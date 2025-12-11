@@ -168,9 +168,9 @@ class NGC_receiver():
         omega_i   = omega_sum / float(num_nb_comm)
         epsilon_i = eps_sum   / float(num_nb_comp)
 
-        ### Update adaptive alpha for current iteration
-        self.alpha = self.adaptive_alpha_v1(omega_i, epsilon_i)
-        # print(f"alpha = {self.alpha}, omega = {omega_i}, epsilon = {epsilon_i}")
+        ### Update learnable alpha for current iteration
+        self.alpha = self.learnable_alpha_v1(omega_i, epsilon_i)
+
         # get the projected gradients for each parameter
         for name, self_params in self.model.module.named_parameters():
             if self_params.requires_grad:
@@ -224,16 +224,7 @@ class NGC_receiver():
 
         self.lr = lr
 
-    def adaptive_alpha_v1(self, omega, epsilon):
-        """
-        alpha = omega / (omega + epsilon)
-        """
-        denom = omega + epsilon
-        alpha = omega / denom
-        alpha = max(0.0, min(1.0, alpha))
-        return alpha
-
-    def adaptive_alpha_v2(self, omega, epsilon):
+    def learnable_alpha_v1(self, omega, epsilon):
         """
         alpha = (omega + epsilon - min(omega, epsilon)) / (max(omega, epsilon) - min(omega, epsilon))
         """
@@ -249,9 +240,12 @@ class NGC_receiver():
         else:
             return (max_val - min_val) / (omega + epsilon - min_val)
 
-    def adaptive_alpha_v3(self, omega, epsilon):
+    def learnable_alpha_v2(self, omega, epsilon):
         """
-        alpha = (omega + epsilon - min(omega, epsilon)) / (max(omega, epsilon) - min(omega, epsilon))
+        alpha = omega / (omega + epsilon)
         """
-        return 1.0
+        denom = omega + epsilon
+        alpha = omega / denom
+        alpha = max(0.0, min(1.0, alpha))
+        return alpha
 
