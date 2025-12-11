@@ -115,7 +115,6 @@ class NGC_receiver():
             new_grad +=self.pi*g
         return new_grad #Ftorch.clamp(new_grad,min=-1.0,max=1.0)
  
-
     def _unflatten_(self, flat_tensor, ref_buf):
         """
             Args
@@ -136,7 +135,6 @@ class NGC_receiver():
         return X
 
     def _get_alpha(self):
-        # map param to [0,1] via sigmoid (or use torch.clamp if prefer)
         return torch.sigmoid(self.alpha_param).item()
 
     def __call__(self, neighbor_grads_comm, neighbor_grads_comp, ref_buf):
@@ -153,7 +151,7 @@ class NGC_receiver():
         for rank, flat_tenor  in neighbor_grads_comp.items():
             neighbor_grads_comp[rank] = self._unflatten_(flat_tenor, ref_buf)
 
-        # --- compute omega_i (data-variance) and epsilon_i (model-variance) ---
+        # compute omega_i (data-variance) and epsilon_i (model-variance)
         omega_sum = 0.0
         eps_sum = 0.0
         omega_count = 0
@@ -176,8 +174,6 @@ class NGC_receiver():
 
         omega_i = (omega_sum / omega_count) if omega_count > 0 else 0.0
         epsilon_i = (eps_sum / eps_count) if eps_count > 0 else 0.0
-        # ---------------------------------------------------------------------
-
         # compute heuristic target alpha (avoid divide by zero)
         target = 0.0
         if (omega_i + epsilon_i) > 0:
