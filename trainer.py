@@ -76,6 +76,7 @@ parser.add_argument("--steplr", action="store_true", help="Uses step lr schedula
 parser.add_argument('--nesterov', action='store_true', )
 parser.add_argument('--qgm', action='store_true', help='quasi global momentum')
 args = parser.parse_args()
+args.devices = torch.cuda.device_count()
 
 # Check the save_dir exists or not
 args.save_dir = os.path.join(args.save_dir, args.optimizer+"_"+args.arch+"_nodes_"+str(args.world_size)+"_"+ args.normtype+"_lr_"+ str(args.lr)+"_gamma_"+str(args.gamma)+"_alpha_"+str(args.alpha)+"_skew_"+str(args.skew)+"_"+args.graph )
@@ -92,7 +93,8 @@ def run(rank, size):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     #torch.use_deterministic_algorithms(True)
-    device = torch.device("cuda:{}".format(rank%args.devices))
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(rank)
 	##############
     best_prec1 = 0
     data_transferred = 0
@@ -148,7 +150,7 @@ def run(rank, size):
     
     mixing = UniformMixing(graph, device)
     model = GossipDataParallel(model, 
-				device_ids=[rank%args.devices],
+				device_ids=[rank],
 				rank=rank,
 				world_size=size,
 				graph=graph, 
@@ -291,7 +293,7 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
 
     prec, rec, f1 = precision_recall_f1(all_outputs, all_targets, num_classes=args.classes)
 
-    auc, auprc = auc_auprc(all_outputs, all_targets, average="macro")
+    #auc, auprc = auc_auprc(all_outputs, all_targets, average="macro")
 
     if dist.get_rank() == 0:
         print(
@@ -299,9 +301,11 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
             f"Precision = {prec:.2f}  "
             f"Recall = {rec:.2f}  "
             f"F1 = {f1:.2f}  "
-            f"AUC = {auc:.2f}  "
-            f"AUPRC = {auprc:.2f}"
         )
+        # print(
+        #     f"AUC = {auc:.2f}  "
+        #     f"AUPRC = {auprc:.2f}"
+        # )
 
     return data_transferred, top1.avg, losses.avg
 
@@ -364,9 +368,9 @@ def validate(val_loader, model, criterion, batch_size, device, epoch=0):
         all_outputs, all_targets, num_classes=args.classes
     )
 
-    auc, auprc = auc_auprc(
-        all_outputs, all_targets, average="macro"
-    )
+    # auc, auprc = auc_auprc(
+    #     all_outputs, all_targets, average="macro"
+    # )
 
     if dist.get_rank() == 0:
         print(
@@ -374,9 +378,11 @@ def validate(val_loader, model, criterion, batch_size, device, epoch=0):
             f"Precision = {prec:.2f}  "
             f"Recall = {rec:.2f}  "
             f"F1 = {f1:.2f}  "
-            f"AUC = {auc:.2f}  "
-            f"AUPRC = {auprc:.2f}"
         )
+        # print (
+        #     f"AUC = {auc:.2f}  "
+        #     f"AUPRC = {auprc:.2f}"
+        # )
 
     return top1.avg, losses.avg
 
@@ -493,29 +499,29 @@ def average_parameters(model):
 
 def init_process(rank, size, fn, backend='nccl'):
     """Initialize distributed enviornment"""
+    torch.cuda.set_device(rank)
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = args.port
     dist.init_process_group(backend, rank=rank, world_size=size)
     fn(rank,size)
 
 def check_noniid(train_loader, rank, world_size):
+    # 1. Counting local label distribution
+    local_counter = Counter()
+    for _, targets in train_loader: # train_loader returns (input, targets)
+        local_counter.update(targets.tolist()) # Counter({label: count, ...})
+    # 2. Convert to probability
+    local_total = sum(local_counter.values())
+    local_distribution = {int(label): count / local_total for label, count in local_counter.items()}
+    # 3. Gather all local distributions
+    ## all_distributions[rank] = local_distribution
+    all_distributions = [None for _ in range(world_size)] # [None,...] with length = world_size
+    dist.all_gather_object(all_distributions, local_distribution) # [{local_distribution},...]
+    # 4. Print distributions
+    print("= = = = = CHECK NON-IID DISTRIBUTION ACROSS AGENTS = = = = =")
     if rank == 0:
-        print("= = = = = CHECK NON-IID DISTRIBUTION ACROSS AGENTS = = = = =")
-        # 1. Counting local label distribution
-        local_counter = Counter()
-        for _, targets in train_loader: # train_loader returns (input, targets)
-            local_counter.update(targets.tolist()) # Counter({label: count, ...})
-        # 2. Convert to probability
-        local_total = sum(local_counter.values())
-        local_distribution = {int(label): count / local_total for label, count in local_counter.items()}
-        # 3. Gather all local distributions
-        ## all_distributions[rank] = local_distribution
-        all_distributions = [None for _ in range(world_size)] # [None,...] with length = world_size
-        dist.all_gather_object(all_distributions, local_distribution) # [{local_distribution},...]
-        # 4. Print distributions
-        if rank == 0:
-            for rank, distribution_rank in enumerate(all_distributions):
-                print(f"Rank {rank} label distribution: {distribution_rank}")
+        for rank, distribution_rank in enumerate(all_distributions):
+            print(f"Rank {rank} label distribution: {distribution_rank}")
         # 5. Computing L1 distance
         all_labels = sorted({label for distribution in all_distributions for label in distribution.keys()})
         matrix = np.array([
