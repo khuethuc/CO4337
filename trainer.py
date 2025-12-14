@@ -2,6 +2,7 @@ import argparse
 import os
 import shutil
 import time
+from tkinter import E
 import numpy as np
 import statistics 
 import copy
@@ -22,6 +23,14 @@ import torch.nn.functional as F
 from math import ceil
 import random
 
+from collections import Counter
+from sklearn.metrics import (
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    average_precision_score,
+)
 
 # Importing modules related to distributed processing
 import torch.distributed as dist
@@ -83,7 +92,8 @@ def run(rank, size):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     #torch.use_deterministic_algorithms(True)
-    device = torch.device("cuda:{}".format(rank%args.devices))
+    device = torch.device(f"cuda:{rank % args.devices}")
+    torch.cuda.set_device(rank)
 	##############
     best_prec1 = 0
     data_transferred = 0
@@ -139,7 +149,7 @@ def run(rank, size):
     
     mixing = UniformMixing(graph, device)
     model = GossipDataParallel(model, 
-				device_ids=[rank%args.devices],
+				device_ids=[rank % args.devices],
 				rank=rank,
 				world_size=size,
 				graph=graph, 
@@ -158,6 +168,9 @@ def run(rank, size):
     train_loader, bsz_train = partition_trainDataset(args.dataset, args.data_dir, args.skew, args.seed, args.batch_size)
     val_loader, bsz_val     = test_Dataset(args.dataset, args.data_dir)
    
+   # Check non-iid distribution
+    check_noniid(train_loader, rank, args.world_size)
+
     if args.optimizer.lower()=='cga':
         receiver  = CGA_receiver(model, device, rank,  args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors)
     elif args.optimizer.lower()=='compcga':
@@ -214,6 +227,9 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
     top1 = AverageMeter()
     data_transferred = 0
 
+    all_outputs = []
+    all_targets = []
+
     # switch to train mode
     model.train()
     end = time.time()
@@ -229,6 +245,9 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
         # then compute output in the forward pass
         output = model(input_var)
         loss = criterion(output, target_var)
+
+        all_outputs.append(output.detach().cpu())
+        all_targets.append(target.detach().cpu())
         # compute gradient 
         loss.backward()
 
@@ -238,6 +257,12 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
             cross_grad_copy                           = copy.deepcopy(cross_grad)
             _, amt_data_transfer, recieved_cross_grad = model.transfer_additional(cross_grad)
             receiver(recieved_cross_grad, cross_grad_copy, ref_buf)
+            if i % args.print_freq == 0 and dist.get_rank() == 0:
+                print(f"Rank {0}" 
+                      f"alpha = {receiver.current_alpha:.3f}"
+                    f"omega = {receiver.current_omega:.3f}"
+                    f"epsilon = {receiver.current_epsilon:.3f}"
+                )
             data_transferred    +=amt_data_transfer
             #project the gradients
             receiver.project_gradients(lr)
@@ -266,7 +291,27 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
                   'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
                       dist.get_rank(), epoch, i, len(train_loader),  batch_time=batch_time,
                       loss=losses, top1=top1))
-        step += batch_size 
+        step += batch_size
+    
+    all_outputs = torch.cat(all_outputs, dim=0)
+    all_targets = torch.cat(all_targets, dim=0)
+
+    prec, rec, f1 = precision_recall_f1(all_outputs, all_targets, num_classes=args.classes)
+
+    #auc, auprc = auc_auprc(all_outputs, all_targets, average="macro")
+
+    if dist.get_rank() == 0:
+        print(
+            f"[Train][Epoch {epoch}] "
+            f"Precision = {prec:.2f}  "
+            f"Recall = {rec:.2f}  "
+            f"F1 = {f1:.2f}  "
+        )
+        # print(
+        #     f"AUC = {auc:.2f}  "
+        #     f"AUPRC = {auprc:.2f}"
+        # )
+
     return data_transferred, top1.avg, losses.avg
 
 
@@ -281,6 +326,10 @@ def validate(val_loader, model, criterion, batch_size, device, epoch=0):
 
     # switch to evaluate mode
     model.eval()
+
+    all_outputs = []
+    all_targets = []
+
     step = len(val_loader)*batch_size*epoch
     end = time.time()
     with torch.no_grad():
@@ -291,6 +340,9 @@ def validate(val_loader, model, criterion, batch_size, device, epoch=0):
             loss = criterion(output, target_var)
             output = output.float()
             loss = loss.float()
+
+            all_outputs.append(output.cpu())
+            all_targets.append(target.cpu())
 
             # measure accuracy and record loss
             prec1 = accuracy(output.data, target_var)[0]
@@ -313,6 +365,30 @@ def validate(val_loader, model, criterion, batch_size, device, epoch=0):
                           top1=top1))
             step += batch_size
     print('Rank:{0}, Prec@1 {top1.avg:.3f}'.format(dist.get_rank(),top1=top1))
+    
+    all_outputs = torch.cat(all_outputs, dim=0)
+    all_targets = torch.cat(all_targets, dim=0)
+
+    prec, rec, f1 = precision_recall_f1(
+        all_outputs, all_targets, num_classes=args.classes
+    )
+
+    # auc, auprc = auc_auprc(
+    #     all_outputs, all_targets, average="macro"
+    # )
+
+    if dist.get_rank() == 0:
+        print(
+            f"[Val][Epoch {epoch}] "
+            f"Precision = {prec:.2f}  "
+            f"Recall = {rec:.2f}  "
+            f"F1 = {f1:.2f}  "
+        )
+        # print (
+        #     f"AUC = {auc:.2f}  "
+        #     f"AUPRC = {auprc:.2f}"
+        # )
+
     return top1.avg, losses.avg
 
 def average_parameters(model):
@@ -360,6 +436,60 @@ def accuracy(output, target, topk=(1,)):
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
 
+def precision_recall_f1(output, target, num_classes):
+    pred = output.argmax(dim=1)
+    precision_list, recall_list, f1_list = [], [], []
+
+    for c in range(num_classes):
+        tp = ((pred == c) & (target == c)).sum().item()
+        fp = ((pred == c) & (target != c)).sum().item()
+        fn = ((pred != c) & (target == c)).sum().item()
+
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+
+        precision_list.append(precision)
+        recall_list.append(recall)
+        f1_list.append(f1)
+
+    return (
+        sum(precision_list)/num_classes * 100,
+        sum(recall_list)/num_classes * 100,
+        sum(f1_list)/num_classes * 100,
+    )
+
+def auc_auprc(output, target, average="macro"):
+    """
+    Compute ROC-AUC and AUPRC
+    - output: logits [N, C] or [N]
+    - target: ground truth labels [N]
+    """
+    target = target.cpu().numpy()
+
+    # Binary classification
+    if output.ndim == 1:
+        score = torch.sigmoid(output).cpu().numpy()
+        auc = roc_auc_score(target, score)
+        auprc = average_precision_score(target, score)
+
+    # Multi-class classification
+    else:
+        score = torch.softmax(output, dim=1).cpu().numpy()
+        auc = roc_auc_score(
+            target,
+            score,
+            multi_class="ovr",
+            average=average
+        )
+        auprc = average_precision_score(
+            target,
+            score,
+            average=average
+        )
+
+    return auc * 100, auprc * 100
+
 def flatten_tensors(tensors):
     if len(tensors) == 1:
         return tensors[0].view(-1).clone()
@@ -378,6 +508,35 @@ def init_process(rank, size, fn, backend='nccl'):
     os.environ['MASTER_PORT'] = args.port
     dist.init_process_group(backend, rank=rank, world_size=size)
     fn(rank,size)
+
+def check_noniid(train_loader, rank, world_size):
+    # 1. Counting local label distribution
+    local_counter = Counter()
+    for _, targets in train_loader: # train_loader returns (input, targets)
+        local_counter.update(targets.tolist()) # Counter({label: count, ...})
+    # 2. Convert to probability
+    local_total = sum(local_counter.values())
+    local_distribution = {int(label): count / local_total for label, count in local_counter.items()}
+    # 3. Gather all local distributions
+    ## all_distributions[rank] = local_distribution
+    all_distributions = [None for _ in range(world_size)] # [None,...] with length = world_size
+    dist.all_gather_object(all_distributions, local_distribution) # [{local_distribution},...]
+    # 4. Print distributions
+    print("= = = = = CHECK NON-IID DISTRIBUTION ACROSS AGENTS = = = = =")
+    if rank == 0:
+        for rank, distribution_rank in enumerate(all_distributions):
+            print(f"Rank {rank} label distribution: {distribution_rank}")
+        # 5. Computing L1 distance
+        all_labels = sorted({label for distribution in all_distributions for label in distribution.keys()})
+        matrix = np.array([
+            [distribution.get(label, 0.0) for label in all_labels]
+            for distribution in all_distributions
+        ]) # [[...],...]
+        mean_distribution = matrix.mean(axis=0)
+        l1_distance = np.abs(matrix - mean_distribution).sum(axis=1)
+        print("\nL1 distance:")
+        for rank, value in enumerate(l1_distance):
+                print(f"Rank {rank}: {value:.3f}")    
 
 if __name__ == '__main__':
     size = args.world_size
@@ -414,5 +573,4 @@ if __name__ == '__main__':
         excel_data["data transferred"][i] = d_tfr
         
     torch.save(excel_data, os.path.join(args.save_dir, "excel_data","dict"))
-    #print(excel_data)
     

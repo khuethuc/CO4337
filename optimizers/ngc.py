@@ -211,7 +211,9 @@ class NGC_receiver():
 
             # blend using learnable alpha
             self.proj_grads[name] = ((1.0 - alpha_val) * p_grads_comp) + (alpha_val * p_grads_comm)
-
+        self.current_omega = omega_i
+        self.current_epsilon = epsilon_i
+        self.current_alpha = alpha_val
         return
                 
 
