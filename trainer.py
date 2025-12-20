@@ -2,7 +2,6 @@ import argparse
 import os
 import shutil
 import time
-from tkinter import E
 import numpy as np
 import statistics 
 import copy
@@ -23,14 +22,6 @@ import torch.nn.functional as F
 from math import ceil
 import random
 
-from collections import Counter
-from sklearn.metrics import (
-    precision_score,
-    recall_score,
-    f1_score,
-    roc_auc_score,
-    average_precision_score,
-)
 
 # Importing modules related to distributed processing
 import torch.distributed as dist
@@ -59,6 +50,11 @@ parser.add_argument('-b', '--batch-size', default=160, type=int,  help='mini-bat
 parser.add_argument('--lr', '--learning-rate', default=0.01, type=float,     metavar='LR', help='initial learning rate')
 parser.add_argument('--gamma',  default=0.1, type=float,  metavar='AR', help='averaging rate')
 parser.add_argument('--alpha',  default=1.0, type=float, help='NGC mixing weight')
+parser.add_argument('--conf-beta', default=2.0, type=float, help='Confidence decay beta for NGC receiver weighting')
+parser.add_argument('--conf-floor', default=1e-4, type=float, help='Minimum confidence assigned to each neighbor')
+parser.add_argument('--conf-eps', default=1e-12, type=float, help='Numerical stability epsilon for confidence calculations')
+parser.add_argument('--comm-self-weight-scale', default=1.0, type=float, help='Relative self-gradient weight for communication path blending')
+parser.add_argument('--comp-self-weight-scale', default=0.5, type=float, help='Relative self-gradient weight for compression path blending')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',     help='momentum')
 parser.add_argument('--weight_decay', default=0.0, type=float,     help='weight_decay')
 parser.add_argument('-world_size', '--world_size', default=10, type=int, help='total number of nodes')
@@ -76,7 +72,6 @@ parser.add_argument("--steplr", action="store_true", help="Uses step lr schedula
 parser.add_argument('--nesterov', action='store_true', )
 parser.add_argument('--qgm', action='store_true', help='quasi global momentum')
 args = parser.parse_args()
-args.devices = torch.cuda.device_count()
 
 # Check the save_dir exists or not
 args.save_dir = os.path.join(args.save_dir, args.optimizer+"_"+args.arch+"_nodes_"+str(args.world_size)+"_"+ args.normtype+"_lr_"+ str(args.lr)+"_gamma_"+str(args.gamma)+"_alpha_"+str(args.alpha)+"_skew_"+str(args.skew)+"_"+args.graph )
@@ -93,8 +88,7 @@ def run(rank, size):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     #torch.use_deterministic_algorithms(True)
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(rank)
+    device = torch.device("cuda:{}".format(rank%args.devices))
 	##############
     best_prec1 = 0
     data_transferred = 0
@@ -150,7 +144,7 @@ def run(rank, size):
     
     mixing = UniformMixing(graph, device)
     model = GossipDataParallel(model, 
-				device_ids=[rank],
+				device_ids=[rank%args.devices],
 				rank=rank,
 				world_size=size,
 				graph=graph, 
@@ -169,15 +163,28 @@ def run(rank, size):
     train_loader, bsz_train = partition_trainDataset(args.dataset, args.data_dir, args.skew, args.seed, args.batch_size)
     val_loader, bsz_val     = test_Dataset(args.dataset, args.data_dir)
    
-   # Check non-iid distribution
-    check_noniid(train_loader, rank, args.world_size)
-
     if args.optimizer.lower()=='cga':
         receiver  = CGA_receiver(model, device, rank,  args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors)
     elif args.optimizer.lower()=='compcga':
         receiver = CompCGA_receiver(model, device, rank,  args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors)
     elif args.optimizer.lower()=='ngc':
-        receiver  = NGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors, alpha = args.alpha)
+        receiver  = NGC_receiver(
+            model,
+            device,
+            rank,
+            args.lr,
+            args.momentum,
+            args.qgm,
+            args.nesterov,
+            weight_decay=args.weight_decay,
+            neighbors=args.neighbors,
+            alpha=args.alpha,
+            confidence_beta=args.conf_beta,
+            confidence_floor=args.conf_floor,
+            confidence_eps=args.conf_eps,
+            comm_self_weight_scale=args.comm_self_weight_scale,
+            comp_self_weight_scale=args.comp_self_weight_scale,
+        )
     elif args.optimizer.lower()=='compngc':
         receiver = CompNGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors, alpha = args.alpha)
     else:
@@ -228,9 +235,6 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
     top1 = AverageMeter()
     data_transferred = 0
 
-    all_outputs = []
-    all_targets = []
-
     # switch to train mode
     model.train()
     end = time.time()
@@ -246,9 +250,6 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
         # then compute output in the forward pass
         output = model(input_var)
         loss = criterion(output, target_var)
-
-        all_outputs.append(output.detach().cpu())
-        all_targets.append(target.detach().cpu())
         # compute gradient 
         loss.backward()
 
@@ -286,27 +287,7 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
                   'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
                       dist.get_rank(), epoch, i, len(train_loader),  batch_time=batch_time,
                       loss=losses, top1=top1))
-        step += batch_size
-    
-    all_outputs = torch.cat(all_outputs, dim=0)
-    all_targets = torch.cat(all_targets, dim=0)
-
-    prec, rec, f1 = precision_recall_f1(all_outputs, all_targets, num_classes=args.classes)
-
-    #auc, auprc = auc_auprc(all_outputs, all_targets, average="macro")
-
-    if dist.get_rank() == 0:
-        print(
-            f"[Train][Epoch {epoch}] "
-            f"Precision = {prec:.2f}  "
-            f"Recall = {rec:.2f}  "
-            f"F1 = {f1:.2f}  "
-        )
-        # print(
-        #     f"AUC = {auc:.2f}  "
-        #     f"AUPRC = {auprc:.2f}"
-        # )
-
+        step += batch_size 
     return data_transferred, top1.avg, losses.avg
 
 
@@ -321,10 +302,6 @@ def validate(val_loader, model, criterion, batch_size, device, epoch=0):
 
     # switch to evaluate mode
     model.eval()
-
-    all_outputs = []
-    all_targets = []
-
     step = len(val_loader)*batch_size*epoch
     end = time.time()
     with torch.no_grad():
@@ -335,9 +312,6 @@ def validate(val_loader, model, criterion, batch_size, device, epoch=0):
             loss = criterion(output, target_var)
             output = output.float()
             loss = loss.float()
-
-            all_outputs.append(output.cpu())
-            all_targets.append(target.cpu())
 
             # measure accuracy and record loss
             prec1 = accuracy(output.data, target_var)[0]
@@ -360,30 +334,6 @@ def validate(val_loader, model, criterion, batch_size, device, epoch=0):
                           top1=top1))
             step += batch_size
     print('Rank:{0}, Prec@1 {top1.avg:.3f}'.format(dist.get_rank(),top1=top1))
-    
-    all_outputs = torch.cat(all_outputs, dim=0)
-    all_targets = torch.cat(all_targets, dim=0)
-
-    prec, rec, f1 = precision_recall_f1(
-        all_outputs, all_targets, num_classes=args.classes
-    )
-
-    # auc, auprc = auc_auprc(
-    #     all_outputs, all_targets, average="macro"
-    # )
-
-    if dist.get_rank() == 0:
-        print(
-            f"[Val][Epoch {epoch}] "
-            f"Precision = {prec:.2f}  "
-            f"Recall = {rec:.2f}  "
-            f"F1 = {f1:.2f}  "
-        )
-        # print (
-        #     f"AUC = {auc:.2f}  "
-        #     f"AUPRC = {auprc:.2f}"
-        # )
-
     return top1.avg, losses.avg
 
 def average_parameters(model):
@@ -431,60 +381,6 @@ def accuracy(output, target, topk=(1,)):
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
 
-def precision_recall_f1(output, target, num_classes):
-    pred = output.argmax(dim=1)
-    precision_list, recall_list, f1_list = [], [], []
-
-    for c in range(num_classes):
-        tp = ((pred == c) & (target == c)).sum().item()
-        fp = ((pred == c) & (target != c)).sum().item()
-        fn = ((pred != c) & (target == c)).sum().item()
-
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
-
-        precision_list.append(precision)
-        recall_list.append(recall)
-        f1_list.append(f1)
-
-    return (
-        sum(precision_list)/num_classes * 100,
-        sum(recall_list)/num_classes * 100,
-        sum(f1_list)/num_classes * 100,
-    )
-
-def auc_auprc(output, target, average="macro"):
-    """
-    Compute ROC-AUC and AUPRC
-    - output: logits [N, C] or [N]
-    - target: ground truth labels [N]
-    """
-    target = target.cpu().numpy()
-
-    # Binary classification
-    if output.ndim == 1:
-        score = torch.sigmoid(output).cpu().numpy()
-        auc = roc_auc_score(target, score)
-        auprc = average_precision_score(target, score)
-
-    # Multi-class classification
-    else:
-        score = torch.softmax(output, dim=1).cpu().numpy()
-        auc = roc_auc_score(
-            target,
-            score,
-            multi_class="ovr",
-            average=average
-        )
-        auprc = average_precision_score(
-            target,
-            score,
-            average=average
-        )
-
-    return auc * 100, auprc * 100
-
 def flatten_tensors(tensors):
     if len(tensors) == 1:
         return tensors[0].view(-1).clone()
@@ -499,40 +395,10 @@ def average_parameters(model):
 
 def init_process(rank, size, fn, backend='nccl'):
     """Initialize distributed enviornment"""
-    torch.cuda.set_device(rank)
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = args.port
     dist.init_process_group(backend, rank=rank, world_size=size)
     fn(rank,size)
-
-def check_noniid(train_loader, rank, world_size):
-    # 1. Counting local label distribution
-    local_counter = Counter()
-    for _, targets in train_loader: # train_loader returns (input, targets)
-        local_counter.update(targets.tolist()) # Counter({label: count, ...})
-    # 2. Convert to probability
-    local_total = sum(local_counter.values())
-    local_distribution = {int(label): count / local_total for label, count in local_counter.items()}
-    # 3. Gather all local distributions
-    ## all_distributions[rank] = local_distribution
-    all_distributions = [None for _ in range(world_size)] # [None,...] with length = world_size
-    dist.all_gather_object(all_distributions, local_distribution) # [{local_distribution},...]
-    # 4. Print distributions
-    print("= = = = = CHECK NON-IID DISTRIBUTION ACROSS AGENTS = = = = =")
-    if rank == 0:
-        for rank, distribution_rank in enumerate(all_distributions):
-            print(f"Rank {rank} label distribution: {distribution_rank}")
-        # 5. Computing L1 distance
-        all_labels = sorted({label for distribution in all_distributions for label in distribution.keys()})
-        matrix = np.array([
-            [distribution.get(label, 0.0) for label in all_labels]
-            for distribution in all_distributions
-        ]) # [[...],...]
-        mean_distribution = matrix.mean(axis=0)
-        l1_distance = np.abs(matrix - mean_distribution).sum(axis=1)
-        print("\nL1 distance:")
-        for rank, value in enumerate(l1_distance):
-                print(f"Rank {rank}: {value:.3f}")    
 
 if __name__ == '__main__':
     size = args.world_size
@@ -569,4 +435,5 @@ if __name__ == '__main__':
         excel_data["data transferred"][i] = d_tfr
         
     torch.save(excel_data, os.path.join(args.save_dir, "excel_data","dict"))
+    #print(excel_data)
     
