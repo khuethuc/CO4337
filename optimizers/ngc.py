@@ -5,7 +5,7 @@ from torch.autograd import Variable
 import copy
 import numpy as np
 from .utils import flatten_tensors, unflatten_tensors
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 
 class NGC_sender():
     def __init__(self, true_model, device):
@@ -85,8 +85,12 @@ class NGC_sender():
 
 class NGC_receiver():
     def __init__(self, model, device, rank, lr, momentum, qgm, nesterov=True, weight_decay=0, neighbors=2, alpha=1.0,
-                 confidence_beta=2.0, confidence_floor=1e-4, confidence_eps=1e-12, comm_self_weight_scale=1.0,
-                 comp_self_weight_scale=0.5):
+             confidence_beta=2.0, confidence_floor=1e-4, confidence_eps=1e-12, comm_self_weight_scale=1.0,
+             comp_self_weight_scale=0.5,
+             prox_mu=0.0, prox_warmup_steps=200,
+             blend_lambda_max=0.25, blend_warmup_steps=500, blend_ramp_steps=2000, min_self_weight=0.2
+):
+
         self.model         = model
         self.rank          = rank
         self.device        = device
@@ -106,55 +110,119 @@ class NGC_receiver():
         self.comm_self_weight_scale = comm_self_weight_scale
         self.comp_self_weight_scale = comp_self_weight_scale
         self.confidence_trace = defaultdict(dict)
+        self.layer_param_map = OrderedDict()
+        # FedProx config
+        self.prox_mu = prox_mu
+        self.prox_warmup_steps = prox_warmup_steps
+        self.step = 0
+        self.anchor_params = {}
+        # Blend baseline(uniform) + confidence
+        self.blend_lambda_max = blend_lambda_max
+        self.blend_warmup_steps = blend_warmup_steps
+        self.blend_ramp_steps = blend_ramp_steps
+        # Optional: tăng self weight để đỡ bị neighbor kéo lệch
+        self.min_self_weight = min_self_weight
+
+        for name, param in self.model.module.named_parameters():
+            if not param.requires_grad:
+                continue
+            layer_key = self._layer_key(name)
+            self.layer_param_map.setdefault(layer_key, []).append(name)
         for param in self.model.module.parameters():
             self.momentum_buff.append(torch.zeros_like(param.data))
             self.prev_params.append(copy.deepcopy(param.data))
+
+    def _blend_lambda(self):
+        # lambda schedule: 0 -> lambda_max
+        if self.step < self.blend_warmup_steps:
+            return 0.0
+        t = self.step - self.blend_warmup_steps
+        if self.blend_ramp_steps <= 0:
+            return float(self.blend_lambda_max)
+        frac = min(1.0, t / float(self.blend_ramp_steps))
+        return float(self.blend_lambda_max) * frac
+
+
+    def _layer_key(self, param_name):
+        if '.' in param_name:
+            return param_name.rsplit('.', 1)[0]
+        return param_name
     
     def _compute_confidence_score(self, neighbor_grad, self_grad):
-        """Returns alignment-aware confidence for a neighbor gradient."""
-        diff_norm = torch.norm(self_grad - neighbor_grad)
+        device = self_grad.device
+        eps = self.confidence_eps
+
         self_norm = torch.norm(self_grad)
         neigh_norm = torch.norm(neighbor_grad)
-        cosine = torch.sum(self_grad * neighbor_grad) / (self_norm * neigh_norm + self.confidence_eps)
+
+        if self_norm < eps or neigh_norm < eps:
+            return torch.tensor(1.0, device=device, dtype=self_grad.dtype)
+
+        cosine = torch.sum(self_grad * neighbor_grad) / (self_norm * neigh_norm + eps)
         cosine = torch.clamp(cosine, -1.0, 1.0)
-        alignment = 0.5 * (cosine + 1.0)
-        relative_diff = diff_norm / (self_norm + self.confidence_eps)
-        penalty = torch.exp(-self.confidence_beta * relative_diff)
-        score = alignment * penalty + self.confidence_floor
+
+        # Alignment in [0, 1]
+        score = 0.5 * (cosine + 1.0)
         return score
 
+    def _confidence_weighted_average_layer(
+        self,
+        neighbor_vecs,
+        self_vec,
+        trace_key="",
+        self_weight_scale=1.0,
+        a_min=0.5,
+        temperature=1.0,
+    ):
+        if not neighbor_vecs:
+            return self_vec.clone()
 
-    def _confidence_weighted_average(self, neighbor_grads, self_grad, param_name="", self_weight_scale=1.0):
-        if not neighbor_grads:
-            return self_grad.clone()
+        scores = torch.stack([self._compute_confidence_score(vec, self_vec) for vec in neighbor_vecs])
+        scores = torch.clamp(scores, min=a_min)
 
-        scores = []
-        for neigh_grad in neighbor_grads:
-            scores.append(self._compute_confidence_score(neigh_grad, self_grad))
+        weights = scores.pow(temperature)
+        weights = weights / (weights.sum() + self.confidence_eps)
 
-        scores = torch.stack(scores)
-        total = scores.sum()
-        if total <= self.confidence_eps or torch.isnan(total):
-            weights = torch.ones_like(scores) / len(neighbor_grads)
-        else:
-            weights = scores / total
+        neighbor_part = torch.zeros_like(self_vec)
+        for w, vec in zip(weights, neighbor_vecs):
+            neighbor_part.add_(vec, alpha=w.item())
 
-        neighbor_part = torch.zeros_like(self_grad)
-        for w, grad in zip(weights, neighbor_grads):
-            neighbor_part.add_(grad, alpha=w.item())
+        # self mixing (same rule as uniform+self)
+        self_weight = max(self.min_self_weight, min(1.0, self.pi * self_weight_scale))
+        neighbor_part.mul_(1.0 - self_weight)
+        neighbor_part.add_(self_vec, alpha=self_weight)
 
-        self_weight = max(0.0, min(1.0, self.pi * self_weight_scale))
-        neighbor_budget = max(self.confidence_eps, 1.0 - self_weight)
-        neighbor_part.mul_(neighbor_budget)
-        neighbor_part.add_(self_grad, alpha=self_weight)
-
-        if param_name:
-            self.confidence_trace[param_name] = {
-                "weights": [float(w) for w in weights.detach().cpu()],
-                "self_weight": self_weight
+        if trace_key:
+            self.confidence_trace[trace_key] = {
+                "weights": weights.detach().cpu().tolist(),
+                "self_weight": self_weight,
             }
 
         return neighbor_part
+
+    def _flatten_layer(self, grads_dict, param_names):
+        flats = []
+        shapes = []
+        sizes = []
+        for name in param_names:
+            tensor = grads_dict.get(name)
+            if tensor is None:
+                continue
+            flats.append(tensor.view(-1))
+            shapes.append(tensor.shape)
+            sizes.append(tensor.numel())
+        if not flats:
+            return None, [], []
+        return torch.cat(flats), shapes, sizes
+
+    def _layer_vector_to_params(self, layer_vec, param_names, shapes, sizes):
+        result = {}
+        offset = 0
+        for name, shape, size in zip(param_names, shapes, sizes):
+            result[name] = layer_vec[offset:offset+size].view(shape).clone()
+            offset += size
+        return result
+
  
 
     def _unflatten_(self, flat_tensor, ref_buf):
@@ -177,83 +245,140 @@ class NGC_receiver():
         return X
 
     def __call__(self, neighbor_grads_comm, neighbor_grads_comp, ref_buf):
-        """
-            Args
-                flat_tensor: received flat tensor to be reshaped 
-                ref_buf: reference buffer for computing unflattened shape
-            Returns
-                computes orthogonal projection space and stores in self.Z
-        """
-        ### Unflatten the neighbor grads
-        for rank, flat_tenor  in neighbor_grads_comm.items():
-            neighbor_grads_comm[rank] = self._unflatten_(flat_tenor, ref_buf)
-        for rank, flat_tenor  in neighbor_grads_comp.items():
-            neighbor_grads_comp[rank] = self._unflatten_(flat_tenor, ref_buf)
-        
-        
-        #get the projected gradients for each parameter
-        for name, self_params in self.model.module.named_parameters():
-            if self_params.requires_grad:
-                self_grad = self_params.grad.data
-                cross_grads_comm = []
-                for rank, neigh_grad in neighbor_grads_comm.items():
-                    cross_grads_comm.append(neigh_grad[name])
-                p_grads_comm  = self._confidence_weighted_average(
-                    cross_grads_comm,
-                    self_grad,
-                    param_name=f"{name}_comm",
-                    self_weight_scale=self.comm_self_weight_scale
-                )
-                
-                cross_grads_comp = []
-                for rank, neigh_grad in neighbor_grads_comp.items():
-                    cross_grads_comp.append(neigh_grad[name])
-                p_grads_comp  = self._confidence_weighted_average(
-                    cross_grads_comp,
-                    self_grad,
-                    param_name=f"{name}_comp",
-                    self_weight_scale=self.comp_self_weight_scale
-                )
-                
-                self.proj_grads[name] = ((1-self.alpha)*p_grads_comp)+(self.alpha*p_grads_comm)
-        return 
-                
+        # 1) Unflatten neighbor grads
+        for r, flat in neighbor_grads_comm.items():
+            neighbor_grads_comm[r] = self._unflatten_(flat, ref_buf)
+        for r, flat in neighbor_grads_comp.items():
+            neighbor_grads_comp[r] = self._unflatten_(flat, ref_buf)
+
+        # 2) step + blend factor (tính 1 lần)
+        self.step += 1
+        lam = self._blend_lambda()
+
+        # 3) FedProx anchor: chỉ refresh theo chu kỳ (KHÔNG clone mỗi step)
+        if (self.prox_mu is not None) and (self.prox_mu > 0):
+            if (self.step == 1) or (self.step % 200 == 0) or (len(self.anchor_params) == 0):
+                self.anchor_params = {
+                    name: p.data.detach().clone()
+                    for name, p in self.model.module.named_parameters()
+                    if p.requires_grad
+                }
+
+        # 4) self grads dict
+        self_grad_dict = {
+            name: p.grad.data
+            for name, p in self.model.module.named_parameters()
+            if p.requires_grad
+        }
+
+        neighbor_comm_list = list(neighbor_grads_comm.values())
+        neighbor_comp_list = list(neighbor_grads_comp.values())
+
+        # 5) layer-wise aggregation
+        for layer_name, param_names in self.layer_param_map.items():
+            self_layer_vec, shapes, sizes = self._flatten_layer(self_grad_dict, param_names)
+            if self_layer_vec is None:
+                continue
+
+            # ===== COMM =====
+            comm_neighbor_vecs = []
+            for neigh in neighbor_comm_list:
+                layer_vec, _, _ = self._flatten_layer(neigh, param_names)
+                if layer_vec is not None:
+                    comm_neighbor_vecs.append(layer_vec)
+
+            # uniform + self
+            comm_self_w = max(self.min_self_weight, min(1.0, self.pi * self.comm_self_weight_scale))
+            if len(comm_neighbor_vecs) > 0:
+                comm_mean = torch.stack(comm_neighbor_vecs, dim=0).mean(dim=0)
+            else:
+                comm_mean = self_layer_vec
+            comm_uniform = (1.0 - comm_self_w) * comm_mean + comm_self_w * self_layer_vec
+
+            # confidence
+            comm_conf = self._confidence_weighted_average_layer(
+                comm_neighbor_vecs,
+                self_layer_vec,
+                trace_key=f"{layer_name}_comm",
+                self_weight_scale=self.comm_self_weight_scale,
+            )
+
+            # blend
+            comm_layer = (1.0 - lam) * comm_uniform + lam * comm_conf
+
+            # ===== COMP =====
+            comp_neighbor_vecs = []
+            for neigh in neighbor_comp_list:
+                layer_vec, _, _ = self._flatten_layer(neigh, param_names)
+                if layer_vec is not None:
+                    comp_neighbor_vecs.append(layer_vec)
+
+            # uniform + self
+            comp_self_w = max(self.min_self_weight, min(1.0, self.pi * self.comp_self_weight_scale))
+            if len(comp_neighbor_vecs) > 0:
+                comp_mean = torch.stack(comp_neighbor_vecs, dim=0).mean(dim=0)
+            else:
+                comp_mean = self_layer_vec
+            comp_uniform = (1.0 - comp_self_w) * comp_mean + comp_self_w * self_layer_vec
+
+            # confidence
+            comp_conf = self._confidence_weighted_average_layer(
+                comp_neighbor_vecs,
+                self_layer_vec,
+                trace_key=f"{layer_name}_comp",
+                self_weight_scale=self.comp_self_weight_scale,
+            )
+
+            # blend
+            comp_layer = (1.0 - lam) * comp_uniform + lam * comp_conf
+
+            # final mix (NGC alpha)
+            mixed_layer = ((1.0 - self.alpha) * comp_layer) + (self.alpha * comm_layer)
+
+            # write back to per-param grads
+            layer_chunks = self._layer_vector_to_params(mixed_layer, param_names, shapes, sizes)
+            for n, chunk in layer_chunks.items():
+                self.proj_grads[n] = chunk
+
+        return
+          
 
     def project_gradients(self, lr):
-        """
-            Returns
-                applies the changes to the model
-        """
-        ### Applies the grad projections
+        # Applies the grad projections
         for name, p in self.model.module.named_parameters():
             if p.requires_grad:
-                p.grad.data = self.proj_grads[name].data 
+                # 1) gradient sau aggregation
+                p.grad.data = self.proj_grads[name].data
+
+                # 2) weight decay nếu có
                 if self.weight_decay != 0:
                     p.grad.data.add_(p.data, alpha=self.weight_decay)
-        
-        #apply momentum
-        if self.momentum!=0:
+
+                # 3) FedProx proximal term (KHÔNG nằm trong weight_decay)
+                if (self.prox_mu is not None) and (self.prox_mu > 0) and (self.step >= self.prox_warmup_steps):
+                    w_anc = self.anchor_params.get(name, None)
+                    if w_anc is not None:
+                        p.grad.data.add_(p.data - w_anc, alpha=self.prox_mu)
+
+        # apply momentum (giữ nguyên code bạn)
+        if self.momentum != 0:
             if self.qgm:
                 for p, p_prev, buf in zip(self.model.module.parameters(), self.prev_params, self.momentum_buff):
-                    buf.mul_(self.momentum).add_(p_prev.data-p.data, alpha=(1.0-self.momentum)/self.lr) #m_hat
+                    buf.mul_(self.momentum).add_(p_prev.data - p.data, alpha=(1.0-self.momentum)/self.lr)
                     mom_buff = copy.deepcopy(buf)
-                    mom_buff.mul_(self.momentum).add_(p.grad.data) #m
+                    mom_buff.mul_(self.momentum).add_(p.grad.data)
                     if self.nesterov:
-                        p.grad.data.add_(mom_buff, alpha=self.momentum) #nestrove momentum
+                        p.grad.data.add_(mom_buff, alpha=self.momentum)
                     else:
-                        p.grad.data.copy_(mom_buff) 
+                        p.grad.data.copy_(mom_buff)
                 for p, p_prev in zip(self.model.module.parameters(), self.prev_params):
                     p_prev.data.copy_(p.data)
             else:
                 for p, buf in zip(self.model.module.parameters(), self.momentum_buff):
                     buf.mul_(self.momentum).add_(p.grad.data)
                     if self.nesterov:
-                        p.grad.data.add_(buf, alpha=self.momentum) #nestrove momentum
+                        p.grad.data.add_(buf, alpha=self.momentum)
                     else:
-                        p.grad.data.copy_(buf) 
+                        p.grad.data.copy_(buf)
 
         self.lr = lr
-        
-        
-                
-             
