@@ -161,42 +161,25 @@ class NGC_receiver():
                 self_gradients[name] = self_params.grad.data
 
         keys = list(ref_buf.keys())
-        for k in keys:
-            self_flatten = flatten_tensors(self_gradients[k]).to(self.device)
+        self_flatten = flatten_tensors(
+            [self_gradients[k] for k in keys]
+        ).to(self.device)
 
         ### Compute utility score
         utilities = {}
         for rank in neighbor_grads_comp.keys():
-            for k in keys: # g_ji (model-variant) flatten
-                g_ji_flatten = flatten_tensors(neighbor_grads_comp[rank][k]).to(self.device)
-            for k in keys: # g_ij (data-variant) flatten
-                g_ij_flatten = flatten_tensors(neighbor_grads_comm[rank][k]).to(self.device)
-
+            g_ji_flatten = flatten_tensors([neighbor_grads_comp[rank][k] for k in keys]).to(self.device)
+            g_ij_flatten = flatten_tensors([neighbor_grads_comm[rank][k] for k in keys]).to(self.device)
             utilities[rank] = self.utility_score(rank, self_flatten, g_ij_flatten, g_ji_flatten)
 
         ### Choose top-k ranks
-        ranks_sorted = sorted(utilities.keys(), key = lambda r: utilities[r], reverse = True)
+        ranks_sorted = sorted(utilities.keys(), key = lambda rank: utilities[rank], reverse = True)
         if self.topk is None or self.topk <= 0:
             selected = ranks_sorted
         else:
             selected = ranks_sorted[: min(self.topk, len(ranks_sorted))]
 
         ### Get the projected gradients for each parameter
-        # for name, self_params in self.model.module.named_parameters():
-        #     if self_params.requires_grad:
-        #         cross_grads_comm = []
-        #         for rank, neigh_grad in neighbor_grads_comm.items():
-        #             cross_grads_comm.append(neigh_grad[name])
-        #         cross_grads_comm.append(self_params.grad.data)
-        #         p_grads_comm  = self.average_gradients(cross_grads_comm)
-                
-        #         cross_grads_comp = []
-        #         for rank, neigh_grad in neighbor_grads_comp.items():
-        #             cross_grads_comp.append(neigh_grad[name])
-        #         cross_grads_comp.append(self_params.grad.data) # added twice so we can use self.pi/2 as weight
-        #         p_grads_comp  = self.average_gradients(cross_grads_comp)
-                
-        #         self.proj_grads[name] = ((1-self.alpha)*p_grads_comp)+(self.alpha*p_grads_comm)
         for name, self_params in self.model.module.named_parameters():
             if self_params.requires_grad:
                 if len(selected) == 0:
@@ -211,9 +194,13 @@ class NGC_receiver():
                 g_model /= float(len(selected))
                 g_data  /= float(len(selected))
 
+                den = float(self.weight_self + self.weight_model + self.weight_data) + 1e-12
                 self.proj_grads[name] = (
-                    self.weight_self * self_gradients[name] + self.weight_model * g_model + self.weight_data  * g_data
-                )
+                    self.weight_self * self_gradients[name]
+                    + self.weight_model * g_model
+                    + self.weight_data  * g_data
+                ) / den
+
         return 
                 
 
@@ -250,8 +237,7 @@ class NGC_receiver():
                     else:
                         p.grad.data.copy_(buf) 
 
-        self.lr = lr
-        
+        self.lr = lr 
         
     def utility_score(self, rank: int, g_ii: torch.Tensor, g_ij: torch.Tensor, g_ji: torch.Tensor):
         """
@@ -263,7 +249,9 @@ class NGC_receiver():
         g_ji = g_ji.to(self.device)
         # Compute cosine similarity
         a_model = float(self.cosine_alignment(g_ii, g_ji).item())
+        print("a_model:", a_model)
         a_data  = float(self.cosine_alignment(g_ii, g_ij).item())
+        print("a_data:", a_data)
         # Compute utility score
         compability = float(self.lambda_1) * a_model + float(self.lambda_2) * a_data
         self.update_running_statics(rank, compability)
