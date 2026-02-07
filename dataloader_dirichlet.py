@@ -249,13 +249,13 @@ def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size,
         train_set = torch.utils.data.DataLoader(partition, batch_size=bsz, shuffle=True, num_workers=2)
         return train_set, bsz
 
-    # --- NEW: Dirichlet partition + optional Dirichlet attack ---
+    # Dirichlet partition + optional Dirichlet attack
     dirichlet_alpha = 0.3     # normal alpha
     min_size = 10             # avoid empty client
     n_classes = 10            # CIFAR10=10, CIFAR100=100, FMNIST=10...
 
     dirichlet_attack = True   
-    adv_ratio = 0.3           # percentage of malicious client
+    adv_ratio = 0.2           # percentage of malicious client
     adv_contiguous = True     # contiguous segment on ring topology
     adv_start = 0             
     attack_alpha = 0.05       # alpha for attacker (small alpha => high skewness)
