@@ -179,6 +179,11 @@ class NGC_receiver():
         else:
             selected = ranks_sorted[: min(self.topk, len(ranks_sorted))]
 
+        print(f"Rank {self.rank} has selected neighbors:")
+        for rank in selected:
+            print(f"Neighbor {rank} with utility score: {utilities[rank]:.4f}")
+        print("==============================")
+
         ### Get the projected gradients for each parameter
         for name, self_params in self.model.module.named_parameters():
             if self_params.requires_grad:
