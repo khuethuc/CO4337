@@ -52,3 +52,14 @@ ResNet20 with 10 agents undirected ring topology with NGC optimizer:
 ```
 python trainer.py  --data-dir ../data   --lr 0.01  --batch-size 320  --world_size 10 --skew 1 --gamma 0.1 --normtype evonorm --optimizer ngc --epoch 100 --arch resnet --depth 20 --momentum 0.9 --alpha 1.0 --graph ring --neighbors 2 --nesterov
 ```
+
+5 layer CNN with 5 agents undirected ring topology with NGC optimizer and Dirichlet attack:
+```
+python trainer_dirichlet.py  --data-dir ../data   --lr 0.01  --batch-size 160  --world_size 5 --skew 1 --gamma 0.1 --normtype evonorm --optimizer ngc --epoch 100 --arch cganet --momentum 0.9 --alpha 1.0 --graph ring --neighbors 2 --nesterov --partition dirichlet --dirichlet_alpha 0.3 --dirichlet_min_size 10 --dirichlet_attack --adv_ratio 0.4 --adv_contiguous --adv_start 0 --attack_alpha 0.05
+```
+
+5 layer CNN with 5 agents undirected ring topology with Topk-NGC optimizer and Dirichlet attack:
+```
+python trainer_dirichlet.py  --data-dir ../data   --lr 0.01  --batch-size 160  --world_size 5 --skew 1 --gamma 0.1 --normtype evonorm --optimizer topk-ngc --epoch 100 --arch cganet --momentum 0.9 --alpha 1.0 --graph ring --neighbors 2 --nesterov --partition dirichlet --dirichlet_alpha 0.3 --dirichlet_min_size 10 --dirichlet_attack --adv_ratio 0.4 --adv_contiguous --adv_start 0 --attack_alpha 0.05
+```
+
