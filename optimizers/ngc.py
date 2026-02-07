@@ -88,7 +88,7 @@ class NGC_receiver():
     def __init__(self, model, device, rank, lr, momentum, qgm, 
                  nesterov=True, weight_decay=0, neighbors=2, alpha=1.0,
                  topk = 1, lambda_1 = 1.0, lambda_2 = 1.0, lambda_3 = 0.5, rho_ema = 0.1,
-                 weight_self = 1.0, weight_model = 1.0, weight_data = 1.0):
+                 weight_self = 0, weight_model = 0, weight_data = 1.0):
         self.model         = model
         self.rank          = rank
         self.device        = device
@@ -194,12 +194,11 @@ class NGC_receiver():
                 g_model /= float(len(selected))
                 g_data  /= float(len(selected))
 
-                den = float(self.weight_self + self.weight_model + self.weight_data) + 1e-12
                 self.proj_grads[name] = (
                     self.weight_self * self_gradients[name]
                     + self.weight_model * g_model
                     + self.weight_data  * g_data
-                ) / den
+                )
 
         return 
                 
