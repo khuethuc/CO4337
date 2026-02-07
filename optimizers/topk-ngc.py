@@ -6,6 +6,7 @@ import copy
 import numpy as np
 from .utils import flatten_tensors, unflatten_tensors
 from collections import defaultdict
+import math
 
 class NGC_sender():
     def __init__(self, true_model, device):
@@ -84,7 +85,10 @@ class NGC_sender():
 
 
 class NGC_receiver():
-    def __init__(self, model, device, rank, lr, momentum, qgm, nesterov=True, weight_decay=0, neighbors=2, alpha=1.0):
+    def __init__(self, model, device, rank, lr, momentum, qgm, 
+                 nesterov=True, weight_decay=0, neighbors=2, alpha=1.0,
+                 topk = 1, lambda_1 = 1.0, lambda_2 = 1.0, lambda_3 = 0.5, rho_ema = 0.1,
+                 weight_self = 0, weight_model = 0, weight_data = 1.0):
         self.model         = model
         self.rank          = rank
         self.device        = device
@@ -101,6 +105,14 @@ class NGC_receiver():
         for param in self.model.module.parameters():
             self.momentum_buff.append(torch.zeros_like(param.data))
             self.prev_params.append(copy.deepcopy(param.data))
+        self.topk = topk
+        self.lambda_1, self.lambda_2, self.lambda_3 = lambda_1, lambda_2, lambda_3
+        self.rho_ema = rho_ema
+        self.mu = defaultdict(float)
+        self.nu = defaultdict(float)
+        self.weight_self = weight_self
+        self.weight_model = weight_model
+        self.weight_data = weight_data
     
     def average_gradients(self, grad):
         new_grad = torch.zeros_like(grad[-1])
@@ -142,23 +154,52 @@ class NGC_receiver():
         for rank, flat_tenor  in neighbor_grads_comp.items():
             neighbor_grads_comp[rank] = self._unflatten_(flat_tenor, ref_buf)
         
-        
-        #get the projected gradients for each parameter
+        ### Compute self-gradients
+        self_gradients = {}
         for name, self_params in self.model.module.named_parameters():
             if self_params.requires_grad:
-                cross_grads_comm = []
-                for rank, neigh_grad in neighbor_grads_comm.items():
-                    cross_grads_comm.append(neigh_grad[name])
-                cross_grads_comm.append(self_params.grad.data)
-                p_grads_comm  = self.average_gradients(cross_grads_comm)
-                
-                cross_grads_comp = []
-                for rank, neigh_grad in neighbor_grads_comp.items():
-                    cross_grads_comp.append(neigh_grad[name])
-                cross_grads_comp.append(self_params.grad.data) # added twice so we can use self.pi/2 as weight
-                p_grads_comp  = self.average_gradients(cross_grads_comp)
-                
-                self.proj_grads[name] = ((1-self.alpha)*p_grads_comp)+(self.alpha*p_grads_comm)
+                self_gradients[name] = self_params.grad.data
+
+        keys = list(ref_buf.keys())
+        self_flatten = flatten_tensors(
+            [self_gradients[k] for k in keys]
+        ).to(self.device)
+
+        ### Compute utility score
+        utilities = {}
+        for rank in neighbor_grads_comp.keys():
+            g_ji_flatten = flatten_tensors([neighbor_grads_comp[rank][k] for k in keys]).to(self.device)
+            g_ij_flatten = flatten_tensors([neighbor_grads_comm[rank][k] for k in keys]).to(self.device)
+            utilities[rank] = self.utility_score(rank, self_flatten, g_ij_flatten, g_ji_flatten)
+
+        ### Choose top-k ranks
+        ranks_sorted = sorted(utilities.keys(), key = lambda rank: utilities[rank], reverse = True)
+        if self.topk is None or self.topk <= 0:
+            selected = ranks_sorted
+        else:
+            selected = ranks_sorted[: min(self.topk, len(ranks_sorted))]
+
+        ### Get the projected gradients for each parameter
+        for name, self_params in self.model.module.named_parameters():
+            if self_params.requires_grad:
+                if len(selected) == 0:
+                    self.proj_grads[name] = self_gradients[name]
+                    continue
+
+                g_model = torch.zeros_like(self_gradients[name])
+                g_data  = torch.zeros_like(self_gradients[name])
+                for rank in selected:
+                    g_model += neighbor_grads_comp[rank][name]
+                    g_data  += neighbor_grads_comm[rank][name]
+                g_model /= float(len(selected))
+                g_data  /= float(len(selected))
+
+                self.proj_grads[name] = (
+                    self.weight_self * self_gradients[name]
+                    + self.weight_model * g_model
+                    + self.weight_data  * g_data
+                )
+
         return 
                 
 
@@ -195,8 +236,56 @@ class NGC_receiver():
                     else:
                         p.grad.data.copy_(buf) 
 
-        self.lr = lr
+        self.lr = lr 
         
-        
-                
+    def utility_score(self, rank: int, g_ii: torch.Tensor, g_ij: torch.Tensor, g_ji: torch.Tensor):
+        """
+        compatibility = lambda_1 * cos(g_ii, g_ji) + lambda_2 * cos(g_ii, g_ij)
+        utility_score = compatibility - lambda_3 * uncertainty
+        """
+        g_ii = g_ii.to(self.device)
+        g_ij = g_ij.to(self.device)
+        g_ji = g_ji.to(self.device)
+        # Compute cosine similarity
+        a_model = float(self.cosine_alignment(g_ii, g_ji).item())
+        print("a_model:", a_model)
+        a_data  = float(self.cosine_alignment(g_ii, g_ij).item())
+        print("a_data:", a_data)
+        # Compute utility score
+        compability = float(self.lambda_1) * a_model + float(self.lambda_2) * a_data
+        self.update_running_statics(rank, compability)
+        uncertainty = self.uncertainty(rank)
+        utility_score = compability - float(self.lambda_3) * uncertainty
+        return float(utility_score)       
+    
+    def cosine_alignment(self, g_ii: torch.Tensor, cross_gradients: torch.Tensor, eps: float = 1e-12):
+        """
+        returns scalar tensor
+        """
+        return torch.dot(g_ii, cross_gradients) / (g_ii.norm() * cross_gradients.norm() + eps)
+
+    def uncertainty(self, rank: int):
+        """
+        EMA stats self.mu[rank], self.nu[rank]
+        uncertainty_{ij,k} = sqrt(max(nu - mu^2, 0))
+        """
+        mu = float(self.mu[rank])
+        nu = float(self.nu[rank])
+        var = max(nu - mu * mu, 0.0)
+        return math.sqrt(var)
+
+    def update_running_statics(self, rank: int, compatibility: float):
+        """
+        mu = (1 - rho) * mu + rho * compatability
+        nu = (1 - rho) * nu + rho * compatability^2
+        """
+        rho = float(self.rho_ema)
+        mu_prev = float(self.mu[rank])
+        nu_prev = float(self.nu[rank])
+        mu = (1.0 - rho) * mu_prev + rho * compatibility
+        nu = (1.0 - rho) * nu_prev + rho * (compatibility**2)
+        self.mu[rank] = mu
+        self.nu[rank] = nu
+
+     
              
