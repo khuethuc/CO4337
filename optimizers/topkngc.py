@@ -8,7 +8,7 @@ from .utils import flatten_tensors, unflatten_tensors
 from collections import defaultdict
 import math
 
-class NGC_sender():
+class Topk_NGC_sender():
     def __init__(self, true_model, device):
         """
             Args
@@ -84,10 +84,10 @@ class NGC_sender():
         return output, g
 
 
-class NGC_receiver():
+class Topk_NGC_receiver():
     def __init__(self, model, device, rank, lr, momentum, qgm, 
                  nesterov=True, weight_decay=0, neighbors=2, alpha=1.0,
-                 topk = 1, lambda_1 = 1.0, lambda_2 = 1.0, lambda_3 = 0.5, rho_ema = 0.1,
+                 lambda_1 = 0.2, lambda_2 = 0.8, lambda_3 = 0.5, rho_ema = 0.1,
                  weight_self = 0, weight_model = 0, weight_data = 1.0):
         self.model         = model
         self.rank          = rank
@@ -105,7 +105,7 @@ class NGC_receiver():
         for param in self.model.module.parameters():
             self.momentum_buff.append(torch.zeros_like(param.data))
             self.prev_params.append(copy.deepcopy(param.data))
-        self.topk = topk
+        self.topk = neighbors
         self.lambda_1, self.lambda_2, self.lambda_3 = lambda_1, lambda_2, lambda_3
         self.rho_ema = rho_ema
         self.mu = defaultdict(float)
@@ -259,8 +259,8 @@ class NGC_receiver():
         # Compute utility score
         compability = float(self.lambda_1) * a_model + float(self.lambda_2) * a_data
         self.update_running_statics(rank, compability)
-        uncertainty = self.uncertainty(rank)
-        utility_score = compability - float(self.lambda_3) * uncertainty
+        # uncertainty = self.uncertainty(rank)
+        utility_score = compability
         return float(utility_score)       
     
     def cosine_alignment(self, g_ii: torch.Tensor, cross_gradients: torch.Tensor, eps: float = 1e-12):

@@ -63,7 +63,7 @@ parser.add_argument('--momentum', default=0.9, type=float, metavar='M',     help
 parser.add_argument('--weight_decay', default=0.0, type=float,     help='weight_decay')
 parser.add_argument('-world_size', '--world_size', default=10, type=int, help='total number of nodes')
 parser.add_argument('--epochs', default=100, type=int, metavar='N',   help='number of total epochs to run')
-parser.add_argument('--optimizer', default='ngc', type=str,  help='global optimizer = [d-psgd, cga, ngc, compcga, compngc, topk-ngc]')
+parser.add_argument('--optimizer', default='ngc', type=str,  help='global optimizer = [d-psgd, cga, ngc, compcga, compngc, topkngc]')
 parser.add_argument('--graph', '-g',  default='ring', help = 'graph structure - [ring, torus]' )
 parser.add_argument('--neighbors', default=2, type=int,     help='number of neighbors per node')
 parser.add_argument('-d', '--devices', default=4, type=int, help='number of gpus/devices on the card')
@@ -134,6 +134,8 @@ def run(rank, size):
         sender = CompCGA_sender(model, device)
     elif args.optimizer.lower()=="compngc":
         sender = CompNGC_sender(model, device)
+    elif args.optimizer.lower()=="topkngc":
+        sender = Topk_NGC_sender(model, device)
     else:
         sender=None
 
@@ -180,6 +182,8 @@ def run(rank, size):
         receiver  = NGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors, alpha = args.alpha)
     elif args.optimizer.lower()=='compngc':
         receiver = CompNGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors, alpha = args.alpha)
+    elif args.optimizer.lower()=='topkngc':
+        receiver  = Topk_NGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors, alpha = args.alpha)
     else:
         receiver = DSGD_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay)
     
