@@ -233,7 +233,8 @@ def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size,
     bsz = int((batch_size) / float(size))
 
     # Choose partition mode: skew < 0.5 is iid, skew >= 0.5 is sort
-    partition_mode = "sort" if float(skew) >= 0.5 else "iid"
+    if partition_mode is None:
+        partition_mode = "sort" if float(skew) >= 0.5 else "iid"
 
     if partition_mode in ["iid", "random"]:
         partition_sizes = [1.0/size for _ in range(size)]
