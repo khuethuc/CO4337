@@ -200,6 +200,14 @@ def run(rank, size):
         attack_alpha=args.attack_alpha,
     )
     val_loader, bsz_val = test_Dataset(args.dataset, args.data_dir)
+
+    local_len = len(train_loader)
+    lens = [None for _ in range(args.world_size)]
+    dist.all_gather_object(lens, local_len)
+    min_len = min(lens)
+    if rank == 0:
+        print("train_loader lens:", lens, "=> use min_len:", min_len)
+
    
    # Check non-iid distribution
     check_noniid(train_loader, rank, args.world_size)
@@ -231,11 +239,14 @@ def run(rank, size):
             
     for epoch in range(0, args.epochs):  
         print('current lr {:.5e}'.format(optimizer.param_groups[0]['lr']))
-        model.block()
-        dt, prec1, loss = train(train_loader, model, criterion, optimizer, epoch, bsz_train, optimizer.param_groups[0]['lr'], device, receiver, sender)
+        dist.barrier()
+        dt, prec1, loss = train(train_loader, model, criterion, optimizer, epoch, bsz_train,
+                        optimizer.param_groups[0]['lr'], device, receiver, sender, min_len=min_len)
+
         data_transferred += dt
         if epoch>=0: lr_scheduler.step()
         prec1, loss = validate(val_loader, model, criterion, bsz_val,device, epoch)
+        dist.barrier()
         is_best = prec1 > best_prec1
         best_prec1 = max(prec1, best_prec1)
         save_checkpoint({
@@ -252,7 +263,7 @@ def run(rank, size):
     torch.save((prec1, prec1_final, (data_transferred+dt)/1.0e9), os.path.join(args.save_dir, "excel_data","rank_{}.sp".format(rank)))
 
 #def train(train_loader, model, criterion, optimizer, epoch, batch_size, writer, device):
-def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, device, receiver=None, sender=None):
+def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, device, receiver=None, sender=None, min_len = None):
     """
         Run one train epoch
     """
@@ -270,6 +281,8 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
     end = time.time()
     step = len(train_loader)*batch_size*epoch
     for i, (input, target) in enumerate(train_loader):
+        if min_len is not None and i >= min_len:
+            break
         #print(dist.get_rank(), torch.unique(target))
         data_time.update(time.time() - end)
         input_var, target_var = Variable(input).to(device), Variable(target).to(device)
@@ -603,4 +616,3 @@ if __name__ == '__main__':
         excel_data["data transferred"][i] = d_tfr
         
     torch.save(excel_data, os.path.join(args.save_dir, "excel_data","dict"))
-    
