@@ -168,9 +168,14 @@ def run(rank, size):
  
     train_loader, bsz_train = partition_trainDataset(args.dataset, args.data_dir, args.skew, args.seed, args.batch_size)
     val_loader, bsz_val     = test_Dataset(args.dataset, args.data_dir)
-   
-   # Check non-iid distribution
-    check_noniid(train_loader, rank, args.world_size)
+    
+    is_multilabel = (args.dataset.lower() in ["mimic_cxr","mimic"])
+    # Check non-iid distribution
+    if is_multilabel:
+        check_noniid_multilabel(train_loader, rank, args.world_size)
+    else:
+        check_noniid_singlelabel(train_loader, rank, args.world_size)
+
 
     if args.optimizer.lower()=='cga':
         receiver  = CGA_receiver(model, device, rank,  args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors)
@@ -185,8 +190,12 @@ def run(rank, size):
     
 
     optimizer = optim.SGD(model.parameters(), args.lr)
-    
-    criterion = nn.CrossEntropyLoss().to(device)
+
+    if is_multilabel:
+        criterion = nn.BCEWithLogitsLoss().to(device)
+    else:
+        criterion = nn.CrossEntropyLoss().to(device)
+
     if args.steplr:
         lr_scheduler = optim.lr_scheduler.StepLR(optimizer, gamma = 0.981, step_size=1)
     else:
@@ -198,10 +207,11 @@ def run(rank, size):
     for epoch in range(0, args.epochs):  
         print('current lr {:.5e}'.format(optimizer.param_groups[0]['lr']))
         model.block()
-        dt, prec1, loss = train(train_loader, model, criterion, optimizer, epoch, bsz_train, optimizer.param_groups[0]['lr'], device, receiver, sender)
+        dt, prec1, loss = train(train_loader, model, criterion, optimizer, epoch, bsz_train, optimizer.param_groups[0]['lr'], device, receiver, sender, is_multilabel=is_multilabel)
+
         data_transferred += dt
         if epoch>=0: lr_scheduler.step()
-        prec1, loss = validate(val_loader, model, criterion, bsz_val,device, epoch)
+        prec1, loss = validate(val_loader, model, criterion, bsz_val,device, epoch, is_multilabel=is_multilabel)
         is_best = prec1 > best_prec1
         best_prec1 = max(prec1, best_prec1)
         save_checkpoint({
@@ -212,13 +222,12 @@ def run(rank, size):
     #############################
     average_parameters(model)
     print('Final test accuracy')
-    prec1_final, _ = validate(val_loader, model, criterion, bsz_val,device, epoch)
+    prec1_final, _ = validate(val_loader, model, criterion, bsz_val,device, epoch, is_multilabel=is_multilabel)
     print("Rank : ", rank, "Data transferred(in GB) during training: ", data_transferred/1.0e9, "\n")
     #Store processed data
     torch.save((prec1, prec1_final, (data_transferred+dt)/1.0e9), os.path.join(args.save_dir, "excel_data","rank_{}.sp".format(rank)))
 
-#def train(train_loader, model, criterion, optimizer, epoch, batch_size, writer, device):
-def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, device, receiver=None, sender=None):
+def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, device, receiver=None, sender=None, is_multilabel=False):
     """
         Run one train epoch
     """
@@ -271,27 +280,43 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
         output = output.float()
         loss = loss.float()
         # measure accuracy and record loss
-        prec1 = accuracy(output.data, target_var)[0]
         losses.update(loss.item(), input.size(0))
-        top1.update(prec1.item(), input.size(0))
+
+        if is_multilabel:
+            prec1, rec, f1 = multilabel_micro_prf1(output.detach(), target_var.detach(), thr=0.5)
+            # dùng meter top1 để lưu F1 (tên biến top1 không đổi để khỏi sửa nhiều nơi)
+            top1.update(f1, input.size(0))
+        else:
+            prec1 = accuracy(output.data, target_var)[0]
+            top1.update(prec1.item(), input.size(0))
+
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
+
+        if is_multilabel:
+            metric_name = "F1"
+        else:
+            metric_name = "Prec@1"
         
         if i % args.print_freq == 0:
             print('Rank: {0}\t'
                   'Epoch: [{1}][{2}/{3}]\t'
                   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
+                  '{metric_name} {top1.val:.3f} ({top1.avg:.3f})'.format(
                       dist.get_rank(), epoch, i, len(train_loader),  batch_time=batch_time,
-                      loss=losses, top1=top1))
+                      loss=losses, top1=top1, metric_name=metric_name))
         step += batch_size
     
     all_outputs = torch.cat(all_outputs, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
 
-    prec, rec, f1 = precision_recall_f1(all_outputs, all_targets, num_classes=args.classes)
+    if is_multilabel:
+        prec, rec, f1 = multilabel_micro_prf1(all_outputs, all_targets, thr=0.5)
+    else:
+        prec, rec, f1 = precision_recall_f1(all_outputs, all_targets, num_classes=args.classes)
+
 
     #auc, auprc = auc_auprc(all_outputs, all_targets, average="macro")
 
@@ -310,8 +335,7 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
     return data_transferred, top1.avg, losses.avg
 
 
-def validate(val_loader, model, criterion, batch_size, device, epoch=0):
-#def validate(val_loader, model, criterion, batch_size, writer, device, epoch=0):
+def validate(val_loader, model, criterion, batch_size, device, epoch=0, is_multilabel=False):
     """
     Run evaluation
     """
@@ -335,38 +359,50 @@ def validate(val_loader, model, criterion, batch_size, device, epoch=0):
             loss = criterion(output, target_var)
             output = output.float()
             loss = loss.float()
+            losses.update(loss.item(), input.size(0))
 
             all_outputs.append(output.cpu())
             all_targets.append(target.cpu())
 
             # measure accuracy and record loss
-            prec1 = accuracy(output.data, target_var)[0]
-            losses.update(loss.item(), input.size(0))
-            top1.update(prec1.item(), input.size(0))
+            if is_multilabel:
+                prec1, rec, f1 = multilabel_micro_prf1(output.detach(), target_var.detach(), thr=0.5)
+                top1.update(f1, input.size(0))
+            else:
+                prec1 = accuracy(output.data, target_var)[0]
+                top1.update(prec1.item(), input.size(0))
+
 
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
+
+            if is_multilabel:
+                metric_name = "F1"
+            else:
+                metric_name = "Prec@1"
 
             if i % args.print_freq == 0:
                 print('Rank: {0}\t'
                       'Test: [{1}/{2}]\t'
                       #'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                       'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                      'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
+                      '{metric_name} {top1.val:.3f} ({top1.avg:.3f})'.format(
                           dist.get_rank(),i, len(val_loader), 
                           #batch_time=batch_time, 
                           loss=losses,
-                          top1=top1))
+                          top1=top1, metric_name=metric_name))
             step += batch_size
-    print('Rank:{0}, Prec@1 {top1.avg:.3f}'.format(dist.get_rank(),top1=top1))
+    print('Rank:{0}, {metric_name} {top1.avg:.3f}'.format(dist.get_rank(),top1=top1, metric_name=metric_name))
     
     all_outputs = torch.cat(all_outputs, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
 
-    prec, rec, f1 = precision_recall_f1(
-        all_outputs, all_targets, num_classes=args.classes
-    )
+    if is_multilabel:
+        prec, rec, f1 = multilabel_micro_prf1(all_outputs, all_targets, thr=0.5)
+    else:
+        prec, rec, f1 = precision_recall_f1(all_outputs, all_targets, num_classes=args.classes)
+
 
     # auc, auprc = auc_auprc(
     #     all_outputs, all_targets, average="macro"
@@ -454,36 +490,25 @@ def precision_recall_f1(output, target, num_classes):
         sum(f1_list)/num_classes * 100,
     )
 
-def auc_auprc(output, target, average="macro"):
+def multilabel_micro_prf1(logits, targets, thr=0.5, eps=1e-9):
     """
-    Compute ROC-AUC and AUPRC
-    - output: logits [N, C] or [N]
-    - target: ground truth labels [N]
+    Multi-label micro Precision/Recall/F1.
+    logits: Tensor [N, C] (raw output before sigmoid)
+    targets: Tensor [N, C] with 0/1 floats
     """
-    target = target.cpu().numpy()
+    probs = torch.sigmoid(logits)
+    preds = (probs >= thr).to(targets.dtype)
 
-    # Binary classification
-    if output.ndim == 1:
-        score = torch.sigmoid(output).cpu().numpy()
-        auc = roc_auc_score(target, score)
-        auprc = average_precision_score(target, score)
+    tp = (preds * targets).sum()
+    fp = (preds * (1 - targets)).sum()
+    fn = ((1 - preds) * targets).sum()
 
-    # Multi-class classification
-    else:
-        score = torch.softmax(output, dim=1).cpu().numpy()
-        auc = roc_auc_score(
-            target,
-            score,
-            multi_class="ovr",
-            average=average
-        )
-        auprc = average_precision_score(
-            target,
-            score,
-            average=average
-        )
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+    f1 = 2 * precision * recall / (precision + recall + eps)
 
-    return auc * 100, auprc * 100
+    return precision.item() * 100.0, recall.item() * 100.0, f1.item() * 100.0
+
 
 def flatten_tensors(tensors):
     if len(tensors) == 1:
@@ -505,7 +530,7 @@ def init_process(rank, size, fn, backend='nccl'):
     dist.init_process_group(backend, rank=rank, world_size=size)
     fn(rank,size)
 
-def check_noniid(train_loader, rank, world_size):
+def check_noniid_singlelabel(train_loader, rank, world_size):
     # 1. Counting local label distribution
     local_counter = Counter()
     for _, targets in train_loader: # train_loader returns (input, targets)
@@ -533,6 +558,44 @@ def check_noniid(train_loader, rank, world_size):
         print("\nL1 distance:")
         for rank, value in enumerate(l1_distance):
                 print(f"Rank {rank}: {value:.3f}")    
+
+def check_noniid_multilabel(train_loader, rank, world_size):
+    """
+    Multi-label: in ra prevalence mỗi nhãn theo rank (mean của target[:,c]).
+    """
+    local_sum = None
+    local_cnt = 0
+
+    for _, targets in train_loader:
+        t = targets.float()
+        if local_sum is None:
+            local_sum = t.sum(dim=0)
+        else:
+            local_sum += t.sum(dim=0)
+        local_cnt += t.size(0)
+
+    local_sum = local_sum.cpu()
+    local_cnt = float(local_cnt)
+
+    all_sums = [None for _ in range(world_size)]
+    all_cnts = [None for _ in range(world_size)]
+    dist.all_gather_object(all_sums, local_sum)
+    dist.all_gather_object(all_cnts, local_cnt)
+
+    if rank == 0:
+        print("= = = CHECK MULTI-LABEL NON-IID (prevalence per class) = = =")
+        mat = []
+        for r in range(world_size):
+            prev = (all_sums[r] / max(all_cnts[r], 1.0)).numpy()
+            mat.append(prev)
+            # in 10 nhãn đầu để khỏi quá dài
+            print(f"Rank {r} prevalence (first 10): {prev[:10]}")
+        mat = np.stack(mat, axis=0)
+        mean_prev = mat.mean(axis=0)
+        l1 = np.abs(mat - mean_prev).sum(axis=1)
+        print("L1 distance to mean prevalence:")
+        for r in range(world_size):
+            print(f"Rank {r}: {l1[r]:.3f}")
 
 if __name__ == '__main__':
     size = args.world_size
