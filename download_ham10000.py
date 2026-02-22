@@ -1,229 +1,180 @@
 """
-download_ham10000.py
+URL: https://isic-archive.s3.amazonaws.com/images/<ISIC_ID>.jpg
 
-Download Skin Cancer / HAM10000 (CSV + optional images) into ../data.
-
-Default Kaggle dataset:
-  harish20ug0429/skin-cancer
-This Kaggle dataset includes:
-  - HAM10000_metadata.csv
-  - hmnist_28_28_L.csv
-  - hmnist_28_28_RGB.csv
-  - hmnist_8_8_L.csv
-  - hmnist_8_8_RGB.csv
-  - Images/ ... (optional, depends on dataset package)
-
-Usage:
-  python download_ham10000.py
-  python download_ham10000.py --out-root ../data --subdir ham10000
-  python download_ham10000.py --force
-  python download_ham10000.py --dataset <owner/dataset-slug>
-
-Kaggle credentials:
-  - Put kaggle.json at ~/.kaggle/kaggle.json
-    (Linux/macOS) chmod 600 ~/.kaggle/kaggle.json
-  OR
-  - export KAGGLE_USERNAME=...
-    export KAGGLE_KEY=...
+Command:
+  python download_ham10000.py --out data/ham10000
+  python download_ham10000.py --out data/ham10000 --csv /path/to/HAM10000_metadata.csv
+  python download_ham10000.py --out data/ham10000 --workers 16 --resume
 """
 
 from __future__ import annotations
 
 import argparse
-import os
-import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Iterable, Tuple
+
+import pandas as pd
+import requests
+from tqdm import tqdm
 
 
-EXPECTED_FILES = [
-    "HAM10000_metadata.csv",
-    "hmnist_28_28_L.csv",
-    "hmnist_28_28_RGB.csv",
-    "hmnist_8_8_L.csv",
-    "hmnist_8_8_RGB.csv",
-]
+S3_IMAGE_URL = "https://isic-archive.s3.amazonaws.com/images/{isic_id}.jpg"
 
 
-def eprint(*args, **kwargs):
-    print(*args, file=sys.stderr, **kwargs)
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Download HAM10000 images based on local HAM10000_metadata.csv (no Kaggle).")
+    ap.add_argument(
+        "--csv",
+        type=str,
+        default="/mnt/data/HAM10000_metadata.csv",
+        help="Path to HAM10000_metadata.csv (default: /mnt/data/HAM10000_metadata.csv).",
+    )
+    ap.add_argument(
+        "--out",
+        type=str,
+        required=True,
+        help="Output folder to save images + copy of metadata (ex: data/ham10000).",
+    )
+    ap.add_argument("--workers", type=int, default=12)
+    ap.add_argument("--timeout", type=int, default=60)
+    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--retries", type=int, default=2)
+    ap.add_argument("--user-agent", default="ham10000-downloader/1.0")
+    return ap.parse_args()
 
 
-def resolve_default_out_dir(out_root: Optional[str], subdir: str) -> Path:
-    script_dir = Path(__file__).resolve().parent
-    root = Path(out_root) if out_root is not None else (script_dir / ".." / "data")
-    return (root / subdir).resolve()
+def make_session(user_agent: str) -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent": user_agent})
+    return s
 
 
-def ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
+def load_isic_ids(csv_path: Path) -> list[str]:
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Cannot find file CSV: {csv_path}")
+
+    df = pd.read_csv(csv_path)
+
+    if "image_id" not in df.columns:
+        raise ValueError(f"CSV has no column 'image_id'. Existed columns: {list(df.columns)}")
+
+    ids = df["image_id"].astype(str).tolist()
+    ids = [x.strip() for x in ids if x and x.strip().startswith("ISIC_")]
+
+    seen = set()
+    out = []
+    for x in ids:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+
+    if not out:
+        raise ValueError("Cannot extract image_id started by 'ISIC_' from CSV.")
+    return out
 
 
-def kaggle_api():
+def download_one(
+    s: requests.Session,
+    isic_id: str,
+    dst: Path,
+    timeout: int,
+    retries: int,
+) -> Tuple[str, bool, str]:
     """
-    Import KaggleApi. Provide a helpful message if missing.
+    Returns: (isic_id, ok, err_msg)
     """
-    try:
-        from kaggle.api.kaggle_api_extended import KaggleApi  # type: ignore
-    except Exception as ex:
-        raise RuntimeError(
-            "Missing Kaggle client. Install with:\n"
-            "  pip install kaggle\n"
-            "Then configure credentials:\n"
-            "  ~/.kaggle/kaggle.json  (chmod 600)\n"
-            "or env vars KAGGLE_USERNAME, KAGGLE_KEY\n"
-        ) from ex
-    return KaggleApi()
+    url = S3_IMAGE_URL.format(isic_id=isic_id)
 
+    last_err = ""
+    for attempt in range(retries + 1):
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            with s.get(url, stream=True, timeout=timeout) as r:
+                r.raise_for_status()
+                tmp = dst.with_suffix(dst.suffix + ".part")
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                tmp.replace(dst)
+            return isic_id, True, ""
+        except Exception as e:
+            last_err = str(e)
+            try:
+                tmp = dst.with_suffix(dst.suffix + ".part")
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
 
-def authenticate(api) -> None:
-    """
-    Kaggle authentication with clear error instructions.
-    """
-    try:
-        api.authenticate()
-    except Exception as ex:
-        raise RuntimeError(
-            "Kaggle authentication failed.\n"
-            "Fix by either:\n"
-            "  1) Put kaggle.json at ~/.kaggle/kaggle.json and chmod 600 it\n"
-            "     - Download from https://www.kaggle.com/settings/account (Create New API Token)\n"
-            "  2) Or set env vars:\n"
-            "     export KAGGLE_USERNAME=...\n"
-            "     export KAGGLE_KEY=...\n"
-        ) from ex
-
-
-def already_have_all_files(dst_dir: Path) -> bool:
-    return all((dst_dir / f).exists() for f in EXPECTED_FILES)
-
-
-def find_files(root: Path, filenames: List[str]) -> Dict[str, Path]:
-    """
-    Search for filenames under root and return {filename: found_path}.
-    """
-    found: Dict[str, Path] = {}
-    target_set = set(filenames)
-
-    for p in root.rglob("*"):
-        if not p.is_file():
-            continue
-        name = p.name
-        if name in target_set and name not in found:
-            found[name] = p
-            if len(found) == len(filenames):
-                break
-    return found
-
-
-def move_to_root(dst_dir: Path, found: Dict[str, Path], force: bool) -> None:
-    """
-    Move each found file into dst_dir root.
-    If a file already exists:
-      - force=True -> overwrite
-      - else -> skip
-    """
-    for name, src in found.items():
-        dst = dst_dir / name
-        if dst.exists():
-            if not force:
-                print(f"[skip] {name} already exists at {dst}")
+            if attempt < retries:
                 continue
-            dst.unlink()
+            return isic_id, False, last_err
 
-        if src.resolve() == dst.resolve():
-            continue
-
-        ensure_dir(dst.parent)
-        shutil.move(str(src), str(dst))
-        print(f"[ok] moved {name} -> {dst}")
+    return isic_id, False, last_err
 
 
-def download_from_kaggle(dataset: str, dst_dir: Path, unzip: bool) -> None:
-    api = kaggle_api()
-    authenticate(api)
+def main() -> int:
+    args = parse_args()
+    csv_path = Path(args.csv)
+    out_dir = Path(args.out)
+    images_dir = out_dir / "images"
 
-    print(f"[download] kaggle dataset: {dataset}")
-    print(f"[download] target dir: {dst_dir}")
-    ensure_dir(dst_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    images_dir.mkdir(parents=True, exist_ok=True)
 
-    # Kaggle downloads a zip; unzip=True extracts automatically
-    api.dataset_download_files(dataset, path=str(dst_dir), unzip=unzip, quiet=False)
-    print("[ok] kaggle download finished")
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        default="harish20ug0429/skin-cancer",
-        help="Kaggle dataset slug (owner/dataset). Default matches the CSV filenames used by your dataloader.",
-    )
-    parser.add_argument(
-        "--out-root",
-        type=str,
-        default=None,
-        help="Output root directory. Default: ../data (relative to this script).",
-    )
-    parser.add_argument(
-        "--subdir",
-        type=str,
-        default="ham10000",
-        help="Subfolder under out-root. Default: ham10000",
-    )
-    parser.add_argument(
-        "--no-unzip",
-        action="store_true",
-        help="Do not unzip downloaded archive.",
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Overwrite existing expected CSV files if present.",
-    )
-    args = parser.parse_args()
-
-    dst_dir = resolve_default_out_dir(args.out_root, args.subdir)
-    ensure_dir(dst_dir)
-
-    if already_have_all_files(dst_dir) and not args.force:
-        print(f"[ok] All expected files already exist in {dst_dir}")
-        print("Files:")
-        for f in EXPECTED_FILES:
-            print(f"  - {dst_dir / f}")
-        return
-
-    # Step 1: Download from Kaggle
     try:
-        download_from_kaggle(args.dataset, dst_dir, unzip=not args.no_unzip)
-    except Exception as ex:
-        eprint(str(ex))
-        sys.exit(1)
+        isic_ids = load_isic_ids(csv_path)
+    except Exception as e:
+        print(f"[ERROR] {e}", file=sys.stderr)
+        return 1
 
-    # Step 2: After download, ensure the expected CSVs are in dst_dir root
-    found = find_files(dst_dir, EXPECTED_FILES)
-    if len(found) == 0:
-        eprint("[warn] Could not find any expected CSV files after download.")
-    else:
-        move_to_root(dst_dir, found, force=args.force)
+    try:
+        (out_dir / "HAM10000_metadata.csv").write_bytes(csv_path.read_bytes())
+    except Exception:
+        pass
+    (out_dir / "isic_ids.txt").write_text("\n".join(isic_ids) + "\n", encoding="utf-8")
 
-    # Step 3: Verify
-    missing = [f for f in EXPECTED_FILES if not (dst_dir / f).exists()]
-    print("\n[verify]")
-    if missing:
-        eprint("[warn] Missing files:")
-        for f in missing:
-            eprint(f"  - {f}")
-        eprint("\nTip: re-run with --force, or check Kaggle dataset contents / slug.")
-        sys.exit(2)
+    print(f"[INFO] Read from CSV: {csv_path}")
+    print(f"[INFO] Number of image_id (unique): {len(isic_ids)}")
+    print(f"[INFO] Output: {out_dir.resolve()}")
 
-    print("[ok] All expected files are ready:")
-    for f in EXPECTED_FILES:
-        print(f"  - {dst_dir / f}")
-    print(f"\nDone. Dataset saved at: {dst_dir}")
+    # Lọc jobs theo resume
+    jobs = []
+    skipped = 0
+    for isic_id in isic_ids:
+        dst = images_dir / f"{isic_id}.jpg"
+        if args.resume and dst.exists() and dst.stat().st_size > 0:
+            skipped += 1
+            continue
+        jobs.append((isic_id, dst))
+
+    print(f"[INFO] Need to download: {len(jobs)} image (skipped={skipped}, resume={args.resume})")
+
+    s = make_session(args.user_agent)
+
+    failures = []
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
+        futs = [
+            ex.submit(download_one, s, isic_id, dst, args.timeout, args.retries)
+            for (isic_id, dst) in jobs
+        ]
+        for fut in tqdm(as_completed(futs), total=len(futs), desc="Downloading", unit="img"):
+            isic_id, ok, err = fut.result()
+            if not ok:
+                failures.append((isic_id, err))
+
+    if failures:
+        fail_path = out_dir / "failed_ids.txt"
+        fail_path.write_text("\n".join([f"{i}\t{e}" for i, e in failures]) + "\n", encoding="utf-8")
+        print(f"[WARN] Error {len(failures)} image. Saved: {fail_path}")
+        return 2
+
+    print("[DONE] Download HAM10000 successfully")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
