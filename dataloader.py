@@ -7,7 +7,51 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torch.distributed as dist
 import random
-import copy
+import pandas as pd
+from PIL import Image
+from sklearn.model_selection import train_test_split
+
+
+_HAM_CACHE = {}
+
+def _load_ham10000_rgb(data_dir, filename="hmnist_28_28_RGB.csv"):
+    """
+      - pixel0000..pixel2351: 28*28*3 = 2352 pixels
+      - label: int 0..6
+    """
+    path = os.path.join(data_dir, filename)
+    key = os.path.abspath(path)
+
+    if key in _HAM_CACHE:
+        return _HAM_CACHE[key]
+
+    df = pd.read_csv(path)
+    y = df["label"].to_numpy(dtype=np.int64)  # (N,)
+    X = df.drop(columns=["label"]).to_numpy(dtype=np.uint8)  # (N, 2352)
+    X = X.reshape(-1, 28, 28, 3)  # (N, H, W, C)
+
+    _HAM_CACHE[key] = (X, y)
+    return X, y
+
+
+class HAM10000CSVDataset(torch.utils.data.Dataset):
+    def __init__(self, X, y, indices=None, transform=None):
+        self.X = X
+        self.y = y
+        self.indices = np.array(indices) if indices is not None else np.arange(len(y))
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, i):
+        idx = int(self.indices[i])
+        img = Image.fromarray(self.X[idx])  # PIL (H, W, C)
+        target = int(self.y[idx])
+
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, target
 
 class Partition(object):
     def __init__(self, data, index):
@@ -20,8 +64,7 @@ class Partition(object):
     def __getitem__(self, index):
         data_idx = self.index[index]
         return self.data[data_idx]
-            
-    
+                
 class DataPartitioner(object):
     """ Partitions a dataset into different chunks"""
     def __init__(self, data, sizes, skew, seed, dataset_name):
@@ -31,12 +74,14 @@ class DataPartitioner(object):
         data_len = len(data)
         dataset = torch.utils.data.DataLoader(data, batch_size=1024, shuffle=False, num_workers=32)
         labels = []
+
+        cache_file = f"labels_{dataset_name}_n{len(data)}_seed{seed}.npy"
         try:
-            labels = np.load('labels'+str(dataset_name)+'.npy')
+            labels = np.load(cache_file).tolist()
         except:
-            for batch_idx, (inputs, targets) in enumerate(dataset):
-                labels = labels+targets.tolist()
-            np.save('labels'+str(dataset_name)+'.npy', labels)
+            for _, targets in dataset:
+                labels = labels + targets.tolist()
+            np.save(cache_file, np.array(labels, dtype=np.int64))
         
         rng = random.Random()
         rng.seed(seed)
@@ -58,12 +103,30 @@ class DataPartitioner(object):
                 part_len = int(frac*data_len)
                 self.partitions.append(indices_rand[0:part_len])
                 indices_rand = indices_rand[part_len:] 
+            else:
+                # 0 < skew < 1: mix sorted and random
+                n = len(labels)
+                n_sorted = int(skew * n)
+                chosen = set()
+                mixed = []
+                # first part is sorted (label-skew)
+                for idx in sort_indices[:n_sorted]:
+                    mixed.append(idx)
+                    chosen.add(idx)
+                # second part is random
+                for idx in indices_rand:
+                    if idx not in chosen:
+                        mixed.append(idx)
+
+                part_len = int(frac * data_len)
+                self.partitions.append(mixed[:part_len])
+
+                sort_indices = mixed[part_len:]
 
 
     def use(self, partition):
         return Partition(self.data, self.partitions[partition])
 
-    
 def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size):
     """Partitioning dataset""" 
     if dataset_name== 'cifar10':
@@ -120,9 +183,26 @@ def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size):
                                  transforms.RandomResizedCrop(224),
                                  transforms.RandomHorizontalFlip(),
                                  transforms.ToTensor(), normalize,])
-        #data_dir = "/local/a/imagenet/imagenet2012/" #
         dataset = datasets.ImageFolder(os.path.join(data_dir, 'train'), data_transforms)
-        #print(len(dataset))          
+
+    elif dataset_name == "ham10000":
+        normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5],
+                                        std=[0.5, 0.5, 0.5])
+        train_tf = transforms.Compose([
+            transforms.Resize(32),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(10),
+            transforms.ToTensor(),
+            normalize,
+        ])
+
+        X, y = _load_ham10000_rgb(data_dir)
+
+        all_idx = np.arange(len(y))
+        train_idx, _ = train_test_split(
+            all_idx, test_size=0.2, random_state=seed, stratify=y
+        )
+        dataset = HAM10000CSVDataset(X, y, indices=train_idx, transform=train_tf)          
        
     size = dist.get_world_size()
     #print(size)
@@ -136,8 +216,7 @@ def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size):
     return train_set, bsz
 
 
-def test_Dataset(dataset_name, data_dir):
-  
+def test_Dataset(dataset_name, data_dir, seed=321):
     if dataset_name=='cifar10':
         normalize = transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
                                      std=[0.2023, 0.1994, 0.2010])
@@ -187,6 +266,20 @@ def test_Dataset(dataset_name, data_dir):
                                  transforms.CenterCrop(224),
                                  transforms.ToTensor(), normalize,])
         dataset = datasets.ImageFolder(os.path.join(data_dir, 'val'),  data_transforms)
+    elif dataset_name == "ham10000":
+        normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5],
+                                        std=[0.5, 0.5, 0.5])
+        val_tf = transforms.Compose([
+            transforms.Resize(32),
+            transforms.ToTensor(),
+            normalize,
+        ])
+        X, y = _load_ham10000_rgb(data_dir)
+        all_idx = np.arange(len(y))
+        _, val_idx = train_test_split(
+            all_idx, test_size=0.2, random_state=seed, stratify=y
+        )
+        dataset = HAM10000CSVDataset(X, y, indices=val_idx, transform=val_tf)
 
     val_bsz = 128
     val_set = torch.utils.data.DataLoader(dataset, batch_size=val_bsz, shuffle=False, num_workers=2)

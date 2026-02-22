@@ -169,7 +169,7 @@ def run(rank, size):
     model.to(device)
  
     train_loader, bsz_train = partition_trainDataset(args.dataset, args.data_dir, args.skew, args.seed, args.batch_size)
-    val_loader, bsz_val     = test_Dataset(args.dataset, args.data_dir)
+    val_loader, bsz_val     = test_Dataset(args.dataset, args.data_dir, seed=args.seed)
    
    # Check non-iid distribution
     check_noniid(train_loader, rank, args.world_size)
