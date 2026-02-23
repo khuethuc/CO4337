@@ -52,7 +52,7 @@ parser.add_argument('--arch', '-a', metavar='ARCH', default='cganet', help = 're
 parser.add_argument('-depth', '--depth', default=20, type=int, help='depth of the resnet model')
 parser.add_argument('--normtype',   default='evonorm', help = 'none or batchnorm or groupnorm or evonorm' )
 parser.add_argument('--data-dir', dest='data_dir',    help='The directory used to save the trained models',   default='../../data', type=str)
-parser.add_argument('--dataset', dest='dataset',     help='available datasets: cifar10, cifar100, imagenette', default='cifar10', type=str)
+parser.add_argument('--dataset', dest='dataset',     help='available datasets: cifar10, cifar100, imagenette, ham10000', default='cifar10', type=str)
 parser.add_argument('--skew', default=1.0, type=float,     help='obelongs to [0,1] where 0= completely iid and 1=completely non-iid')
 parser.add_argument('--classes', default=10, type=int,     help='number of classes in the dataset')
 parser.add_argument('-b', '--batch-size', default=160, type=int,  help='mini-batch size (default: 128)')
@@ -297,8 +297,6 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
 
     prec, rec, f1 = precision_recall_f1(all_outputs, all_targets, num_classes=args.classes)
 
-    #auc, auprc = auc_auprc(all_outputs, all_targets, average="macro")
-
     if dist.get_rank() == 0:
         print(
             f"[Train][Epoch {epoch}] "
@@ -306,10 +304,6 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
             f"Recall = {rec:.2f}  "
             f"F1 = {f1:.2f}  "
         )
-        # print(
-        #     f"AUC = {auc:.2f}  "
-        #     f"AUPRC = {auprc:.2f}"
-        # )
 
     return data_transferred, top1.avg, losses.avg
 
@@ -502,12 +496,16 @@ def average_parameters(model):
         param.data /= size
 
 def init_process(rank, size, fn, backend='nccl'):
-    """Initialize distributed enviornment"""
     torch.cuda.set_device(rank)
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = args.port
     dist.init_process_group(backend, rank=rank, world_size=size)
-    fn(rank,size)
+    dist.barrier() 
+    try:
+        fn(rank, size)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 def check_noniid(train_loader, rank, world_size):
     # 1. Counting local label distribution

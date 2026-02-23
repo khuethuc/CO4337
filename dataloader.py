@@ -51,7 +51,6 @@ _HAM10000_DX_TO_LABEL = {
 
 def _find_metadata_path(data_dir: str) -> str:
     candidates = [
-        os.path.join(data_dir, "HAM10000_metadata.csv"),
         os.path.join(data_dir, "isic_ham10000_metadata.csv"),
     ]
     for p in candidates:
@@ -201,16 +200,24 @@ class DataPartitioner(object):
         self.data = data
         self.partitions = []
         data_len = len(data)
-        dataset = torch.utils.data.DataLoader(data, batch_size=1024, shuffle=False, num_workers=32)
-        labels = []
-
-        cache_file = f"labels_{dataset_name}_n{len(data)}_seed{seed}.npy"
-        try:
-            labels = np.load(cache_file).tolist()
-        except:
-            for _, targets in dataset:
-                labels = labels + targets.tolist()
-            np.save(cache_file, np.array(labels, dtype=np.int64))
+        # -------- labels: take directly from dataset --------
+        if hasattr(data, "targets"):
+            labels = [int(x) for x in data.targets]
+        elif hasattr(data, "y") and hasattr(data, "indices"):
+            # IMPORTANT: data.y is global labels, but len(data) is subset length
+            labels = [int(data.y[int(idx)]) for idx in data.indices]
+        elif hasattr(data, "y"):
+            labels = [int(x) for x in data.y]
+        elif hasattr(data, "labels"):
+            labels = [int(x) for x in data.labels]
+        else:
+            loader = torch.utils.data.DataLoader(data, batch_size=1024, shuffle=False, num_workers=0)
+            labels = []
+            for _, targets in loader:
+                labels.extend([int(t) for t in targets])
+        
+        assert len(labels) == len(data), f"labels({len(labels)}) != len(data)({len(data)})"
+        # -------- end labels --------
         
         rng = random.Random()
         rng.seed(seed)
@@ -334,7 +341,7 @@ def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size):
     #print(partition_sizes, len(dataset))
     partition = DataPartitioner(dataset, partition_sizes, skew=skew, seed=seed, dataset_name=dataset_name)
     partition = partition.use(dist.get_rank())
-    train_set = torch.utils.data.DataLoader(partition, batch_size=bsz, shuffle=True, num_workers=2)
+    train_set = torch.utils.data.DataLoader(partition, batch_size=bsz, shuffle=True, num_workers=0)
     return train_set, bsz
 
 
@@ -399,6 +406,6 @@ def test_Dataset(dataset_name, data_dir, seed=321):
         dataset = _load_ham10000_images(data_dir=data_dir, seed=seed, train=False, transform=val_tf)
 
     val_bsz = 128
-    val_set = torch.utils.data.DataLoader(dataset, batch_size=val_bsz, shuffle=False, num_workers=2)
+    val_set = torch.utils.data.DataLoader(dataset, batch_size=val_bsz, shuffle=False, num_workers=0)
 
     return val_set, val_bsz
