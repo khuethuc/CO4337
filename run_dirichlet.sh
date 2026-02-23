@@ -1,0 +1,26 @@
+python trainer_dirichlet.py  \
+--data-dir ../data/ham10000 \
+--dataset ham10000 \
+--lr 0.01  \
+--batch-size 160  \
+--world_size 5 \
+--skew 1 \
+--classes 7 \
+--gamma 0.1 \
+--normtype evonorm \
+--optimizer ngc \
+--epoch 10 \
+--arch cganet \
+--momentum 0.9 \
+--alpha 1.0 \
+--graph ring \
+--neighbors 2 \
+--nesterov \
+--partition dirichlet \
+--dirichlet_alpha 0.3 \
+--dirichlet_min_size 10 \
+--dirichlet_attack \
+--adv_ratio 0.2 \
+--adv_contiguous \
+--adv_start 0 \
+--attack_alpha 0.05

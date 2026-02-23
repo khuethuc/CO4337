@@ -52,7 +52,7 @@ parser.add_argument('--arch', '-a', metavar='ARCH', default='cganet', help = 're
 parser.add_argument('-depth', '--depth', default=20, type=int, help='depth of the resnet model')
 parser.add_argument('--normtype',   default='evonorm', help = 'none or batchnorm or groupnorm or evonorm' )
 parser.add_argument('--data-dir', dest='data_dir',    help='The directory used to save the trained models',   default='../../data', type=str)
-parser.add_argument('--dataset', dest='dataset',     help='available datasets: cifar10, cifar100, imagenette', default='cifar10', type=str)
+parser.add_argument('--dataset', dest='dataset',     help='available datasets: cifar10, cifar100, imagenette, ham10000', default='cifar10', type=str)
 parser.add_argument('--skew', default=1.0, type=float,     help='obelongs to [0,1] where 0= completely iid and 1=completely non-iid')
 parser.add_argument('--classes', default=10, type=int,     help='number of classes in the dataset')
 parser.add_argument('-b', '--batch-size', default=160, type=int,  help='mini-batch size (default: 128)')
@@ -199,7 +199,7 @@ def run(rank, size):
         adv_start=args.adv_start,
         attack_alpha=args.attack_alpha,
     )
-    val_loader, bsz_val = test_Dataset(args.dataset, args.data_dir)
+    val_loader, bsz_val = test_Dataset(args.dataset, args.data_dir, seed=args.seed)
 
     local_len = len(train_loader)
     lens = [None for _ in range(args.world_size)]
