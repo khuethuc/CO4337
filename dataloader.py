@@ -12,33 +12,136 @@ from PIL import Image
 from sklearn.model_selection import train_test_split
 
 
-_HAM_CACHE = {}
+_HAM10000_DX_TO_LABEL = {
+    # canonical HAM10000 short codes
+    "akiec": 0,
+    "bcc": 1,
+    "bkl": 2,
+    "df": 3,
+    "mel": 4,
+    "nv": 5,
+    "vasc": 6,
 
-def _load_ham10000_rgb(data_dir, filename="hmnist_28_28_RGB.csv"):
-    """
-      - pixel0000..pixel2351: 28*28*3 = 2352 pixels
-      - label: int 0..6
-    """
-    path = os.path.join(data_dir, filename)
-    key = os.path.abspath(path)
+    # common long-form aliases (ISIC-style)
+    "actinic keratosis": 0,
+    "bowen": 0,
+    "bowen's disease": 0,
+    "intraepithelial carcinoma": 0,
+    "squamous cell carcinoma in situ": 0,
 
-    if key in _HAM_CACHE:
-        return _HAM_CACHE[key]
+    "basal cell carcinoma": 1,
 
-    df = pd.read_csv(path)
-    y = df["label"].to_numpy(dtype=np.int64)  # (N,)
-    X = df.drop(columns=["label"]).to_numpy(dtype=np.uint8)  # (N, 2352)
-    X = X.reshape(-1, 28, 28, 3)  # (N, H, W, C)
+    "benign keratosis": 2,
+    "seborrheic keratosis": 2,
+    "solar lentigo": 2,
+    "lichen planus-like keratosis": 2,
 
-    _HAM_CACHE[key] = (X, y)
-    return X, y
+    "dermatofibroma": 3,
 
+    "melanoma": 4,
 
-class HAM10000CSVDataset(torch.utils.data.Dataset):
-    def __init__(self, X, y, indices=None, transform=None):
-        self.X = X
-        self.y = y
-        self.indices = np.array(indices) if indices is not None else np.arange(len(y))
+    "nevus": 5,
+    "melanocytic nevus": 5,
+
+    "vascular lesion": 6,
+    "angioma": 6,
+    "hemangioma": 6,
+    "pyogenic granuloma": 6,
+}
+
+def _find_metadata_path(data_dir: str) -> str:
+    candidates = [
+        os.path.join(data_dir, "HAM10000_metadata.csv"),
+        os.path.join(data_dir, "isic_ham10000_metadata.csv"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError(
+        f"Cannot find metadata. Need 1 file in: {', '.join(os.path.basename(x) for x in candidates)}"
+    )
+
+def _extract_ids_labels(df: pd.DataFrame):
+    # id column
+    id_candidates = ["isic_id", "image_id", "name", "image", "_id"]
+    id_col = next((c for c in id_candidates if c in df.columns), None)
+    if id_col is None:
+        raise ValueError(f"Cannot find id column in metadata. Columns: {list(df.columns)}")
+    ids_all = df[id_col].astype(str).str.strip().tolist()
+
+    # if numeric label exists, use it
+    if "label" in df.columns:
+        y_all = df["label"].to_numpy(dtype=np.int64)
+        return ids_all, y_all
+
+    # choose the "most specific" diagnosis column available: 3 -> 2 -> 1
+    diag_cols = [c for c in ["diagnosis_3", "diagnosis_2", "diagnosis_1", "dx", "diagnosis", "diagnosis_name"] if c in df.columns]
+    if not diag_cols:
+        raise ValueError(
+            "Metadata has no label and no diagnosis columns. "
+            f"Columns: {list(df.columns)}"
+        )
+
+    # helper to normalize text
+    def norm(x: str) -> str:
+        return str(x).strip().lower()
+
+    # values that are too coarse (can't map to 7 classes)
+    coarse = {"benign", "malignant", "unknown", "nan", "none", ""}
+
+    keep_ids = []
+    keep_y = []
+
+    for i in range(len(df)):
+        isic_id = ids_all[i]
+
+        # pick first non-coarse diagnosis among diag_cols (prefer diagnosis_3 then 2 then 1)
+        chosen = ""
+        for c in diag_cols:
+            v = norm(df.iloc[i][c])
+            if v not in coarse:
+                chosen = v
+                break
+
+        if not chosen:
+            # skip if we only have benign/malignant/unknown
+            continue
+
+        # direct match or substring match
+        if chosen in _HAM10000_DX_TO_LABEL:
+            lab = _HAM10000_DX_TO_LABEL[chosen]
+            keep_ids.append(isic_id)
+            keep_y.append(lab)
+            continue
+
+        matched = None
+        for k, lab in _HAM10000_DX_TO_LABEL.items():
+            if k in chosen:
+                matched = lab
+                break
+
+        if matched is None:
+            # skip unknown diagnosis values instead of crashing
+            continue
+
+        keep_ids.append(isic_id)
+        keep_y.append(matched)
+
+    if len(keep_ids) == 0:
+        raise ValueError(
+            "After filtering, no samples could be mapped to 7 HAM10000 classes. "
+            "Your metadata may not contain 7-class diagnosis information. "
+            "Use HAM10000_metadata.csv (dx) or provide a mapping."
+        )
+
+    return keep_ids, np.array(keep_y, dtype=np.int64)
+
+class HAM10000ImageDataset(torch.utils.data.Dataset):
+    def __init__(self, images_dir: str, ids, y, indices=None, transform=None):
+        self.images_dir = images_dir
+        self.ids = list(ids)
+        self.y = np.asarray(y, dtype=np.int64)
+        self.indices = np.asarray(indices) if indices is not None else np.arange(len(self.y))
         self.transform = transform
 
     def __len__(self):
@@ -46,12 +149,38 @@ class HAM10000CSVDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, i):
         idx = int(self.indices[i])
-        img = Image.fromarray(self.X[idx])  # PIL (H, W, C)
+        isic_id = self.ids[idx]
+        img_path = os.path.join(self.images_dir, f"{isic_id}.jpg")
+        img = Image.open(img_path).convert("RGB")
         target = int(self.y[idx])
-
         if self.transform is not None:
             img = self.transform(img)
         return img, target
+
+def _load_ham10000_images(data_dir: str, seed: int, train: bool, transform):
+    images_dir = os.path.join(data_dir, "images")
+    if not os.path.isdir(images_dir):
+        raise FileNotFoundError(f"Cannot find folder images/: {images_dir}")
+
+    meta_path = _find_metadata_path(data_dir)
+    df = pd.read_csv(meta_path)
+    ids, y = _extract_ids_labels(df)
+
+    keep_ids, keep_y = [], []
+    for _id, _lab in zip(ids, y):
+        p = os.path.join(images_dir, f"{_id}.jpg")
+        if os.path.exists(p):
+            keep_ids.append(_id)
+            keep_y.append(int(_lab))
+
+    if len(keep_ids) == 0:
+        raise FileNotFoundError(f"No .jpg matched after mapping in {images_dir}")
+
+    y2 = np.array(keep_y, dtype=np.int64)
+    all_idx = np.arange(len(y2))
+    train_idx, val_idx = train_test_split(all_idx, test_size=0.2, random_state=seed, stratify=y2)
+    indices = train_idx if train else val_idx
+    return HAM10000ImageDataset(images_dir, keep_ids, y2, indices=indices, transform=transform)
 
 class Partition(object):
     def __init__(self, data, index):
@@ -189,20 +318,13 @@ def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size):
         normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5],
                                         std=[0.5, 0.5, 0.5])
         train_tf = transforms.Compose([
-            transforms.Resize(32),
+            transforms.Resize((32, 32)),
             transforms.RandomHorizontalFlip(),
             transforms.RandomRotation(10),
             transforms.ToTensor(),
             normalize,
         ])
-
-        X, y = _load_ham10000_rgb(data_dir)
-
-        all_idx = np.arange(len(y))
-        train_idx, _ = train_test_split(
-            all_idx, test_size=0.2, random_state=seed, stratify=y
-        )
-        dataset = HAM10000CSVDataset(X, y, indices=train_idx, transform=train_tf)          
+        dataset = _load_ham10000_images(data_dir=data_dir, seed=seed, train=True, transform=train_tf)    
        
     size = dist.get_world_size()
     #print(size)
@@ -270,16 +392,11 @@ def test_Dataset(dataset_name, data_dir, seed=321):
         normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5],
                                         std=[0.5, 0.5, 0.5])
         val_tf = transforms.Compose([
-            transforms.Resize(32),
+            transforms.Resize((32, 32)),
             transforms.ToTensor(),
             normalize,
         ])
-        X, y = _load_ham10000_rgb(data_dir)
-        all_idx = np.arange(len(y))
-        _, val_idx = train_test_split(
-            all_idx, test_size=0.2, random_state=seed, stratify=y
-        )
-        dataset = HAM10000CSVDataset(X, y, indices=val_idx, transform=val_tf)
+        dataset = _load_ham10000_images(data_dir=data_dir, seed=seed, train=False, transform=val_tf)
 
     val_bsz = 128
     val_set = torch.utils.data.DataLoader(dataset, batch_size=val_bsz, shuffle=False, num_workers=2)
