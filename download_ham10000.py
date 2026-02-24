@@ -2,9 +2,9 @@
 URL: https://isic-archive.s3.amazonaws.com/images/<ISIC_ID>.jpg
 
 Commands:
-  python download_ham10000.py --out data/ham10000
-  python download_ham10000.py --out data/ham10000 --max-images 200
-  python download_ham10000.py --out data/ham10000 --workers 16 --resume
+  python download_ham10000.py --out ../data/ham10000
+  python download_ham10000.py --out ../data/ham10000 --max-images 200
+  python download_ham10000.py --out ../data/ham10000 --workers 16 --resume
 """
 
 from __future__ import annotations
