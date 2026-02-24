@@ -305,14 +305,24 @@ class DataPartitioner(object):
         self.data = data
         self.partitions = []
         data_len = len(data)
-        dataset = torch.utils.data.DataLoader(data, batch_size=1024, shuffle=False, num_workers=32)
-        labels = []
-        try:
-            labels = np.load('labels'+str(dataset_name)+'.npy')
-        except:
-            for batch_idx, (inputs, targets) in enumerate(dataset):
-                labels = labels+targets.tolist()
-            np.save('labels'+str(dataset_name)+'.npy', labels)
+        # -------- labels: take directly from dataset --------
+        if hasattr(data, "targets"):
+            labels = [int(x) for x in data.targets]
+        elif hasattr(data, "y") and hasattr(data, "indices"):
+            # IMPORTANT: data.y is global labels, but len(data) is subset length
+            labels = [int(data.y[int(idx)]) for idx in data.indices]
+        elif hasattr(data, "y"):
+            labels = [int(x) for x in data.y]
+        elif hasattr(data, "labels"):
+            labels = [int(x) for x in data.labels]
+        else:
+            loader = torch.utils.data.DataLoader(data, batch_size=1024, shuffle=False, num_workers=0)
+            labels = []
+            for _, targets in loader:
+                labels.extend([int(t) for t in targets])
+        
+        assert len(labels) == len(data), f"labels({len(labels)}) != len(data)({len(data)})"
+        # -------- end labels --------
         
         rng = random.Random()
         rng.seed(seed)
@@ -334,6 +344,25 @@ class DataPartitioner(object):
                 part_len = int(frac*data_len)
                 self.partitions.append(indices_rand[0:part_len])
                 indices_rand = indices_rand[part_len:] 
+            else:
+                # 0 < skew < 1: mix sorted and random
+                n = len(labels)
+                n_sorted = int(skew * n)
+                chosen = set()
+                mixed = []
+                # first part is sorted (label-skew)
+                for idx in sort_indices[:n_sorted]:
+                    mixed.append(idx)
+                    chosen.add(idx)
+                # second part is random
+                for idx in indices_rand:
+                    if idx not in chosen:
+                        mixed.append(idx)
+
+                part_len = int(frac * data_len)
+                self.partitions.append(mixed[:part_len])
+
+                sort_indices = mixed[part_len:]
 
 
     def use(self, partition):
