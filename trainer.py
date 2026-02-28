@@ -75,6 +75,8 @@ parser.add_argument('--port', dest='port',   help='between 3000 to 65000',defaul
 parser.add_argument("--steplr", action="store_true", help="Uses step lr schedular for training.")
 parser.add_argument('--nesterov', action='store_true', )
 parser.add_argument('--qgm', action='store_true', help='quasi global momentum')
+parser.add_argument('--sparsity', default=0.9, type=float, help='MedHE sparsity s in [0,1), fraction zeroed')
+parser.add_argument('--tau_alpha', default=0.9, type=float, help='MedHE EMA rate for threshold')
 args = parser.parse_args()
 args.devices = torch.cuda.device_count()
 
@@ -136,6 +138,8 @@ def run(rank, size):
         sender = CompNGC_sender(model, device)
     elif args.optimizer.lower()=="topkngc":
         sender = Topk_NGC_sender(model, device)
+    elif args.optimizer.lower() == "medhengc":
+        sender = MedHE_NGC_sender(model, device, sparsity=args.sparsity, tau_alpha=args.tau_alpha)
     else:
         sender=None
 
@@ -184,6 +188,9 @@ def run(rank, size):
         receiver = CompNGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors, alpha = args.alpha)
     elif args.optimizer.lower()=='topkngc':
         receiver  = Topk_NGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors, alpha = args.alpha)
+    elif args.optimizer.lower() == 'medhengc':
+        receiver = MedHE_NGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov,
+                            weight_decay=args.weight_decay, neighbors=args.neighbors, alpha=args.alpha)
     else:
         receiver = DSGD_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay)
     

@@ -85,8 +85,8 @@ class Topk_NGC_sender():
 
 
 class Topk_NGC_receiver():
-    def __init__(self, model, device, rank, lr, momentum, qgm, 
-                 nesterov=True, weight_decay=0, neighbors=2, alpha=1.0,
+    def __init__(self, model, device, rank, lr, momentum, qgm, neighbors,
+                 nesterov=True, weight_decay=0, alpha=1.0,
                  lambda_1 = 0.2, lambda_2 = 0.8, lambda_3 = 0.5, rho_ema = 0.1,
                  weight_self = 0, weight_model = 0, weight_data = 1.0):
         self.model         = model
@@ -105,7 +105,7 @@ class Topk_NGC_receiver():
         for param in self.model.module.parameters():
             self.momentum_buff.append(torch.zeros_like(param.data))
             self.prev_params.append(copy.deepcopy(param.data))
-        self.topk = neighbors
+        self.topk = int(neighbors / 2)
         self.lambda_1, self.lambda_2, self.lambda_3 = lambda_1, lambda_2, lambda_3
         self.rho_ema = rho_ema
         self.mu = defaultdict(float)
@@ -179,11 +179,6 @@ class Topk_NGC_receiver():
         else:
             selected = ranks_sorted[: min(self.topk, len(ranks_sorted))]
 
-        print(f"Rank {self.rank} has selected neighbors:")
-        for rank in selected:
-            print(f"Neighbor {rank} with utility score: {utilities[rank]:.4f}")
-        print("==============================")
-
         ### Get the projected gradients for each parameter
         for name, self_params in self.model.module.named_parameters():
             if self_params.requires_grad:
@@ -196,15 +191,16 @@ class Topk_NGC_receiver():
                 for rank in selected:
                     g_model += neighbor_grads_comp[rank][name]
                     g_data  += neighbor_grads_comm[rank][name]
-                g_model /= float(len(selected))
-                g_data  /= float(len(selected))
+                g_model += self_params.grad.data
+                g_data += self_params.grad.data
+                g_model /= float(len(selected) + 1)
+                g_data  /= float(len(selected) + 1)
 
                 self.proj_grads[name] = (
                     self.weight_self * self_gradients[name]
                     + self.weight_model * g_model
                     + self.weight_data  * g_data
                 )
-
         return 
                 
 
@@ -253,9 +249,7 @@ class Topk_NGC_receiver():
         g_ji = g_ji.to(self.device)
         # Compute cosine similarity
         a_model = float(self.cosine_alignment(g_ii, g_ji).item())
-        print("a_model:", a_model)
         a_data  = float(self.cosine_alignment(g_ii, g_ij).item())
-        print("a_data:", a_data)
         # Compute utility score
         compability = float(self.lambda_1) * a_model + float(self.lambda_2) * a_data
         self.update_running_statics(rank, compability)

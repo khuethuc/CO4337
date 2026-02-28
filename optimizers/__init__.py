@@ -4,3 +4,4 @@ from .ngc import *
 from .compressngc import *
 from .dsgd import *
 from .topkngc import *
+from .medhe import *
