@@ -228,7 +228,7 @@ def run(rank, size):
     for epoch in range(0, args.epochs):  
         print('current lr {:.5e}'.format(optimizer.param_groups[0]['lr']))
         model.block()
-                # (NIC) đo trước epoch train
+        # (NIC) đo trước epoch train
         net_before = read_net_dev() if rank == 0 else None
 
         dt, prec1, loss, m = train(
@@ -252,7 +252,6 @@ def run(rank, size):
         else:
             net_delta = {"rx_bytes":0,"rx_packets":0,"tx_bytes":0,"tx_packets":0}
 
-        # ví dụ: bạn có thể cộng dồn các tổng này (khai báo total_* trước loop epoch)
         total_train_time_s += m["train_time_s"]
         total_cpu_pct_sum += m["cpu_pct_avg"]
         total_gpu_pct_sum += m["gpu_pct_avg"]
@@ -354,13 +353,8 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
             lambda_t = min(1.0, current_round / (total_rounds / 2.0))
             criterion.lambda_t = lambda_t
             sender.criterion.lambda_t = lambda_t
-            clipped_output = torch.clamp(output, max=20.0)
-            evidence = torch.exp(clipped_output)
-            loss = criterion(evidence, target_var) 
-            # Computing local epistemic uncertainty
-            alpha_val = evidence + 1.0
-            S = torch.sum(alpha_val, dim=-1)
-            local_uncertainty = (args.classes / S).mean().item()
+            evidence = F.softplus(output)
+            loss = criterion(evidence, target_var)
         else:
             loss = criterion(output, target_var)
 
@@ -371,7 +365,6 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
 
         if 'cga' in args.optimizer.lower() or 'ngc' in args.optimizer.lower():
             if args.optimizer.lower() == 'edlngc':
-                # Nhận về 3 biến (có thêm cross_unc)
                 cross_grad, cross_unc, ref_buf = sender(cross_weights, input_var, target_var) 
                 cross_grad_copy = copy.deepcopy(cross_grad)
                 cross_uncertainty_copy  = copy.deepcopy(cross_unc)
@@ -387,7 +380,7 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
                 data_transferred += (amt_data_transfer + amt_data_transfer_unc)
                 
                 # Call receiver
-                receiver(recieved_cross_grad, cross_grad_copy, recieved_cross_uncertainty, cross_uncertainty_copy, local_uncertainty, ref_buf, current_round, total_rounds)
+                receiver(recieved_cross_grad, cross_grad_copy, recieved_cross_uncertainty, cross_uncertainty_copy, ref_buf, current_round, total_rounds)
                 receiver.project_gradients(lr)
             else:
                 #send and recieve cross gradients
@@ -471,7 +464,6 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
 
 # # # Validation function # # #
 def validate(val_loader, model, criterion, batch_size, device, epoch=0):
-#def validate(val_loader, model, criterion, batch_size, writer, device, epoch=0):
     """
     Run evaluation
     """
@@ -493,8 +485,7 @@ def validate(val_loader, model, criterion, batch_size, device, epoch=0):
             # compute output and loss
             output = model(input_var)
             if args.optimizer.lower() == 'edlngc':
-                clipped_output = torch.clamp(output, max=20.0)
-                evidence = torch.exp(clipped_output)
+                evidence = F.softplus(output)
                 loss = criterion(evidence, target_var)
             else:
                 loss = criterion(output, target_var)
@@ -663,37 +654,6 @@ def precision_recall_f1(output, target, num_classes):
         sum(recall_list)/num_classes * 100,
         sum(f1_list)/num_classes * 100,
     )
-
-def auc_auprc(output, target, average="macro"):
-    """
-    Compute ROC-AUC and AUPRC
-    - output: logits [N, C] or [N]
-    - target: ground truth labels [N]
-    """
-    target = target.cpu().numpy()
-
-    # Binary classification
-    if output.ndim == 1:
-        score = torch.sigmoid(output).cpu().numpy()
-        auc = roc_auc_score(target, score)
-        auprc = average_precision_score(target, score)
-
-    # Multi-class classification
-    else:
-        score = torch.softmax(output, dim=1).cpu().numpy()
-        auc = roc_auc_score(
-            target,
-            score,
-            multi_class="ovr",
-            average=average
-        )
-        auprc = average_precision_score(
-            target,
-            score,
-            average=average
-        )
-
-    return auc * 100, auprc * 100
 
 def flatten_tensors(tensors):
     if len(tensors) == 1:
