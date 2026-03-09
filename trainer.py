@@ -6,7 +6,6 @@ from tkinter import E
 import numpy as np
 import statistics 
 import copy
-
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
@@ -25,7 +24,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-
 from collections import Counter
 from sklearn.metrics import (
     precision_score,
@@ -35,13 +33,12 @@ from sklearn.metrics import (
     average_precision_score,
 )
 
-# Importing modules related to distributed processing
 import torch.distributed as dist
 from torch.multiprocessing import Process
 from torch.autograd import Variable
 from torch.multiprocessing import spawn
 
-###########
+# # # Import custom modules # # #
 from gossip import GossipDataParallel
 from gossip import RingGraph, GridGraph, FullGraph
 from gossip import UniformMixing
@@ -50,6 +47,7 @@ from models import *
 from optimizers import *
 from dataloader import *
 
+# # # Add arguments # # #
 parser = argparse.ArgumentParser(description='Propert ResNets for CIFAR10 in pytorch')
 parser.add_argument('--arch', '-a', metavar='ARCH', default='cganet', help = 'resnet or vgg or resquant' )
 parser.add_argument('-depth', '--depth', default=20, type=int, help='depth of the resnet model')
@@ -66,7 +64,7 @@ parser.add_argument('--momentum', default=0.9, type=float, metavar='M',     help
 parser.add_argument('--weight_decay', default=0.0, type=float,     help='weight_decay')
 parser.add_argument('-world_size', '--world_size', default=10, type=int, help='total number of nodes')
 parser.add_argument('--epochs', default=100, type=int, metavar='N',   help='number of total epochs to run')
-parser.add_argument('--optimizer', default='ngc', type=str,  help='global optimizer = [d-psgd, cga, ngc, compcga, compngc, topkngc]')
+parser.add_argument('--optimizer', default='ngc', type=str,  help='global optimizer = [d-psgd, cga, ngc, compcga, compngc, topkngc, edlngc]')
 parser.add_argument('--graph', '-g',  default='ring', help = 'graph structure - [ring, torus]' )
 parser.add_argument('--neighbors', default=2, type=int,     help='number of neighbors per node')
 parser.add_argument('-d', '--devices', default=4, type=int, help='number of gpus/devices on the card')
@@ -81,12 +79,13 @@ parser.add_argument('--qgm', action='store_true', help='quasi global momentum')
 args = parser.parse_args()
 args.devices = torch.cuda.device_count()
 
-# Check the save_dir exists or not
+# # # Check the save_dir exists or not # # #
 args.save_dir = os.path.join(args.save_dir, args.optimizer+"_"+args.arch+"_nodes_"+str(args.world_size)+"_"+ args.normtype+"_lr_"+ str(args.lr)+"_gamma_"+str(args.gamma)+"_alpha_"+str(args.alpha)+"_skew_"+str(args.skew)+"_"+args.graph )
 if not os.path.exists(os.path.join(args.save_dir, "excel_data") ):
     os.makedirs(os.path.join(args.save_dir, "excel_data") )
 torch.save(args, os.path.join(args.save_dir, "training_args.bin"))    
 
+# # # Run training # # #
 def run(rank, size):
     global args, best_prec1, global_steps
     torch.manual_seed(args.seed)
@@ -154,6 +153,8 @@ def run(rank, size):
         sender = CompNGC_sender(model, device)
     elif args.optimizer.lower()=="topkngc":
         sender = Topk_NGC_sender(model, device)
+    elif args.optimizer.lower()=='edlngc':
+        sender = EDL_NGC_sender(model, device, num_classes=args.classes)
     else:
         sender=None
 
@@ -202,13 +203,20 @@ def run(rank, size):
         receiver = CompNGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors, alpha = args.alpha)
     elif args.optimizer.lower()=='topkngc':
         receiver  = Topk_NGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors, alpha = args.alpha)
+    elif args.optimizer.lower() == 'edlngc':
+        receiver = EDL_NGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors, alpha=args.alpha)
     else:
         receiver = DSGD_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay)
     
 
     optimizer = optim.SGD(model.parameters(), args.lr)
     
-    criterion = nn.CrossEntropyLoss().to(device)
+    if args.optimizer.lower() == 'edlngc':
+        from optimizers.edlngc import EDLLoss 
+        criterion = EDLLoss(num_classes=args.classes).to(device)
+    else:
+        criterion = nn.CrossEntropyLoss().to(device)
+
     if args.steplr:
         lr_scheduler = optim.lr_scheduler.StepLR(optimizer, gamma = 0.981, step_size=1)
     else:
@@ -288,7 +296,7 @@ def run(rank, size):
     }
     torch.save(result, os.path.join(args.save_dir, "excel_data", f"rank_{rank}.sp"))
 
-#def train(train_loader, model, criterion, optimizer, epoch, batch_size, writer, device):
+# # # Train functions # # #
 def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, device, receiver=None, sender=None, gpu_index: int = 0, monitor_every: int = 50):
     """
         Run one train epoch
@@ -324,7 +332,11 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
 
     end = time.time()
     step = len(train_loader)*batch_size*epoch
+
+    total_rounds = args.epochs * len(train_loader)
+
     for i, (input, target) in enumerate(train_loader):
+        current_round = epoch * len(train_loader) + i
         #print(dist.get_rank(), torch.unique(target))
         data_time.update(time.time() - end)
         input_var, target_var = Variable(input).to(device), Variable(target).to(device)
@@ -338,22 +350,56 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
         output = model(input_var)
         loss = criterion(output, target_var)
 
+        if args.optimizer.lower() == 'edlngc':
+            lambda_t = min(1.0, current_round / (total_rounds / 2.0))
+            criterion.lambda_t = lambda_t
+            sender.criterion.lambda_t = lambda_t
+            clipped_output = torch.clamp(output, max=20.0)
+            evidence = torch.exp(clipped_output)
+            loss = criterion(evidence, target_var) 
+            # Computing local epistemic uncertainty
+            alpha_val = evidence + 1.0
+            S = torch.sum(alpha_val, dim=-1)
+            local_uncertainty = (args.classes / S).mean().item()
+        else:
+            loss = criterion(output, target_var)
+
         all_outputs.append(output.detach().cpu())
         all_targets.append(target.detach().cpu())
         # compute gradient 
         loss.backward()
 
         if 'cga' in args.optimizer.lower() or 'ngc' in args.optimizer.lower():
-            #send and recieve cross gradients
-            cross_grad, ref_buf                       = sender(cross_weights, input_var, target_var) 
-            cross_grad_copy                           = copy.deepcopy(cross_grad)
-            _, amt_data_transfer, recieved_cross_grad = model.transfer_additional(cross_grad)
-            comm_calls_transfer_additional += 1
-            payload_bytes_from_calls += amt_data_transfer
-            receiver(recieved_cross_grad, cross_grad_copy, ref_buf)
-            data_transferred    +=amt_data_transfer
-            #project the gradients
-            receiver.project_gradients(lr)
+            if args.optimizer.lower() == 'edlngc':
+                # Nhận về 3 biến (có thêm cross_unc)
+                cross_grad, cross_unc, ref_buf = sender(cross_weights, input_var, target_var) 
+                cross_grad_copy = copy.deepcopy(cross_grad)
+                cross_uncertainty_copy  = copy.deepcopy(cross_unc)
+                # Transmit gradients through topology
+                _, amt_data_transfer, recieved_cross_grad = model.transfer_additional(cross_grad)
+                comm_calls_transfer_additional += 1
+                payload_bytes_from_calls += amt_data_transfer
+                # Transmit uncertainty through topology
+                _, amt_data_transfer_unc, recieved_cross_uncertainty = model.transfer_additional(cross_unc)
+                comm_calls_transfer_additional += 1
+                payload_bytes_from_calls += amt_data_transfer_unc
+                
+                data_transferred += (amt_data_transfer + amt_data_transfer_unc)
+                
+                # Call receiver
+                receiver(recieved_cross_grad, cross_grad_copy, recieved_cross_uncertainty, cross_uncertainty_copy, local_uncertainty, ref_buf, current_round, total_rounds)
+                receiver.project_gradients(lr)
+            else:
+                #send and recieve cross gradients
+                cross_grad, ref_buf                       = sender(cross_weights, input_var, target_var) 
+                cross_grad_copy                           = copy.deepcopy(cross_grad)
+                _, amt_data_transfer, recieved_cross_grad = model.transfer_additional(cross_grad)
+                comm_calls_transfer_additional += 1
+                payload_bytes_from_calls += amt_data_transfer
+                receiver(recieved_cross_grad, cross_grad_copy, ref_buf)
+                data_transferred    +=amt_data_transfer
+                #project the gradients
+                receiver.project_gradients(lr)
         elif args.optimizer.lower() == 'd-psgd':
             receiver.update_gradients(lr)
 
@@ -423,7 +469,7 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
     }
     return data_transferred, top1.avg, losses.avg, metrics
 
-
+# # # Validation function # # #
 def validate(val_loader, model, criterion, batch_size, device, epoch=0):
 #def validate(val_loader, model, criterion, batch_size, writer, device, epoch=0):
     """
@@ -446,7 +492,13 @@ def validate(val_loader, model, criterion, batch_size, device, epoch=0):
             input_var, target_var = Variable(input).to(device), Variable(target).to(device)
             # compute output and loss
             output = model(input_var)
-            loss = criterion(output, target_var)
+            if args.optimizer.lower() == 'edlngc':
+                clipped_output = torch.clamp(output, max=20.0)
+                evidence = torch.exp(clipped_output)
+                loss = criterion(evidence, target_var)
+            else:
+                loss = criterion(output, target_var)
+
             output = output.float()
             loss = loss.float()
 
@@ -482,10 +534,6 @@ def validate(val_loader, model, criterion, batch_size, device, epoch=0):
         all_outputs, all_targets, num_classes=args.classes
     )
 
-    # auc, auprc = auc_auprc(
-    #     all_outputs, all_targets, average="macro"
-    # )
-
     if dist.get_rank() == 0:
         print(
             f"[Val][Epoch {epoch}] "
@@ -493,12 +541,25 @@ def validate(val_loader, model, criterion, batch_size, device, epoch=0):
             f"Recall = {rec:.2f}  "
             f"F1 = {f1:.2f}  "
         )
-        # print (
-        #     f"AUC = {auc:.2f}  "
-        #     f"AUPRC = {auprc:.2f}"
-        # )
-
     return top1.avg, losses.avg
+
+# # # Helper functions # # #
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
 
 def read_net_dev(iface: str | None = None):
     """
@@ -564,24 +625,6 @@ def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
     Save the training model
     """
     torch.save(state, filename)
-
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
 
 def accuracy(output, target, topk=(1,)):
     """Computes the precision@k for the specified values of k"""
@@ -705,6 +748,7 @@ def check_noniid(train_loader, rank, world_size):
         for rank, value in enumerate(l1_distance):
                 print(f"Rank {rank}: {value:.3f}")    
 
+# # # Main function # # #
 if __name__ == '__main__':
     size = args.world_size
     
