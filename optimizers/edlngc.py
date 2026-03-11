@@ -1,6 +1,5 @@
 import copy
-import math
-from typing import Dict, Tuple
+from collections import defaultdict
 
 import torch
 import torch.nn as nn
@@ -11,160 +10,203 @@ from .utils import flatten_tensors, unflatten_tensors
 
 class EDLLoss(nn.Module):
     """
-    Evidential Deep Learning loss:
-      - MSE term on expected class probabilities
-      - KL regularization on non-true classes
-    lambda_t should be annealed in trainer over the first half of training,
-    which matches the MURMURA paper's recommendation.
+    Class-weighted Evidential Deep Learning loss.
+
+    Expected input:
+        evidence: non-negative tensor of shape [B, K]
+        target:   integer class labels of shape [B]
+
+    Notes:
+    - Works even if class_weights is None.
+    - If class_weights is None, batch-wise inverse-frequency weights are used.
+    - lambda_t can be updated externally from trainer.
     """
-    def __init__(self, num_classes: int, lambda_t: float = 0.0, device=None):
+
+    def __init__(
+        self,
+        num_classes,
+        class_weights=None,
+        lambda_t=0.0,
+        eps=1e-8,
+    ):
         super().__init__()
-        self.num_classes = num_classes
+        self.num_classes = int(num_classes)
         self.lambda_t = float(lambda_t)
-        self.device = device if device is not None else torch.device("cpu")
+        self.eps = float(eps)
 
-    def forward(self, evidence: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        if class_weights is not None:
+            cw = torch.as_tensor(class_weights, dtype=torch.float32)
+            self.register_buffer("class_weights", cw)
+        else:
+            self.class_weights = None
+
+    def _one_hot(self, target):
+        return F.one_hot(target.long(), num_classes=self.num_classes).float()
+
+    def _batch_inverse_frequency_weights(self, target, device):
+        counts = torch.bincount(target.long(), minlength=self.num_classes).float().to(device)
+        counts = torch.clamp(counts, min=1.0)
+        weights = 1.0 / counts
+        weights = weights / torch.clamp(weights.mean(), min=self.eps)
+        return weights
+
+    def _get_class_weights(self, target, device):
+        if self.class_weights is not None:
+            return self.class_weights.to(device)
+        return self._batch_inverse_frequency_weights(target, device)
+
+    def _kl_dirichlet(self, alpha_tilde):
+        """
+        KL( Dir(alpha_tilde) || Dir(1) )
+        """
+        beta = torch.ones((1, self.num_classes), device=alpha_tilde.device, dtype=alpha_tilde.dtype)
+
+        sum_alpha = torch.sum(alpha_tilde, dim=1, keepdim=True)
+        sum_beta = torch.sum(beta, dim=1, keepdim=True)
+
+        lnB_alpha = torch.lgamma(sum_alpha) - torch.sum(torch.lgamma(alpha_tilde), dim=1, keepdim=True)
+        lnB_beta = torch.sum(torch.lgamma(beta), dim=1, keepdim=True) - torch.lgamma(sum_beta)
+
+        digamma_sum_alpha = torch.digamma(sum_alpha)
+        digamma_alpha = torch.digamma(alpha_tilde)
+
+        kl = torch.sum((alpha_tilde - beta) * (digamma_alpha - digamma_sum_alpha), dim=1, keepdim=True)
+        kl = kl + lnB_alpha + lnB_beta
+        return kl.squeeze(1)
+
+    def forward(self, evidence, target):
+        """
+        evidence: [B, K], non-negative
+        target:   [B]
+        """
+        evidence = torch.clamp(evidence, min=0.0)
+        target = target.long()
+
         alpha = evidence + 1.0
-        S = alpha.sum(dim=1, keepdim=True)
-        p_hat = alpha / S
+        S = torch.sum(alpha, dim=1, keepdim=True)
+        probs = alpha / torch.clamp(S, min=self.eps)
 
-        y_true = F.one_hot(targets, num_classes=self.num_classes).float().to(evidence.device)
+        y = self._one_hot(target)
+        class_weights = self._get_class_weights(target, evidence.device)  # [K]
+        class_weights = class_weights.view(1, -1)
 
-        mse = torch.sum((y_true - p_hat) ** 2, dim=1, keepdim=True)
+        # Class-weighted squared error term
+        sq_error = torch.sum(class_weights * (y - probs) ** 2, dim=1)
 
-        alpha_tilde = y_true + (1.0 - y_true) * alpha
-        S_tilde = torch.sum(alpha_tilde, dim=1, keepdim=True)
+        # KL annealing term
+        alpha_tilde = y + (1.0 - y) * alpha
+        kl = self._kl_dirichlet(alpha_tilde)
 
-        num_classes_t = torch.tensor(
-            self.num_classes, dtype=torch.float32, device=evidence.device
-        )
-
-        kl_divergence = (
-            torch.lgamma(S_tilde)
-            - torch.lgamma(num_classes_t)
-            - torch.sum(torch.lgamma(alpha_tilde), dim=1, keepdim=True)
-            + torch.sum(
-                (alpha_tilde - 1.0)
-                * (torch.digamma(alpha_tilde) - torch.digamma(S_tilde)),
-                dim=1,
-                keepdim=True,
-            )
-        )
-
-        return torch.mean(mse + self.lambda_t * kl_divergence)
+        loss = sq_error + self.lambda_t * kl
+        return loss.mean()
 
 
 class EDL_NGC_sender:
     """
-    Sender side:
-      - loads neighbor model weights
-      - computes cross-gradients on local batch
-      - computes peer trust statistics on local batch:
-          * mean epistemic uncertainty
-          * accuracy
-    Interface is kept compatible with trainer.py:
-      returns (output_grads, output_stats, ref_buf)
+    Sender side for ENGC / EDL-NGC.
 
-    NOTE:
-      For full MURMURA faithfulness, trust should ideally be computed on a local
-      validation/holdout batch (not the train batch). This implementation keeps
-      trainer compatibility and uses the provided batch as a proxy.
+    For each neighbor model weight received from gossip:
+      - load that model locally
+      - compute gradient on current local batch
+      - compute mean epistemic uncertainty on current local batch
+      - return flattened gradients and scalar uncertainty per neighbor
+
+    This matches trainer.py, which expects:
+        cross_grad, cross_unc, ref_buf = sender(cross_weights, input_var, target_var)
     """
-    def __init__(self, true_model, device, num_classes: int = 10):
-        self.model = copy.deepcopy(true_model).to(device)
+
+    def __init__(self, true_model, device, num_classes, class_weights=None):
+        self.model = copy.deepcopy(true_model)
         self.model.train()
+        self.model = self.model.to(device)
+
+        self.gradient_buffer = {}
         self.device = device
-        self.num_classes = num_classes
-        self.criterion = EDLLoss(num_classes=num_classes, lambda_t=0.0, device=device)
-        self.gradient_buffer: Dict[str, torch.Tensor] = {}
+        self.num_classes = int(num_classes)
+        self.criterion = EDLLoss(
+            num_classes=num_classes,
+            class_weights=class_weights,
+            lambda_t=0.0,
+        ).to(device)
 
     def _update_model(self, state_dict):
         for w, p in zip(state_dict, self.model.parameters()):
             p.data.copy_(w.data)
+        return
 
     def _clear_gradient_buffer(self):
         self.gradient_buffer = {}
+        return
 
-    def _flatten_(self, G: Dict[str, torch.Tensor]) -> torch.Tensor:
-        grad = [g for g in G.values()]
+    def _flatten_(self, G):
+        grad = []
+        for g in G.values():
+            grad.append(g)
         return flatten_tensors(grad).to(self.device)
 
-    @torch.no_grad()
-    def _evaluate_peer_stats(self, x: torch.Tensor, targets: torch.Tensor) -> Tuple[float, float]:
-        """
-        Returns:
-            mean epistemic uncertainty in [0, 1]
-            accuracy in [0, 1]
-        """
-        self.model.eval()
-        output = self.model(x)
-
-        # More stable than ReLU for evidential modeling in practice.
-        evidence = F.softplus(output)
+    def _mean_epistemic_uncertainty(self, evidence):
+        # u = K / S
         alpha = evidence + 1.0
-        S = alpha.sum(dim=1)
-        epistemic_uncertainty = (self.num_classes / S).mean().item()
+        S = torch.sum(alpha, dim=1)
+        u = float(self.num_classes) / torch.clamp(S, min=1e-8)
+        return u.mean()
 
-        preds = torch.argmax(output, dim=1)
-        acc = (preds == targets).float().mean().item()
-
-        self.model.train()
-        return epistemic_uncertainty, acc
-
-    def _accumulate_gradients(self, x: torch.Tensor, targets: torch.Tensor):
-        self.model.zero_grad(set_to_none=True)
-
+    def _accumulate_gradients_and_uncertainty(self, x, targets):
         output = self.model(x)
         evidence = F.softplus(output)
 
+        self.model.zero_grad()
         loss = self.criterion(evidence, targets)
         loss.backward()
 
         self._clear_gradient_buffer()
         for name, param in self.model.named_parameters():
             if param.requires_grad and param.grad is not None:
-                self.gradient_buffer[name] = param.grad.detach().clone()
+                self.gradient_buffer[name] = param.grad.data.clone()
 
-        return self.gradient_buffer
+        mean_unc = self._mean_epistemic_uncertainty(evidence).detach()
+        return self.gradient_buffer, mean_unc
 
     def __call__(self, neighbor_weight, batch_x, targets):
-        output_grads = {}
-        output_stats = {}
+        output_grad = {}
+        output_unc = {}
         ref_buf = None
 
         for rank, w in neighbor_weight.items():
             self._update_model(w)
+            g, u = self._accumulate_gradients_and_uncertainty(batch_x, targets)
+            output_grad[rank] = self._flatten_(g)
+            output_unc[rank] = u.view(1).to(self.device)
+            ref_buf = g
 
-            u_mean, acc = self._evaluate_peer_stats(batch_x, targets)
-            gradients = self._accumulate_gradients(batch_x, targets)
-
-            output_grads[rank] = self._flatten_(gradients)
-
-            # Pack [uncertainty, accuracy] into one tensor so trainer.py does not need changes.
-            output_stats[rank] = torch.tensor(
-                [u_mean, acc], dtype=torch.float32, device=self.device
-            )
-
-            if ref_buf is None:
-                ref_buf = gradients
-
-        return output_grads, output_stats, ref_buf
+        return output_grad, output_unc, ref_buf
 
 
 class EDL_NGC_receiver:
     """
-    Receiver side:
-      - decodes received cross-gradients
-      - decodes received peer trust stats [uncertainty, accuracy]
-      - computes MURMURA-style trust score
-      - applies hard filtering using adaptive threshold
-      - aggregates trusted peer cross-gradients
-      - mixes model-variant and data-variant branches using NGC alpha
+    Receiver / aggregator for ENGC.
 
-    This is a hybrid:
-      - trust/filtering logic from MURMURA
-      - comp/data gradient fusion from NGC
+    Core idea:
+    - evidential trust is the primary compatibility signal
+    - gradient alignment is the auxiliary optimization-aware signal
+    - peer weights are computed from a hybrid score
+    - final gradient combines:
+        self-gradient
+        model-variant cross-gradients
+        data-variant cross-gradients
+
+    Compatible with trainer.py current call:
+        receiver(
+            recieved_cross_grad,
+            cross_grad_copy,
+            recieved_cross_uncertainty,
+            cross_uncertainty_copy,
+            ref_buf,
+            current_round,
+            total_rounds
+        )
     """
+
     def __init__(
         self,
         model,
@@ -176,203 +218,333 @@ class EDL_NGC_receiver:
         nesterov=True,
         weight_decay=0.0,
         neighbors=2,
-        alpha=0.5,
-        # MURMURA-style parameters
-        self_weight=0.5,          # omega
-        acc_weight=0.5,           # wa
-        uncertainty_threshold=0.7,  # tau_u
-        init_threshold=0.3,       # tau_min^(0)
-        tight_coef=0.5,           # gamma_tau
-        tight_speed=1.0,          # kappa
+        alpha=1.0,
+        beta=0.8,
+        wa=0.5,
+        tau_u=0.6,
+        tau_min=0.0,
+        gamma_tau=0.5,
+        kappa=5.0,
+        omega_min=0.4,
+        omega_max=0.8,
+        softmax_temp=5.0,
+        num_classes=None,
+        eps=1e-8,
     ):
         self.model = model
         self.rank = rank
         self.device = device
 
-        self.proj_grads: Dict[str, torch.Tensor] = {}
-
-        self.alpha = float(alpha)
-        self.self_weight = float(self_weight)
-        self.acc_weight = float(acc_weight)
-        self.uncertainty_threshold = float(uncertainty_threshold)
-        self.init_threshold = float(init_threshold)
-        self.tight_coef = float(tight_coef)
-        self.tight_speed = float(tight_speed)
+        self.proj_grads = {}
+        self.pi = 1.0 / float(neighbors + 1)
+        self.alpha = float(alpha)              # NGC mixing weight
+        self.beta = float(beta)                # hybrid weight for evidential score
+        self.wa = float(wa)                    # weight on local batch accuracy inside trust
+        self.tau_u = float(tau_u)
+        self.tau_min0 = float(tau_min)
+        self.gamma_tau = float(gamma_tau)
+        self.kappa = float(kappa)
+        self.omega_min = float(omega_min)
+        self.omega_max = float(omega_max)
+        self.softmax_temp = float(softmax_temp)
 
         self.momentum = momentum
         self.lr = lr
         self.nesterov = nesterov
         self.qgm = qgm
         self.weight_decay = weight_decay
+        self.eps = float(eps)
+        self.num_classes = num_classes
 
         self.momentum_buff = []
         self.prev_params = []
-
         for param in self.model.module.parameters():
             self.momentum_buff.append(torch.zeros_like(param.data))
             self.prev_params.append(copy.deepcopy(param.data))
 
-    def _unflatten_(self, flat_tensor: torch.Tensor, ref_buf: Dict[str, torch.Tensor]):
+        # cache for debugging / analysis
+        self.last_peer_scores = {}
+        self.last_peer_weights = {}
+        self.last_self_weight = None
+        self.last_tau_min = None
+
+    def average_gradients(self, grad, weights=None):
+        """
+        Weighted sum of a list of tensors with same shape.
+        If weights is None, uniform average is used.
+        """
+        if len(grad) == 0:
+            raise ValueError("average_gradients received an empty list")
+
+        out = torch.zeros_like(grad[0])
+
+        if weights is None:
+            coeff = 1.0 / float(len(grad))
+            for g in grad:
+                out.add_(g, alpha=coeff)
+            return out
+
+        w_sum = sum(float(w) for w in weights)
+        if abs(w_sum) < self.eps:
+            coeff = 1.0 / float(len(grad))
+            for g in grad:
+                out.add_(g, alpha=coeff)
+            return out
+
+        for g, w in zip(grad, weights):
+            out.add_(g, alpha=float(w) / w_sum)
+        return out
+
+    def _unflatten_(self, flat_tensor, ref_buf):
         ref = []
         keys = []
         for key, val in ref_buf.items():
             ref.append(val)
             keys.append(key)
-
         unflat_tensor = unflatten_tensors(flat_tensor, ref)
         X = {}
         for i, key in enumerate(keys):
             X[key] = unflat_tensor[i]
         return X
 
-    def _adaptive_threshold(self, current_round: int, total_rounds: int) -> float:
-        if total_rounds <= 0:
-            return self.init_threshold
-        t = float(current_round)
-        T = float(total_rounds)
-        tau_t = self.init_threshold * (
-            1.0 - self.tight_coef * math.exp(-self.tight_speed * t / T)
-        )
-        return max(0.0, min(1.0, tau_t))
+    def _safe_scalar(self, x, default=0.0):
+        if isinstance(x, torch.Tensor):
+            if x.numel() == 0:
+                return float(default)
+            return float(x.detach().view(-1)[0].item())
+        try:
+            return float(x)
+        except Exception:
+            return float(default)
 
-    def _compute_trust_score(self, stat_tensor: torch.Tensor) -> Tuple[float, float, float]:
+    def _adaptive_threshold(self, current_round, total_rounds):
+        T = max(float(total_rounds), 1.0)
+        return self.tau_min0 * (1.0 - self.gamma_tau * torch.exp(torch.tensor(-self.kappa * current_round / T, device=self.device)).item())
+
+    def _cosine_nonneg(self, a, b):
+        denom = torch.norm(a) * torch.norm(b) + self.eps
+        if denom <= 0:
+            return 0.0
+        val = torch.dot(a, b) / denom
+        return max(0.0, float(val.item()))
+
+    def _normalize_peer_weights(self, score_dict, tau_min):
         """
-        stat_tensor = [mean_uncertainty, accuracy]
-        Returns:
-            s_final, u_mean, acc
+        Soft weighting with optional thresholding.
         """
-        u_mean = float(stat_tensor[0].item())
-        acc = float(stat_tensor[1].item())
+        kept = {}
+        for r, s in score_dict.items():
+            if s >= tau_min:
+                kept[r] = s
 
-        # MURMURA-style base trust:
-        # s_base = (1 - u_bar) * (wa * acc + (1 - wa))
-        s_base = max(
-            0.0,
-            (1.0 - u_mean) * (self.acc_weight * acc + (1.0 - self.acc_weight)),
+        if len(kept) == 0:
+            # fallback: if all are filtered out, use the unfiltered scores
+            kept = {r: max(0.0, float(s)) for r, s in score_dict.items()}
+
+        if len(kept) == 0:
+            return {}
+
+        score_tensor = torch.tensor(
+            [self.softmax_temp * kept[r] for r in kept.keys()],
+            device=self.device,
+            dtype=torch.float32,
         )
+        weight_tensor = torch.softmax(score_tensor, dim=0)
 
-        if u_mean > self.uncertainty_threshold:
-            s_final = s_base * math.exp(-(u_mean - self.uncertainty_threshold))
-        else:
-            s_final = s_base
+        out = {}
+        for idx, r in enumerate(kept.keys()):
+            out[r] = float(weight_tensor[idx].item())
+        return out
 
-        return s_final, u_mean, acc
+    def _compute_local_self_uncertainty(self, local_peer_unc_dict):
+        """
+        In the current trainer interface, sender returns uncertainty only for neighbor-weight models.
+        We do not directly receive local self uncertainty from trainer.
 
-    def _filter_and_weight_peers(
-        self,
-        peer_stats: Dict[int, torch.Tensor],
-        current_round: int,
-        total_rounds: int,
-    ):
-        tau_t = self._adaptive_threshold(current_round, total_rounds)
-
-        retained_scores = {}
-        debug_info = {}
-
-        for rank, stat in peer_stats.items():
-            score, u_mean, acc = self._compute_trust_score(stat)
-            debug_info[rank] = {
-                "score": score,
-                "u_mean": u_mean,
-                "acc": acc,
-                "tau_t": tau_t,
-            }
-            if score >= tau_t:
-                retained_scores[rank] = score
-
-        if len(retained_scores) == 0:
-            return {}, [], debug_info
-
-        score_sum = sum(retained_scores.values())
-        weights = {r: retained_scores[r] / score_sum for r in retained_scores.keys()}
-        retained_ranks = list(retained_scores.keys())
-        return weights, retained_ranks, debug_info
+        Practical fallback:
+        - use average peer uncertainty as a proxy
+        - if no peer uncertainties exist, fall back to 0.5
+        """
+        if len(local_peer_unc_dict) == 0:
+            return 0.5
+        vals = [max(0.0, min(1.0, self._safe_scalar(v, 0.5))) for v in local_peer_unc_dict.values()]
+        return float(sum(vals) / max(len(vals), 1))
 
     def __call__(
         self,
         neighbor_grads_comm,
         neighbor_grads_comp,
-        comm_uncertainty,
-        comp_uncertainty,
+        neighbor_unc_comm,
+        neighbor_unc_comp,
         ref_buf,
         current_round,
         total_rounds,
     ):
-        # Unflatten received gradients
-        for rank in list(neighbor_grads_comm.keys()):
-            neighbor_grads_comm[rank] = self._unflatten_(neighbor_grads_comm[rank], ref_buf)
-        for rank in list(neighbor_grads_comp.keys()):
-            neighbor_grads_comp[rank] = self._unflatten_(neighbor_grads_comp[rank], ref_buf)
+        """
+        Inputs:
+        - neighbor_grads_comm:
+            gradients received after communication, interpreted as data-variant cross-gradients
+        - neighbor_grads_comp:
+            local cross-gradients computed from neighbor models on local batch,
+            interpreted as model-variant cross-gradients
+        - neighbor_unc_comm:
+            uncertainty messages received from neighbors
+        - neighbor_unc_comp:
+            local uncertainty estimates computed while evaluating neighbor models locally
+        """
+        # Unflatten gradients first
+        for rank, flat_tensor in neighbor_grads_comm.items():
+            neighbor_grads_comm[rank] = self._unflatten_(flat_tensor, ref_buf)
 
-        # comm_uncertainty / comp_uncertainty actually carry [uncertainty, accuracy]
-        weights_comp, ranks_comp, _ = self._filter_and_weight_peers(
-            comp_uncertainty, current_round, total_rounds
-        )
-        weights_comm, ranks_comm, _ = self._filter_and_weight_peers(
-            comm_uncertainty, current_round, total_rounds
-        )
+        for rank, flat_tensor in neighbor_grads_comp.items():
+            neighbor_grads_comp[rank] = self._unflatten_(flat_tensor, ref_buf)
 
-        for name, self_params in self.model.module.named_parameters():
-            if not self_params.requires_grad or self_params.grad is None:
+        tau_min_t = self._adaptive_threshold(current_round, total_rounds)
+        self.last_tau_min = tau_min_t
+
+        # Self-weight from local uncertainty proxy
+        u_local = self._compute_local_self_uncertainty(neighbor_unc_comp)
+        omega_i = self.omega_min + (self.omega_max - self.omega_min) * (1.0 - u_local)
+        omega_i = float(max(self.omega_min, min(self.omega_max, omega_i)))
+        self.last_self_weight = omega_i
+
+        # Compute per-peer scores
+        peer_scores = {}
+        peer_weights = {}
+
+        # use parameter-wise weighted combination after global peer weighting
+        for rank in neighbor_grads_comp.keys():
+            # Evidential score
+            u_comp = max(0.0, min(1.0, self._safe_scalar(neighbor_unc_comp.get(rank, 1.0), 1.0)))
+            # use communicated uncertainty if available as a stabilizer
+            u_comm = max(0.0, min(1.0, self._safe_scalar(neighbor_unc_comm.get(rank, u_comp), u_comp)))
+            u_bar = 0.5 * (u_comp + u_comm)
+
+            # approximate local-batch compatibility accuracy from model-variant gradient alignment
+            # since trainer currently does not pass a_ij explicitly
+            if rank in neighbor_grads_comp:
+                flat_self = flatten_tensors(
+                    [p.grad.data for p in self.model.module.parameters() if p.requires_grad]
+                ).to(self.device)
+                flat_mv = flatten_tensors(
+                    [neighbor_grads_comp[rank][name] for name, p in self.model.module.named_parameters() if p.requires_grad]
+                ).to(self.device)
+                acc_proxy = 0.5 * (1.0 + self._cosine_nonneg(flat_self, flat_mv))
+                acc_proxy = max(0.0, min(1.0, acc_proxy))
+            else:
+                acc_proxy = 0.5
+
+            s_base = (1.0 - u_bar) * (self.wa * acc_proxy + (1.0 - self.wa))
+            if u_bar > self.tau_u:
+                s_ev = s_base * float(torch.exp(torch.tensor(-(u_bar - self.tau_u), device=self.device)).item())
+            else:
+                s_ev = s_base
+
+            # Gradient score
+            if rank in neighbor_grads_comp:
+                c_mv = self._cosine_nonneg(
+                    flat_self,
+                    flatten_tensors(
+                        [neighbor_grads_comp[rank][name] for name, p in self.model.module.named_parameters() if p.requires_grad]
+                    ).to(self.device),
+                )
+            else:
+                c_mv = 0.0
+
+            if rank in neighbor_grads_comm:
+                c_dv = self._cosine_nonneg(
+                    flat_self,
+                    flatten_tensors(
+                        [neighbor_grads_comm[rank][name] for name, p in self.model.module.named_parameters() if p.requires_grad]
+                    ).to(self.device),
+                )
+            else:
+                c_dv = 0.0
+
+            # time-dependent mixing for mv/dv can reuse alpha as a constant for now
+            s_grad = (1.0 - self.alpha) * c_mv + self.alpha * c_dv
+
+            # Hybrid score
+            # multiplicative form, but guarded against zeros
+            s_ev_safe = max(s_ev, self.eps)
+            s_grad_safe = max(s_grad, self.eps)
+            s_hybrid = (s_ev_safe ** self.beta) * (s_grad_safe ** (1.0 - self.beta))
+
+            peer_scores[rank] = {
+                "u_comp": u_comp,
+                "u_comm": u_comm,
+                "u_bar": u_bar,
+                "acc_proxy": acc_proxy,
+                "s_base": s_base,
+                "s_ev": s_ev,
+                "c_mv": c_mv,
+                "c_dv": c_dv,
+                "s_grad": s_grad,
+                "s_hybrid": s_hybrid,
+            }
+
+        # Normalize peer weights from hybrid scores
+        hybrid_score_dict = {r: peer_scores[r]["s_hybrid"] for r in peer_scores.keys()}
+        peer_weights = self._normalize_peer_weights(hybrid_score_dict, tau_min_t)
+
+        self.last_peer_scores = peer_scores
+        self.last_peer_weights = peer_weights
+
+        # Final parameter-wise aggregation
+        for name, self_param in self.model.module.named_parameters():
+            if not self_param.requires_grad or self_param.grad is None:
                 continue
 
-            local_grad = self_params.grad.data
+            self_grad = self_param.grad.data
 
-            # Model-variant branch (comp)
-            if len(ranks_comp) == 0:
-                p_grads_comp = local_grad
+            mv_list = []
+            mv_w = []
+            for rank, neigh_grad in neighbor_grads_comp.items():
+                if rank in peer_weights:
+                    mv_list.append(neigh_grad[name])
+                    mv_w.append(peer_weights[rank])
+
+            dv_list = []
+            dv_w = []
+            for rank, neigh_grad in neighbor_grads_comm.items():
+                if rank in peer_weights:
+                    dv_list.append(neigh_grad[name])
+                    dv_w.append(peer_weights[rank])
+
+            if len(mv_list) > 0:
+                p_grad_mv = self.average_gradients(mv_list, mv_w)
             else:
-                g_peers_comp = torch.zeros_like(local_grad)
-                for rank in ranks_comp:
-                    g_peers_comp.add_(neighbor_grads_comp[rank][name], alpha=weights_comp[rank])
-                p_grads_comp = (
-                    self.self_weight * local_grad
-                    + (1.0 - self.self_weight) * g_peers_comp
-                )
+                p_grad_mv = torch.zeros_like(self_grad)
 
-            # Data-variant branch (comm)
-            if len(ranks_comm) == 0:
-                p_grads_comm = local_grad
+            if len(dv_list) > 0:
+                p_grad_dv = self.average_gradients(dv_list, dv_w)
             else:
-                g_peers_comm = torch.zeros_like(local_grad)
-                for rank in ranks_comm:
-                    g_peers_comm.add_(neighbor_grads_comm[rank][name], alpha=weights_comm[rank])
-                p_grads_comm = (
-                    self.self_weight * local_grad
-                    + (1.0 - self.self_weight) * g_peers_comm
-                )
+                p_grad_dv = torch.zeros_like(self_grad)
 
-            # NGC fusion
-            self.proj_grads[name] = (
-                (1.0 - self.alpha) * p_grads_comp + self.alpha * p_grads_comm
-            )
+            peer_grad = (1.0 - self.alpha) * p_grad_mv + self.alpha * p_grad_dv
+            self.proj_grads[name] = omega_i * self_grad + (1.0 - omega_i) * peer_grad
+
+        return
 
     def project_gradients(self, lr):
+        """
+        Applies the projected / aggregated gradients to the wrapped model,
+        then applies weight decay and momentum exactly like the NGC baseline.
+        """
         for name, p in self.model.module.named_parameters():
-            if not p.requires_grad:
-                continue
-            if name not in self.proj_grads:
-                continue
+            if p.requires_grad:
+                if name in self.proj_grads:
+                    p.grad.data = self.proj_grads[name].data
+                if self.weight_decay != 0:
+                    p.grad.data.add_(p.data, alpha=self.weight_decay)
 
-            p.grad.data = self.proj_grads[name].data
-
-            if self.weight_decay != 0:
-                p.grad.data.add_(p.data, alpha=self.weight_decay)
-
+        # momentum
         if self.momentum != 0:
             if self.qgm:
-                for p, p_prev, buf in zip(
-                    self.model.module.parameters(),
-                    self.prev_params,
-                    self.momentum_buff,
-                ):
-                    buf.mul_(self.momentum).add_(
-                        p_prev.data - p.data,
-                        alpha=(1.0 - self.momentum) / self.lr,
-                    )
+                for p, p_prev, buf in zip(self.model.module.parameters(), self.prev_params, self.momentum_buff):
+                    buf.mul_(self.momentum).add_(p_prev.data - p.data, alpha=(1.0 - self.momentum) / self.lr)
                     mom_buff = copy.deepcopy(buf)
                     mom_buff.mul_(self.momentum).add_(p.grad.data)
-
                     if self.nesterov:
                         p.grad.data.add_(mom_buff, alpha=self.momentum)
                     else:
@@ -383,7 +555,6 @@ class EDL_NGC_receiver:
             else:
                 for p, buf in zip(self.model.module.parameters(), self.momentum_buff):
                     buf.mul_(self.momentum).add_(p.grad.data)
-
                     if self.nesterov:
                         p.grad.data.add_(buf, alpha=self.momentum)
                     else:

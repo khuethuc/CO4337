@@ -76,6 +76,26 @@ parser.add_argument('--port', dest='port',   help='between 3000 to 65000',defaul
 parser.add_argument("--steplr", action="store_true", help="Uses step lr schedular for training.")
 parser.add_argument('--nesterov', action='store_true', )
 parser.add_argument('--qgm', action='store_true', help='quasi global momentum')
+# engc arguments
+parser.add_argument('--engc-beta', dest='engc_beta', default=0.8, type=float,
+                    help='hybrid compatibility weight: beta for evidential score')
+parser.add_argument('--engc-wa', dest='engc_wa', default=0.5, type=float,
+                    help='weight of validation accuracy inside evidential trust')
+parser.add_argument('--engc-tau-u', dest='engc_tau_u', default=0.6, type=float,
+                    help='uncertainty threshold for evidential penalty')
+parser.add_argument('--engc-tau-min', dest='engc_tau_min', default=0.0, type=float,
+                    help='minimum trust threshold for peer filtering')
+parser.add_argument('--engc-gamma-tau', dest='engc_gamma_tau', default=0.5, type=float,
+                    help='adaptive trust-threshold decay factor')
+parser.add_argument('--engc-kappa', dest='engc_kappa', default=5.0, type=float,
+                    help='adaptive trust-threshold sharpness')
+parser.add_argument('--engc-omega-min', dest='engc_omega_min', default=0.4, type=float,
+                    help='minimum self-weight')
+parser.add_argument('--engc-omega-max', dest='engc_omega_max', default=0.8, type=float,
+                    help='maximum self-weight')
+parser.add_argument('--engc-softmax-temp', dest='engc_softmax_temp', default=5.0, type=float,
+                    help='temperature/scale used when normalizing hybrid compatibility scores')
+
 args = parser.parse_args()
 args.devices = torch.cuda.device_count()
 
@@ -153,8 +173,13 @@ def run(rank, size):
         sender = CompNGC_sender(model, device)
     elif args.optimizer.lower()=="topkngc":
         sender = Topk_NGC_sender(model, device)
-    elif args.optimizer.lower()=='edlngc':
-        sender = EDL_NGC_sender(model, device, num_classes=args.classes)
+    elif args.optimizer.lower() == 'edlngc':
+        sender = EDL_NGC_sender(
+            model,
+            device,
+            num_classes=args.classes,
+            class_weights=local_class_weights,
+        )
     else:
         sender=None
 
@@ -190,8 +215,17 @@ def run(rank, size):
     train_loader, bsz_train = partition_trainDataset(args.dataset, args.data_dir, args.skew, args.seed, args.batch_size)
     val_loader, bsz_val     = test_Dataset(args.dataset, args.data_dir, seed=args.seed)
    
-   # Check non-iid distribution
+    # Check non-iid distribution
     check_noniid(train_loader, rank, args.world_size)
+
+    # Compute local class weights for ENGC
+    local_class_weights = compute_local_class_weights(
+        train_loader=train_loader,
+        num_classes=args.classes,
+        device=device,
+    )
+    if rank == 0:
+        print(f"[ENGC] local_class_weights rank {rank}: {local_class_weights.detach().cpu().tolist()}")
 
     if args.optimizer.lower()=='cga':
         receiver  = CGA_receiver(model, device, rank,  args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors)
@@ -204,7 +238,28 @@ def run(rank, size):
     elif args.optimizer.lower()=='topkngc':
         receiver  = Topk_NGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors, alpha = args.alpha)
     elif args.optimizer.lower() == 'edlngc':
-        receiver = EDL_NGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors, alpha=args.alpha)
+        receiver = EDL_NGC_receiver(
+            model,
+            device,
+            rank,
+            args.lr,
+            args.momentum,
+            args.qgm,
+            args.nesterov,
+            weight_decay=args.weight_decay,
+            neighbors=args.neighbors,
+            alpha=args.alpha,
+            beta=args.engc_beta,
+            wa=args.engc_wa,
+            tau_u=args.engc_tau_u,
+            tau_min=args.engc_tau_min,
+            gamma_tau=args.engc_gamma_tau,
+            kappa=args.engc_kappa,
+            omega_min=args.engc_omega_min,
+            omega_max=args.engc_omega_max,
+            softmax_temp=args.engc_softmax_temp,
+            num_classes=args.classes,
+        )
     else:
         receiver = DSGD_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay)
     
@@ -212,8 +267,11 @@ def run(rank, size):
     optimizer = optim.SGD(model.parameters(), args.lr)
     
     if args.optimizer.lower() == 'edlngc':
-        from optimizers.edlngc import EDLLoss 
-        criterion = EDLLoss(num_classes=args.classes).to(device)
+        from optimizers.edlngc import EDLLoss
+        criterion = EDLLoss(
+            num_classes=args.classes,
+            class_weights=local_class_weights,
+        ).to(device)
     else:
         criterion = nn.CrossEntropyLoss().to(device)
 
@@ -347,12 +405,15 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
         # do global update (gossip average step) in the pre forward hook, 
         # then compute output in the forward pass
         output = model(input_var)
-        loss = criterion(output, target_var)
 
         if args.optimizer.lower() == 'edlngc':
-            lambda_t = min(1.0, current_round / (total_rounds / 2.0))
+            anneal_steps = max(1.0, total_rounds / 2.0)
+            lambda_t = min(1.0, current_round / anneal_steps)
+
             criterion.lambda_t = lambda_t
-            sender.criterion.lambda_t = lambda_t
+            if sender is not None and hasattr(sender, "criterion"):
+                sender.criterion.lambda_t = lambda_t
+
             evidence = F.softplus(output)
             loss = criterion(evidence, target_var)
         else:
@@ -706,7 +767,29 @@ def check_noniid(train_loader, rank, world_size):
         l1_distance = np.abs(matrix - mean_distribution).sum(axis=1)
         print("\nL1 distance:")
         for rank, value in enumerate(l1_distance):
-                print(f"Rank {rank}: {value:.3f}")    
+                print(f"Rank {rank}: {value:.3f}")
+
+def compute_local_class_weights(train_loader, num_classes, device, eps=1e-8, power=1.0):
+    """
+    Compute inverse-frequency class weights from the local node's train_loader.
+    Returns a tensor of shape [num_classes] on `device`.
+    """
+    counts = torch.zeros(num_classes, dtype=torch.float32)
+
+    for _, targets in train_loader:
+        if isinstance(targets, torch.Tensor):
+            t = targets.view(-1).cpu()
+            counts += torch.bincount(t, minlength=num_classes).float()
+
+    counts = torch.clamp(counts, min=eps)
+
+    # inverse frequency
+    weights = 1.0 / (counts ** power)
+
+    # normalize so mean weight ~= 1
+    weights = weights / weights.mean()
+
+    return weights.to(device)    
 
 # # # Main function # # #
 if __name__ == '__main__':
