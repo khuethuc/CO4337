@@ -64,7 +64,7 @@ parser.add_argument('--momentum', default=0.9, type=float, metavar='M',     help
 parser.add_argument('--weight_decay', default=0.0, type=float,     help='weight_decay')
 parser.add_argument('-world_size', '--world_size', default=10, type=int, help='total number of nodes')
 parser.add_argument('--epochs', default=100, type=int, metavar='N',   help='number of total epochs to run')
-parser.add_argument('--optimizer', default='ngc', type=str,  help='global optimizer = [d-psgd, cga, ngc, compcga, compngc, topkngc, edlngc]')
+parser.add_argument('--optimizer', default='ngc', type=str,  help='global optimizer = [d-psgd, cga, ngc, compcga, compngc, topkngc, engc]')
 parser.add_argument('--graph', '-g',  default='ring', help = 'graph structure - [ring, torus]' )
 parser.add_argument('--neighbors', default=2, type=int,     help='number of neighbors per node')
 parser.add_argument('-d', '--devices', default=4, type=int, help='number of gpus/devices on the card')
@@ -114,10 +114,10 @@ def run(rank, size):
     random.seed(args.seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    #torch.use_deterministic_algorithms(True)
+
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(rank)
-	##############
+
     best_prec1 = 0
     data_transferred = 0
     global_steps = 0
@@ -131,94 +131,41 @@ def run(rank, size):
     total_tx_bytes = 0
     total_tx_packets = 0
 
-    # track per-epoch metrics (for plotting)
     train_acc_list = []
     train_loss_list = []
     val_acc_list = []
     val_loss_list = []
-    
-    
-    if args.arch.lower()=='resnet':
-        model = resnet(num_classes=args.classes, depth=args.depth, dataset=args.dataset, norm_type=args.normtype, groups=2)
+
+    if args.arch.lower() == 'resnet':
+        base_model = resnet(num_classes=args.classes, depth=args.depth, dataset=args.dataset, norm_type=args.normtype, groups=2)
     elif args.arch.lower() == 'vgg11':
-        model = vgg11(num_classes=args.classes, dataset=args.dataset, norm_type=args.normtype, groups=2)
+        base_model = vgg11(num_classes=args.classes, dataset=args.dataset, norm_type=args.normtype, groups=2)
     elif args.arch.lower() == 'mobilenet':
-        model = MobileNetV2(num_classes=args.classes, norm_type=args.normtype, groups=2)
+        base_model = MobileNetV2(num_classes=args.classes, norm_type=args.normtype, groups=2)
     elif args.arch.lower() == 'cganet':
-        model = cganet5(num_classes=args.classes, dataset=args.dataset, norm_type=args.normtype, groups=2)
+        base_model = cganet5(num_classes=args.classes, dataset=args.dataset, norm_type=args.normtype, groups=2)
     elif args.arch.lower() == 'lenet5':
-        model = LeNet5()
+        base_model = LeNet5()
     else:
         raise NotImplementedError
-    
-    if rank==0: 
+
+    if rank == 0:
         print(args)
         print('Printing model summary...')
-        if args.dataset=="fmnist":
-            print(summary(model, (1,28,28), batch_size=int(args.batch_size/size), device='cpu'))
-        elif args.dataset=="imagenette_full":
-            print(summary(model, (3, 224, 224), batch_size=int(args.batch_size/size), device='cpu'))
-        elif args.dataset=="imagenet":
-            print(summary(model, (3, 224, 224), batch_size=int(args.batch_size/size), device='cpu'))
-        else: 
-            print(summary(model, (3, 32, 32), batch_size=int(args.batch_size/size), device='cpu'))
-        
-    if args.optimizer.lower()=='cga':
-        sender = CGA_sender(model, device)
-    elif args.optimizer.lower()=="ngc":
-        sender = NGC_sender(model, device)
-    elif args.optimizer.lower()=='compcga':
-        sender = CompCGA_sender(model, device)
-    elif args.optimizer.lower()=="compngc":
-        sender = CompNGC_sender(model, device)
-    elif args.optimizer.lower()=="topkngc":
-        sender = Topk_NGC_sender(model, device)
-    elif args.optimizer.lower() == 'edlngc':
-        sender = EDL_NGC_sender(
-            model,
-            device,
-            num_classes=args.classes,
-            class_weights=local_class_weights,
-        )
-    else:
-        sender=None
+        if args.dataset == "fmnist":
+            print(summary(base_model, (1, 28, 28), batch_size=int(args.batch_size / size), device='cpu'))
+        elif args.dataset in ["imagenette_full", "imagenet"]:
+            print(summary(base_model, (3, 224, 224), batch_size=int(args.batch_size / size), device='cpu'))
+        else:
+            print(summary(base_model, (3, 32, 32), batch_size=int(args.batch_size / size), device='cpu'))
 
-    if args.graph.lower() == 'ring':
-        graph = RingGraph(rank, size, args.devices, peers_per_itr=args.neighbors) #undirected ring structure => neighbors = 2 ; directed ring => neighbors=1
-    elif args.graph.lower() == 'torus':   
-        graph = GridGraph(rank, size, args.devices, peers_per_itr=args.neighbors) # torus graph structure
-    elif args.graph.lower() == 'full':
-        graph = FullGraph(rank, size, args.devices, peers_per_itr=args.world_size-1) # torus graph structure  
-    elif args.graph.lower() == 'chain':   
-        graph = ChainGraph(rank, size, args.devices, peers_per_itr=args.neighbors)
-    else:
-        raise NotImplementedError
-    
-    mixing = UniformMixing(graph, device)
-    model = GossipDataParallel(model, 
-				device_ids=[rank],
-				rank=rank,
-				world_size=size,
-				graph=graph, 
-				mixing=mixing,
-				comm_device=device, 
-                level = 32,
-                biased = False,
-                eta = args.gamma,
-                compress_ratio=0.0,
-                compress_fn = 'quantize', 
-                compress_op = 'top_k', 
-                momentum=args.momentum,
-                lr = args.lr) 
-    model.to(device)
- 
-    train_loader, bsz_train = partition_trainDataset(args.dataset, args.data_dir, args.skew, args.seed, args.batch_size)
-    val_loader, bsz_val     = test_Dataset(args.dataset, args.data_dir, seed=args.seed)
-   
-    # Check non-iid distribution
+    train_loader, bsz_train = partition_trainDataset(
+        args.dataset, args.data_dir, args.skew, args.seed, args.batch_size
+    )
+    val_loader, bsz_val = test_Dataset(args.dataset, args.data_dir, seed=args.seed)
+
     check_noniid(train_loader, rank, args.world_size)
 
-    # Compute local class weights for ENGC
     local_class_weights = compute_local_class_weights(
         train_loader=train_loader,
         num_classes=args.classes,
@@ -227,18 +174,83 @@ def run(rank, size):
     if rank == 0:
         print(f"[ENGC] local_class_weights rank {rank}: {local_class_weights.detach().cpu().tolist()}")
 
-    if args.optimizer.lower()=='cga':
-        receiver  = CGA_receiver(model, device, rank,  args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors)
-    elif args.optimizer.lower()=='compcga':
-        receiver = CompCGA_receiver(model, device, rank,  args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors)
-    elif args.optimizer.lower()=='ngc':
-        receiver  = NGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors, alpha = args.alpha)
-    elif args.optimizer.lower()=='compngc':
-        receiver = CompNGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors, alpha = args.alpha)
-    elif args.optimizer.lower()=='topkngc':
-        receiver  = Topk_NGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors, alpha = args.alpha)
-    elif args.optimizer.lower() == 'edlngc':
-        receiver = EDL_NGC_receiver(
+    if args.optimizer.lower() == 'engc':
+        criterion = EDLLoss(
+            num_classes=args.classes,
+            class_weights=local_class_weights,
+        ).to(device)
+    else:
+        criterion = nn.CrossEntropyLoss().to(device)
+
+    if args.optimizer.lower() == 'cga':
+        sender = CGA_sender(base_model, device)
+    elif args.optimizer.lower() == "ngc":
+        sender = NGC_sender(base_model, device)
+    elif args.optimizer.lower() == 'compcga':
+        sender = CompCGA_sender(base_model, device)
+    elif args.optimizer.lower() == "compngc":
+        sender = CompNGC_sender(base_model, device)
+    elif args.optimizer.lower() == "topkngc":
+        sender = Topk_NGC_sender(base_model, device)
+    elif args.optimizer.lower() == 'engc':        
+        sender = ENGC_sender(
+            base_model,
+            device,
+            criterion=criterion,
+            num_classes=args.classes,
+            total_rounds=args.epochs * len(train_loader),
+            tau_u=args.engc_tau_u,
+            tau_min_0=args.engc_tau_min,
+            w_a=args.engc_wa,
+            gamma_tau=args.engc_gamma_tau,
+            kappa=args.engc_kappa
+        )
+    else:
+        sender = None
+
+    if args.graph.lower() == 'ring':
+        graph = RingGraph(rank, size, args.devices, peers_per_itr=args.neighbors)
+    elif args.graph.lower() == 'torus':
+        graph = GridGraph(rank, size, args.devices, peers_per_itr=args.neighbors)
+    elif args.graph.lower() == 'full':
+        graph = FullGraph(rank, size, args.devices, peers_per_itr=args.world_size - 1)
+    elif args.graph.lower() == 'chain':
+        graph = ChainGraph(rank, size, args.devices, peers_per_itr=args.neighbors)
+    else:
+        raise NotImplementedError
+
+    mixing = UniformMixing(graph, device)
+    model = GossipDataParallel(
+        base_model,
+        device_ids=[rank],
+        rank=rank,
+        world_size=size,
+        graph=graph,
+        mixing=mixing,
+        comm_device=device,
+        level=32,
+        biased=False,
+        eta=args.gamma,
+        compress_ratio=0.0,
+        compress_fn='quantize',
+        compress_op='top_k',
+        momentum=args.momentum,
+        lr=args.lr,
+    )
+    model.to(device)
+
+    if args.optimizer.lower() == 'cga':
+        receiver = CGA_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors)
+    elif args.optimizer.lower() == 'compcga':
+        receiver = CompCGA_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors)
+    elif args.optimizer.lower() == 'ngc':
+        receiver = NGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors, alpha=args.alpha)
+    elif args.optimizer.lower() == 'compngc':
+        receiver = CompNGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors, alpha=args.alpha)
+    elif args.optimizer.lower() == 'topkngc':
+        receiver = Topk_NGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors, alpha=args.alpha)
+    elif args.optimizer.lower() == 'engc':
+        receiver = ENGC_receiver(
             model,
             device,
             rank,
@@ -248,51 +260,42 @@ def run(rank, size):
             args.nesterov,
             weight_decay=args.weight_decay,
             neighbors=args.neighbors,
-            alpha=args.alpha,
-            beta=args.engc_beta,
-            wa=args.engc_wa,
-            tau_u=args.engc_tau_u,
-            tau_min=args.engc_tau_min,
-            gamma_tau=args.engc_gamma_tau,
-            kappa=args.engc_kappa,
-            omega_min=args.engc_omega_min,
-            omega_max=args.engc_omega_max,
-            softmax_temp=args.engc_softmax_temp,
-            num_classes=args.classes,
+            alpha=args.alpha 
         )
     else:
         receiver = DSGD_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay)
-    
 
     optimizer = optim.SGD(model.parameters(), args.lr)
-    
-    if args.optimizer.lower() == 'edlngc':
-        from optimizers.edlngc import EDLLoss
-        criterion = EDLLoss(
-            num_classes=args.classes,
-            class_weights=local_class_weights,
-        ).to(device)
-    else:
-        criterion = nn.CrossEntropyLoss().to(device)
 
     if args.steplr:
-        lr_scheduler = optim.lr_scheduler.StepLR(optimizer, gamma = 0.981, step_size=1)
+        lr_scheduler = optim.lr_scheduler.StepLR(optimizer, gamma=0.981, step_size=1)
     else:
-        if args.dataset=='imagenet':
-            lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, gamma = 0.1, milestones=[int(args.epochs*0.33), int(args.epochs*0.67), int(args.epochs*0.89)])
+        if args.dataset == 'imagenet':
+            lr_scheduler = optim.lr_scheduler.MultiStepLR(
+                optimizer, gamma=0.1,
+                milestones=[int(args.epochs * 0.33), int(args.epochs * 0.67), int(args.epochs * 0.89)]
+            )
         else:
-            lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, gamma = 0.1, milestones=[int(args.epochs*0.5), int(args.epochs*0.75)])
-            
-    for epoch in range(0, args.epochs):  
+            lr_scheduler = optim.lr_scheduler.MultiStepLR(
+                optimizer, gamma=0.1,
+                milestones=[int(args.epochs * 0.5), int(args.epochs * 0.75)]
+            )
+
+    for epoch in range(0, args.epochs):
         print('current lr {:.5e}'.format(optimizer.param_groups[0]['lr']))
         model.block()
-        # (NIC) đo trước epoch train
         net_before = read_net_dev() if rank == 0 else None
 
         dt, prec1, loss, m = train(
-            train_loader, model, criterion, optimizer, epoch,
-            bsz_train, optimizer.param_groups[0]['lr'],
-            device,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            model=model,
+            criterion=criterion,
+            optimizer=optimizer,
+            epoch=epoch,
+            batch_size=bsz_train,
+            lr=optimizer.param_groups[0]['lr'],
+            device=device,
             receiver=receiver,
             sender=sender,
             gpu_index=rank,
@@ -303,12 +306,11 @@ def run(rank, size):
         train_acc_list.append(float(prec1))
         train_loss_list.append(float(loss))
 
-        # (NIC) đo sau epoch train
         if rank == 0:
             net_after = read_net_dev()
             net_delta = diff_stats(net_after, net_before)
         else:
-            net_delta = {"rx_bytes":0,"rx_packets":0,"tx_bytes":0,"tx_packets":0}
+            net_delta = {"rx_bytes": 0, "rx_packets": 0, "tx_bytes": 0, "tx_packets": 0}
 
         total_train_time_s += m["train_time_s"]
         total_cpu_pct_sum += m["cpu_pct_avg"]
@@ -318,11 +320,13 @@ def run(rank, size):
 
         total_tx_bytes += net_delta["tx_bytes"]
         total_tx_packets += net_delta["tx_packets"]
-        
-        if epoch>=0: lr_scheduler.step()
-        prec1, loss = validate(val_loader, model, criterion, bsz_val,device, epoch)
+
+        lr_scheduler.step()
+
+        prec1, loss = validate(val_loader, model, criterion, bsz_val, device, epoch)
         is_best = prec1 > best_prec1
         best_prec1 = max(prec1, best_prec1)
+
         save_checkpoint({
             'state_dict': model.state_dict(),
             'best_prec1': best_prec1,
@@ -330,34 +334,31 @@ def run(rank, size):
 
         val_acc_list.append(float(prec1))
         val_loss_list.append(float(loss))
-      
-    #############################
+
     average_parameters(model)
     print('Final test accuracy')
-    prec1_final, _ = validate(val_loader, model, criterion, bsz_val,device, epoch)
-    print("Rank : ", rank, "Data transferred(in GB) during training: ", data_transferred/1.0e9, "\n")
-    #Store processed data
+    prec1_final, _ = validate(val_loader, model, criterion, bsz_val, device, epoch)
+    print("Rank : ", rank, "Data transferred(in GB) during training: ", data_transferred / 1.0e9, "\n")
+
     result = {
         "acc_last_epoch": float(prec1),
         "acc_final": float(prec1_final),
-        "payload_gb": float(data_transferred / 1.0e9),   # payload theo gossip (đã có)
+        "payload_gb": float(data_transferred / 1.0e9),
         "train_time_s": float(total_train_time_s),
         "cpu_pct_avg": float(total_cpu_pct_sum / max(total_cpu_cnt, 1)),
         "gpu_pct_avg": float(total_gpu_pct_sum / max(total_gpu_cnt, 1)),
-        "tx_bytes": int(total_tx_bytes),                 # NIC-level (rank0)
-        "tx_packets": int(total_tx_packets),             # NIC-level (rank0)
+        "tx_bytes": int(total_tx_bytes),
+        "tx_packets": int(total_tx_packets),
         "train_acc_list": train_acc_list,
         "train_loss_list": train_loss_list,
         "val_acc_list": val_acc_list,
         "val_loss_list": val_loss_list,
     }
     torch.save(result, os.path.join(args.save_dir, "excel_data", f"rank_{rank}.sp"))
-
+    
 # # # Train functions # # #
-def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, device, receiver=None, sender=None, gpu_index: int = 0, monitor_every: int = 50):
-    """
-        Run one train epoch
-    """
+def train(train_loader, val_loader, model, criterion, optimizer, epoch, batch_size, lr, device,
+          receiver=None, sender=None, gpu_index: int = 0, monitor_every: int = 50):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -367,46 +368,45 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
     all_outputs = []
     all_targets = []
 
-    # switch to train mode
     model.train()
 
-    # timing (GPU-accurate)
     torch.cuda.synchronize(device)
     t_epoch_start = time.perf_counter()
 
-    # CPU% (process) sampling: cpu_time / wall_time
     last_wall = time.perf_counter()
-    last_cpu  = time.process_time()
+    last_cpu = time.process_time()
     cpu_samples = []
-
-    # GPU util% sampling
     gpu_samples = []
 
-    # logical comm counters (rounds/calls)
     comm_calls_transfer_params = 0
     comm_calls_transfer_additional = 0
-    payload_bytes_from_calls = 0  # sum of amt_data_transfer returned by gossip
+    payload_bytes_from_calls = 0
 
     end = time.time()
-    step = len(train_loader)*batch_size*epoch
-
+    step = len(train_loader) * batch_size * epoch
     total_rounds = args.epochs * len(train_loader)
+
+    val_iter = iter(val_loader)
 
     for i, (input, target) in enumerate(train_loader):
         current_round = epoch * len(train_loader) + i
-        #print(dist.get_rank(), torch.unique(target))
         data_time.update(time.time() - end)
-        input_var, target_var = Variable(input).to(device), Variable(target).to(device)
-        # gossip the weights
-        _, amt_data_transfer, cross_weights = model.transfer_params(epoch=epoch+(1e-3*i), lr=lr)
+
+        input_var = Variable(input).to(device)
+        target_var = Variable(target).to(device)
+
+        (val_input, val_target), val_iter = get_next_batch(val_iter, val_loader)
+        val_input_var = Variable(val_input).to(device)
+        val_target_var = Variable(val_target).to(device)
+
+        _, amt_data_transfer, cross_weights = model.transfer_params(epoch=epoch + (1e-3 * i), lr=lr)
         comm_calls_transfer_params += 1
         payload_bytes_from_calls += amt_data_transfer
         data_transferred += amt_data_transfer
-        # do global update (gossip average step) in the pre forward hook, 
-        # then compute output in the forward pass
+
         output = model(input_var)
 
-        if args.optimizer.lower() == 'edlngc':
+        if args.optimizer.lower() == 'engc':
             anneal_steps = max(1.0, total_rounds / 2.0)
             lambda_t = min(1.0, current_round / anneal_steps)
 
@@ -421,61 +421,72 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
 
         all_outputs.append(output.detach().cpu())
         all_targets.append(target.detach().cpu())
-        # compute gradient 
+
         loss.backward()
 
         if 'cga' in args.optimizer.lower() or 'ngc' in args.optimizer.lower():
-            if args.optimizer.lower() == 'edlngc':
-                cross_grad, cross_unc, ref_buf = sender(cross_weights, input_var, target_var) 
+            if args.optimizer.lower() == 'engc':
+                cross_grad, ref_buf, trust_scores = sender(
+                    cross_weights,
+                    input_var,
+                    target_var,
+                    val_input_var,
+                    val_target_var,
+                    current_round
+                )
+
                 cross_grad_copy = copy.deepcopy(cross_grad)
-                cross_uncertainty_copy  = copy.deepcopy(cross_unc)
-                # Transmit gradients through topology
-                _, amt_data_transfer, recieved_cross_grad = model.transfer_additional(cross_grad)
+
+                _, amt_data_transfer, received_cross_grad = model.transfer_additional(cross_grad)
                 comm_calls_transfer_additional += 1
                 payload_bytes_from_calls += amt_data_transfer
-                # Transmit uncertainty through topology
-                _, amt_data_transfer_unc, recieved_cross_uncertainty = model.transfer_additional(cross_unc)
-                comm_calls_transfer_additional += 1
-                payload_bytes_from_calls += amt_data_transfer_unc
-                
-                data_transferred += (amt_data_transfer + amt_data_transfer_unc)
-                
-                # Call receiver
-                receiver(recieved_cross_grad, cross_grad_copy, recieved_cross_uncertainty, cross_uncertainty_copy, ref_buf, current_round, total_rounds)
+                data_transferred += amt_data_transfer
+
+                self_eval_local = evaluate_self_evidential(
+                    model,
+                    val_input_var,
+                    val_target_var,
+                    args.classes,
+                )
+
+                receiver(
+                    received_cross_grad, # neighbor_grads_comm
+                    cross_grad_copy,     # neighbor_grads_comp
+                    ref_buf,             # self gradient
+                    trust_scores 
+                )
                 receiver.project_gradients(lr)
             else:
-                #send and recieve cross gradients
-                cross_grad, ref_buf                       = sender(cross_weights, input_var, target_var) 
-                cross_grad_copy                           = copy.deepcopy(cross_grad)
-                _, amt_data_transfer, recieved_cross_grad = model.transfer_additional(cross_grad)
+                cross_grad, ref_buf = sender(cross_weights, input_var, target_var)
+                cross_grad_copy = copy.deepcopy(cross_grad)
+                _, amt_data_transfer, received_cross_grad = model.transfer_additional(cross_grad)
                 comm_calls_transfer_additional += 1
                 payload_bytes_from_calls += amt_data_transfer
-                receiver(recieved_cross_grad, cross_grad_copy, ref_buf)
-                data_transferred    +=amt_data_transfer
-                #project the gradients
+                data_transferred += amt_data_transfer
+                receiver(received_cross_grad, cross_grad_copy, ref_buf)
                 receiver.project_gradients(lr)
+
         elif args.optimizer.lower() == 'd-psgd':
             receiver.update_gradients(lr)
 
-        # do local update
         optimizer.step()
-        #zero out the gradients
-        optimizer.zero_grad() 
+        optimizer.zero_grad()
+
         output = output.float()
         loss = loss.float()
-        # measure accuracy and record loss
+
         prec1 = accuracy(output.data, target_var)[0]
         losses.update(loss.item(), input.size(0))
         top1.update(prec1.item(), input.size(0))
-        # measure elapsed time
+
         batch_time.update(time.time() - end)
         end = time.time()
-        
+
         if (i % monitor_every) == 0:
             now_wall = time.perf_counter()
-            now_cpu  = time.process_time()
+            now_cpu = time.process_time()
             dt_wall = max(now_wall - last_wall, 1e-9)
-            dt_cpu  = max(now_cpu - last_cpu, 0.0)
+            dt_cpu = max(now_cpu - last_cpu, 0.0)
             cpu_pct = (dt_cpu / dt_wall) * 100.0
             cpu_samples.append(cpu_pct)
             last_wall, last_cpu = now_wall, now_cpu
@@ -490,10 +501,10 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
                   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
                   'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
-                      dist.get_rank(), epoch, i, len(train_loader),  batch_time=batch_time,
-                      loss=losses, top1=top1))
+                      dist.get_rank(), epoch, i, len(train_loader),
+                      batch_time=batch_time, loss=losses, top1=top1))
         step += batch_size
-    
+
     all_outputs = torch.cat(all_outputs, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
 
@@ -504,9 +515,9 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
             f"[Train][Epoch {epoch}] "
             f"Precision = {prec:.2f}  "
             f"Recall = {rec:.2f}  "
-            f"F1 = {f1:.2f}  "
+            f"F1 = {f1:.2f}"
         )
-    
+
     torch.cuda.synchronize(device)
     train_time_s = time.perf_counter() - t_epoch_start
 
@@ -522,7 +533,7 @@ def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, devi
         "payload_bytes_from_calls": int(payload_bytes_from_calls),
     }
     return data_transferred, top1.avg, losses.avg, metrics
-
+    
 # # # Validation function # # #
 def validate(val_loader, model, criterion, batch_size, device, epoch=0):
     """
@@ -545,9 +556,10 @@ def validate(val_loader, model, criterion, batch_size, device, epoch=0):
             input_var, target_var = Variable(input).to(device), Variable(target).to(device)
             # compute output and loss
             output = model(input_var)
-            if args.optimizer.lower() == 'edlngc':
+            if args.optimizer.lower() == 'engc':
                 evidence = F.softplus(output)
-                loss = criterion(evidence, target_var)
+                alpha = evidence + 1.0
+                loss = criterion(alpha, target_var)
             else:
                 loss = criterion(output, target_var)
 
@@ -769,11 +781,7 @@ def check_noniid(train_loader, rank, world_size):
         for rank, value in enumerate(l1_distance):
                 print(f"Rank {rank}: {value:.3f}")
 
-def compute_local_class_weights(train_loader, num_classes, device, eps=1e-8, power=1.0):
-    """
-    Compute inverse-frequency class weights from the local node's train_loader.
-    Returns a tensor of shape [num_classes] on `device`.
-    """
+def compute_local_class_weights(train_loader, num_classes, device, eps=1e-8):
     counts = torch.zeros(num_classes, dtype=torch.float32)
 
     for _, targets in train_loader:
@@ -781,15 +789,44 @@ def compute_local_class_weights(train_loader, num_classes, device, eps=1e-8, pow
             t = targets.view(-1).cpu()
             counts += torch.bincount(t, minlength=num_classes).float()
 
-    counts = torch.clamp(counts, min=eps)
-
-    # inverse frequency
-    weights = 1.0 / (counts ** power)
-
-    # normalize so mean weight ~= 1
+    counts = torch.clamp(counts, min=1.0)
+    weights = 1.0 / torch.sqrt(counts)
     weights = weights / weights.mean()
+    weights = torch.clamp(weights, max=3.0)
+    return weights.to(device)
 
-    return weights.to(device)    
+
+def get_next_batch(loader_iter, loader):
+    try:
+        batch = next(loader_iter)
+    except StopIteration:
+        loader_iter = iter(loader)
+        batch = next(loader_iter)
+    return batch, loader_iter
+
+
+@torch.no_grad()
+def evaluate_self_evidential(model, x, y, num_classes):
+    was_training = model.training
+    model.eval()
+
+    output = model(x)
+    evidence = F.softplus(output)
+    alpha = evidence + 1.0
+    S = torch.sum(alpha, dim=1, keepdim=True)
+    probs = alpha / torch.clamp(S, min=1e-8)
+
+    pred = probs.argmax(dim=1)
+    acc = (pred == y).float().mean().item()
+    unc = (float(num_classes) / torch.clamp(S.squeeze(1), min=1e-8)).mean().item()
+
+    if was_training:
+        model.train()
+
+    return {
+        "accuracy": float(acc),
+        "uncertainty": float(unc),
+    }   
 
 # # # Main function # # #
 if __name__ == '__main__':

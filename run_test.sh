@@ -1,19 +1,21 @@
-# python trainer.py --data-dir ../data/ham10000 --dataset ham10000 \
-# --lr 0.01 --batch-size 160 \
-# --world_size 5 --classes 7 \
-# --skew 1 \
-# --gamma 0.1 --normtype evonorm \
-# --optimizer edlngc --epoch 10 \
-# --arch cganet --momentum 0.9 --alpha 1.0 \
-# --graph ring --neighbors 2 \
-# --nesterov
-
-python trainer.py --data-dir ../data \
---lr 0.01 --batch-size 160 \
---world_size 5 \
---skew 1 \
---gamma 0.1 --normtype evonorm \
---optimizer edlngc --epoch 10 \
---arch cganet --momentum 0.9 --alpha 1.0 \
---graph ring --neighbors 2 \
---nesterov
+python trainer.py \
+  --data-dir ../data \
+  --lr 0.01 \
+  --batch-size 160 \
+  --world_size 5 \
+  --skew 1.0 \
+  --gamma 0.1 \
+  --normtype evonorm \
+  --optimizer engc \
+  --epochs 10 \
+  --arch cganet \
+  --momentum 0.9 \
+  --alpha 1.0 \
+  --graph ring \
+  --neighbors 2 \
+  --nesterov \
+  --engc-wa 0.5 \
+  --engc-tau-u 0.7 \
+  --engc-tau-min 0.2 \
+  --engc-gamma-tau 0.3 \
+  --engc-kappa 3.0

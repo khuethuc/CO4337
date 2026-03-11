@@ -5,4 +5,4 @@ from .compressngc import *
 from .dsgd import *
 from .topkngc import *
 from .medhe import *
-from .edlngc import *
+from .engc import *
