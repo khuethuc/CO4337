@@ -200,10 +200,7 @@ def run(rank, size):
             num_classes=args.classes,
             total_rounds=args.epochs * len(train_loader),
             tau_u=args.engc_tau_u,
-            tau_min_0=args.engc_tau_min,
-            w_a=args.engc_wa,
-            gamma_tau=args.engc_gamma_tau,
-            kappa=args.engc_kappa
+            w_a=args.engc_wa
         )
     else:
         sender = None
@@ -414,7 +411,7 @@ def train(train_loader, val_loader, model, criterion, optimizer, epoch, batch_si
             if sender is not None and hasattr(sender, "criterion"):
                 sender.criterion.lambda_t = lambda_t
 
-            evidence = F.softplus(output)
+            evidence = F.relu(output)
             loss = criterion(evidence, target_var)
         else:
             loss = criterion(output, target_var)

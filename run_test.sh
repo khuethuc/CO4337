@@ -15,7 +15,4 @@ python trainer.py \
   --neighbors 2 \
   --nesterov \
   --engc-wa 0.5 \
-  --engc-tau-u 0.7 \
-  --engc-tau-min 0.2 \
-  --engc-gamma-tau 0.3 \
-  --engc-kappa 3.0
+  --engc-tau-u 0.7
