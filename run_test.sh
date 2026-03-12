@@ -3,16 +3,20 @@ python trainer.py \
   --lr 0.01 \
   --batch-size 160 \
   --world_size 5 \
-  --skew 1.0 \
+  --skew 1 \
   --gamma 0.1 \
   --normtype evonorm \
   --optimizer engc \
-  --epochs 10 \
+  --epoch 10 \
   --arch cganet \
   --momentum 0.9 \
-  --alpha 1.0 \
+  --alpha 0.5 \
   --graph ring \
   --neighbors 2 \
   --nesterov \
-  --engc-wa 0.5 \
-  --engc-tau-u 0.7
+  --ngc-self-weight 0.60 \
+  --ngc-score-momentum 0.90 \
+  --ngc-temperature 0.20 \
+  --ngc-align-weight 0.80 \
+  --ngc-norm-weight 0.20 \
+  --ngc-min-peer-weight 0.00

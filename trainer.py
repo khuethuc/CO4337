@@ -77,24 +77,18 @@ parser.add_argument("--steplr", action="store_true", help="Uses step lr schedula
 parser.add_argument('--nesterov', action='store_true', )
 parser.add_argument('--qgm', action='store_true', help='quasi global momentum')
 # engc arguments
-parser.add_argument('--engc-beta', dest='engc_beta', default=0.8, type=float,
-                    help='hybrid compatibility weight: beta for evidential score')
-parser.add_argument('--engc-wa', dest='engc_wa', default=0.5, type=float,
-                    help='weight of validation accuracy inside evidential trust')
-parser.add_argument('--engc-tau-u', dest='engc_tau_u', default=0.6, type=float,
-                    help='uncertainty threshold for evidential penalty')
-parser.add_argument('--engc-tau-min', dest='engc_tau_min', default=0.0, type=float,
-                    help='minimum trust threshold for peer filtering')
-parser.add_argument('--engc-gamma-tau', dest='engc_gamma_tau', default=0.5, type=float,
-                    help='adaptive trust-threshold decay factor')
-parser.add_argument('--engc-kappa', dest='engc_kappa', default=5.0, type=float,
-                    help='adaptive trust-threshold sharpness')
-parser.add_argument('--engc-omega-min', dest='engc_omega_min', default=0.4, type=float,
-                    help='minimum self-weight')
-parser.add_argument('--engc-omega-max', dest='engc_omega_max', default=0.8, type=float,
-                    help='maximum self-weight')
-parser.add_argument('--engc-softmax-temp', dest='engc_softmax_temp', default=5.0, type=float,
-                    help='temperature/scale used when normalizing hybrid compatibility scores')
+parser.add_argument('--ngc-self-weight', dest='ngc_self_weight', default=0.60, type=float,
+                    help='reserved weight for local self-gradient inside each NGC branch')
+parser.add_argument('--ngc-score-momentum', dest='ngc_score_momentum', default=0.90, type=float,
+                    help='EMA momentum for branch-wise neighbor compatibility scores')
+parser.add_argument('--ngc-temperature', dest='ngc_temperature', default=0.20, type=float,
+                    help='softmax temperature for neighbor weighting')
+parser.add_argument('--ngc-align-weight', dest='ngc_align_weight', default=0.75, type=float,
+                    help='weight of cosine-alignment score in soft weighting')
+parser.add_argument('--ngc-norm-weight', dest='ngc_norm_weight', default=0.25, type=float,
+                    help='weight of norm-agreement score in soft weighting')
+parser.add_argument('--ngc-min-peer-weight', dest='ngc_min_peer_weight', default=0.00, type=float,
+                    help='minimum peer weight floor after normalization')
 
 args = parser.parse_args()
 args.devices = torch.cuda.device_count()
@@ -121,16 +115,13 @@ def run(rank, size):
     best_prec1 = 0
     data_transferred = 0
     global_steps = 0
-
+    # Train time - %CPU - %GPU
     total_train_time_s = 0.0
     total_cpu_pct_sum = 0.0
     total_gpu_pct_sum = 0.0
     total_cpu_cnt = 0
     total_gpu_cnt = 0
-
-    total_tx_bytes = 0
-    total_tx_packets = 0
-
+    # Accuracy and loss lists for plotting
     train_acc_list = []
     train_loss_list = []
     val_acc_list = []
@@ -174,11 +165,8 @@ def run(rank, size):
     if rank == 0:
         print(f"[ENGC] local_class_weights rank {rank}: {local_class_weights.detach().cpu().tolist()}")
 
-    if args.optimizer.lower() == 'engc':
-        criterion = EDLLoss(
-            num_classes=args.classes,
-            class_weights=local_class_weights,
-        ).to(device)
+    if args.optimizer.lower() == 'engc' and local_class_weights is not None:
+        criterion = nn.CrossEntropyLoss(weight=local_class_weights).to(device)
     else:
         criterion = nn.CrossEntropyLoss().to(device)
 
@@ -257,7 +245,13 @@ def run(rank, size):
             args.nesterov,
             weight_decay=args.weight_decay,
             neighbors=args.neighbors,
-            alpha=args.alpha 
+            alpha=args.alpha,
+            self_weight=args.ngc_self_weight,
+            score_momentum=args.ngc_score_momentum,
+            temperature=args.ngc_temperature,
+            align_weight=args.ngc_align_weight,
+            norm_weight=args.ngc_norm_weight,
+            min_peer_weight=args.ngc_min_peer_weight,
         )
     else:
         receiver = DSGD_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay)
@@ -281,7 +275,6 @@ def run(rank, size):
     for epoch in range(0, args.epochs):
         print('current lr {:.5e}'.format(optimizer.param_groups[0]['lr']))
         model.block()
-        net_before = read_net_dev() if rank == 0 else None
 
         dt, prec1, loss, m = train(
             train_loader=train_loader,
@@ -303,20 +296,11 @@ def run(rank, size):
         train_acc_list.append(float(prec1))
         train_loss_list.append(float(loss))
 
-        if rank == 0:
-            net_after = read_net_dev()
-            net_delta = diff_stats(net_after, net_before)
-        else:
-            net_delta = {"rx_bytes": 0, "rx_packets": 0, "tx_bytes": 0, "tx_packets": 0}
-
         total_train_time_s += m["train_time_s"]
         total_cpu_pct_sum += m["cpu_pct_avg"]
         total_gpu_pct_sum += m["gpu_pct_avg"]
         total_cpu_cnt += 1
         total_gpu_cnt += 1
-
-        total_tx_bytes += net_delta["tx_bytes"]
-        total_tx_packets += net_delta["tx_packets"]
 
         lr_scheduler.step()
 
@@ -344,8 +328,6 @@ def run(rank, size):
         "train_time_s": float(total_train_time_s),
         "cpu_pct_avg": float(total_cpu_pct_sum / max(total_cpu_cnt, 1)),
         "gpu_pct_avg": float(total_gpu_pct_sum / max(total_gpu_cnt, 1)),
-        "tx_bytes": int(total_tx_bytes),
-        "tx_packets": int(total_tx_packets),
         "train_acc_list": train_acc_list,
         "train_loss_list": train_loss_list,
         "val_acc_list": val_acc_list,
@@ -402,19 +384,7 @@ def train(train_loader, val_loader, model, criterion, optimizer, epoch, batch_si
         data_transferred += amt_data_transfer
 
         output = model(input_var)
-
-        if args.optimizer.lower() == 'engc':
-            anneal_steps = max(1.0, total_rounds / 2.0)
-            lambda_t = min(1.0, current_round / anneal_steps)
-
-            criterion.lambda_t = lambda_t
-            if sender is not None and hasattr(sender, "criterion"):
-                sender.criterion.lambda_t = lambda_t
-
-            evidence = F.relu(output)
-            loss = criterion(evidence, target_var)
-        else:
-            loss = criterion(output, target_var)
+        loss = criterion(output, target_var)
 
         all_outputs.append(output.detach().cpu())
         all_targets.append(target.detach().cpu())
@@ -553,13 +523,7 @@ def validate(val_loader, model, criterion, batch_size, device, epoch=0):
             input_var, target_var = Variable(input).to(device), Variable(target).to(device)
             # compute output and loss
             output = model(input_var)
-            if args.optimizer.lower() == 'engc':
-                evidence = F.softplus(output)
-                alpha = evidence + 1.0
-                loss = criterion(alpha, target_var)
-            else:
-                loss = criterion(output, target_var)
-
+            loss = criterion(output, target_var)
             output = output.float()
             loss = loss.float()
 
@@ -621,44 +585,6 @@ class AverageMeter(object):
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
-
-def read_net_dev(iface: str | None = None):
-    """
-    Return dict: rx_bytes, rx_packets, tx_bytes, tx_packets
-    If iface is None -> sum all non-loopback/non-virtual interfaces.
-    Linux only.
-    """
-    stats = {}
-    with open("/proc/net/dev", "r") as f:
-        lines = f.readlines()[2:]  # skip headers
-
-    for ln in lines:
-        if ":" not in ln:
-            continue
-        name, data = ln.split(":", 1)
-        name = name.strip()
-        fields = data.split()
-        # fields layout: rx_bytes rx_packets ... tx_bytes tx_packets ...
-        rx_bytes = int(fields[0]); rx_packets = int(fields[1])
-        tx_bytes = int(fields[8]); tx_packets = int(fields[9])
-        stats[name] = (rx_bytes, rx_packets, tx_bytes, tx_packets)
-
-    if iface:
-        rx_b, rx_p, tx_b, tx_p = stats.get(iface, (0, 0, 0, 0))
-        return {"rx_bytes": rx_b, "rx_packets": rx_p, "tx_bytes": tx_b, "tx_packets": tx_p}
-
-    # auto-sum (exclude common virtual interfaces)
-    rx_b = rx_p = tx_b = tx_p = 0
-    for name, (a, b, c, d) in stats.items():
-        if name == "lo":
-            continue
-        if name.startswith(("docker", "veth", "br-", "virbr", "vmnet")):
-            continue
-        rx_b += a; rx_p += b; tx_b += c; tx_p += d
-    return {"rx_bytes": rx_b, "rx_packets": rx_p, "tx_bytes": tx_b, "tx_packets": tx_p}
-
-def diff_stats(after: dict, before: dict):
-    return {k: int(after[k]) - int(before.get(k, 0)) for k in after.keys()}
 
 def get_gpu_util_percent(gpu_index: int):
     """
@@ -865,7 +791,6 @@ if __name__ == '__main__':
         excel_data["avg test acc"][i] = r["acc_last_epoch"]
         excel_data["avg test acc final"][i] = r["acc_final"]
         excel_data["data transferred"][i] = r["payload_gb"]
-        # thêm cột mới nếu muốn:
         excel_data["train_acc_list"][i] = r.get("train_acc_list", [])
         excel_data["train_loss_list"][i] = r.get("train_loss_list", [])
         excel_data["val_acc_list"][i]   = r.get("val_acc_list", [])
