@@ -77,6 +77,10 @@ parser.add_argument("--steplr", action="store_true", help="Uses step lr schedula
 parser.add_argument('--nesterov', action='store_true', )
 parser.add_argument('--qgm', action='store_true', help='quasi global momentum')
 # engc arguments
+parser.add_argument('--engc-tau-u', dest='engc_tau_u', default=0.5, type=float,
+                    help='uncertainty threshold τ_u for trust score soft penalty')
+parser.add_argument('--engc-wa', dest='engc_wa', default=0.5, type=float,
+                    help='accuracy weight w_a in trust score: s_j = (1-u_j)*(w_a*acc_j + 1-w_a)')
 parser.add_argument('--ngc-self-weight', dest='ngc_self_weight', default=0.60, type=float,
                     help='reserved weight for local self-gradient inside each NGC branch')
 parser.add_argument('--ngc-score-momentum', dest='ngc_score_momentum', default=0.90, type=float,
@@ -89,6 +93,17 @@ parser.add_argument('--ngc-norm-weight', dest='ngc_norm_weight', default=0.25, t
                     help='weight of norm-agreement score in soft weighting')
 parser.add_argument('--ngc-min-peer-weight', dest='ngc_min_peer_weight', default=0.00, type=float,
                     help='minimum peer weight floor after normalization')
+# EDL (Evidential Deep Learning) arguments
+parser.add_argument('--use-edl', dest='use_edl', action='store_true',
+                    help='enable Evidential Deep Learning for uncertainty-aware training')
+parser.add_argument('--edl-weight', dest='edl_weight', default=0.3, type=float,
+                    help='weight for EDL uncertainty-based alpha adjustment [0, 1]')
+# parser.add_argument('--edl-annealing-step', dest='edl_annealing_step', default=10, type=int,
+#                     help='annealing steps for EDL KL divergence regularization')
+parser.add_argument('--edl-uncertainty-threshold', dest='edl_uncertainty_threshold', default=0.5, type=float,
+                    help='uncertainty threshold for adaptive alpha adjustment')
+parser.add_argument('--edl-kl-weight', dest='edl_kl_weight', default=0.1, type=float,
+                    help='weight for EDL KL divergence regularization')
 
 args = parser.parse_args()
 args.devices = torch.cuda.device_count()
@@ -166,7 +181,8 @@ def run(rank, size):
         print(f"[ENGC] local_class_weights rank {rank}: {local_class_weights.detach().cpu().tolist()}")
 
     if args.optimizer.lower() == 'engc' and local_class_weights is not None:
-        criterion = nn.CrossEntropyLoss(weight=local_class_weights).to(device)
+        # criterion = nn.CrossEntropyLoss(weight=local_class_weights).to(device)
+        criterion = nn.CrossEntropyLoss().to(device)
     else:
         criterion = nn.CrossEntropyLoss().to(device)
 
@@ -180,15 +196,14 @@ def run(rank, size):
         sender = CompNGC_sender(base_model, device)
     elif args.optimizer.lower() == "topkngc":
         sender = Topk_NGC_sender(base_model, device)
-    elif args.optimizer.lower() == 'engc':        
+    elif args.optimizer.lower() == 'engc':
+        edl_annealing_step = int((args.epochs / 100) * 10)
         sender = ENGC_sender(
             base_model,
             device,
-            criterion=criterion,
             num_classes=args.classes,
-            total_rounds=args.epochs * len(train_loader),
-            tau_u=args.engc_tau_u,
-            w_a=args.engc_wa
+            use_edl=args.use_edl,
+            edl_annealing_step=edl_annealing_step
         )
     else:
         sender = None
@@ -246,12 +261,14 @@ def run(rank, size):
             weight_decay=args.weight_decay,
             neighbors=args.neighbors,
             alpha=args.alpha,
-            self_weight=args.ngc_self_weight,
+            # Trust score params (per pseudocode)
+            tau_u=args.engc_tau_u,
+            w_a=args.engc_wa,
             score_momentum=args.ngc_score_momentum,
-            temperature=args.ngc_temperature,
-            align_weight=args.ngc_align_weight,
-            norm_weight=args.ngc_norm_weight,
-            min_peer_weight=args.ngc_min_peer_weight,
+            use_edl=args.use_edl,
+            edl_weight=args.edl_weight,
+            num_classes=args.classes,
+            edl_uncertainty_threshold=args.edl_uncertainty_threshold,
         )
     else:
         receiver = DSGD_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay)
@@ -393,15 +410,22 @@ def train(train_loader, val_loader, model, criterion, optimizer, epoch, batch_si
 
         if 'cga' in args.optimizer.lower() or 'ngc' in args.optimizer.lower():
             if args.optimizer.lower() == 'engc':
-                cross_grad, ref_buf, trust_scores = sender(
+                # self gradient thật của local model sau backward
+                self_grad_buf = {}
+                for name, param in model.module.named_parameters():
+                    if param.requires_grad:
+                        self_grad_buf[name] = param.grad.data.clone()
+
+                # cross gradients từ sender (với uncertainty metrics trên validation batch)
+                # Per pseudocode: uncertainty computed on x_val, y_val for neighbor models
+                cross_grad, _, uncertainty_metrics = sender(
                     cross_weights,
                     input_var,
                     target_var,
-                    val_input_var,
-                    val_target_var,
-                    current_round
+                    val_x=val_input_var,
+                    val_y=val_target_var,
+                    global_step=global_steps
                 )
-
                 cross_grad_copy = copy.deepcopy(cross_grad)
 
                 _, amt_data_transfer, received_cross_grad = model.transfer_additional(cross_grad)
@@ -409,18 +433,13 @@ def train(train_loader, val_loader, model, criterion, optimizer, epoch, batch_si
                 payload_bytes_from_calls += amt_data_transfer
                 data_transferred += amt_data_transfer
 
-                self_eval_local = evaluate_self_evidential(
-                    model,
-                    val_input_var,
-                    val_target_var,
-                    args.classes,
-                )
-
+                # dùng self_grad_buf thật làm anchor
+                # pass uncertainty metrics (vacuity + accuracy) để receiver compute trust scores
                 receiver(
-                    received_cross_grad, # neighbor_grads_comm
-                    cross_grad_copy,     # neighbor_grads_comp
-                    ref_buf,             # self gradient
-                    trust_scores 
+                    received_cross_grad,
+                    cross_grad_copy,
+                    self_grad_buf,
+                    uncertainty_metrics=uncertainty_metrics
                 )
                 receiver.project_gradients(lr)
             else:
@@ -504,7 +523,7 @@ def train(train_loader, val_loader, model, criterion, optimizer, epoch, batch_si
 # # # Validation function # # #
 def validate(val_loader, model, criterion, batch_size, device, epoch=0):
     """
-    Run evaluation
+    Run evaluation with optional uncertainty metrics for EDL
     """
     batch_time = AverageMeter()
     losses = AverageMeter()
@@ -515,6 +534,7 @@ def validate(val_loader, model, criterion, batch_size, device, epoch=0):
 
     all_outputs = []
     all_targets = []
+    all_uncertainties = []  # Track uncertainty for EDL
 
     step = len(val_loader)*batch_size*epoch
     end = time.time()
@@ -526,6 +546,14 @@ def validate(val_loader, model, criterion, batch_size, device, epoch=0):
             loss = criterion(output, target_var)
             output = output.float()
             loss = loss.float()
+
+            # Compute uncertainty if using EDL
+            if args.use_edl:
+                evidence = F.softplus(output)
+                alpha = evidence + 1
+                S = torch.sum(alpha, dim=1, keepdim=True)
+                uncertainty = args.classes / torch.clamp(S.squeeze(1), min=1e-8)
+                all_uncertainties.append(uncertainty.cpu())
 
             all_outputs.append(output.cpu())
             all_targets.append(target.cpu())
@@ -542,16 +570,14 @@ def validate(val_loader, model, criterion, batch_size, device, epoch=0):
             if i % args.print_freq == 0:
                 print('Rank: {0}\t'
                       'Test: [{1}/{2}]\t'
-                      #'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                       'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
                       'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
-                          dist.get_rank(),i, len(val_loader), 
-                          #batch_time=batch_time, 
+                          dist.get_rank(),i, len(val_loader),
                           loss=losses,
                           top1=top1))
             step += batch_size
     print('Rank:{0}, Prec@1 {top1.avg:.3f}'.format(dist.get_rank(),top1=top1))
-    
+
     all_outputs = torch.cat(all_outputs, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
 
@@ -566,6 +592,18 @@ def validate(val_loader, model, criterion, batch_size, device, epoch=0):
             f"Recall = {rec:.2f}  "
             f"F1 = {f1:.2f}  "
         )
+
+        # Log uncertainty metrics if using EDL
+        if args.use_edl and len(all_uncertainties) > 0:
+            all_uncertainties = torch.cat(all_uncertainties, dim=0)
+            mean_unc = all_uncertainties.mean().item()
+            std_unc = all_uncertainties.std().item()
+            print(
+                f"[Val][Epoch {epoch}] "
+                f"Mean Uncertainty = {mean_unc:.4f}  "
+                f"Std Uncertainty = {std_unc:.4f}"
+            )
+
     return top1.avg, losses.avg
 
 # # # Helper functions # # #
@@ -777,7 +815,7 @@ if __name__ == '__main__':
         "avg test acc":[0.0 for _ in range(size)],
         "avg test acc final":[0.0 for _ in range(size)],
         "data transferred": [0.0 for _ in range(size)],
-         "seed" :args.seed,
+        "seed" :args.seed,
     }
     excel_data.update({
         "train_acc_list": [[] for _ in range(size)],
