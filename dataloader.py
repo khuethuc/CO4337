@@ -10,6 +10,7 @@ import random
 import pandas as pd
 from PIL import Image
 from sklearn.model_selection import train_test_split
+import torchvision.transforms.functional as TF
 
 
 _HAM10000_DX_TO_LABEL = {
@@ -181,6 +182,139 @@ def _load_ham10000_images(data_dir: str, seed: int, train: bool, transform):
     indices = train_idx if train else val_idx
     return HAM10000ImageDataset(images_dir, keep_ids, y2, indices=indices, transform=transform)
 
+# ------------------------------------------------------------------
+# 1. CorruptionTransform — áp dụng per-node, simulate image quality
+# ------------------------------------------------------------------
+class CorruptionTransform:
+    """
+    Simulate ảnh chất lượng kém: Gaussian noise + Gaussian blur.
+    
+    Args:
+        noise_std  : độ lệch chuẩn Gaussian noise trên [0,1] pixel space
+                     0.0 = không noise, 0.1 = nhẹ, 0.3 = nặng
+        blur_radius: bán kính blur kernel (0 = không blur, 3 = nặng)
+    """
+    def __init__(self, noise_std: float = 0.0, blur_radius: int = 0):
+        self.noise_std   = noise_std
+        self.blur_radius = blur_radius
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        # tensor shape: (C, H, W), đã được normalize trước đó
+        if self.noise_std > 0.0:
+            noise = torch.randn_like(tensor) * self.noise_std
+            tensor = tensor + noise
+        if self.blur_radius > 0:
+            # kernel_size phải là số lẻ
+            k = self.blur_radius * 2 + 1
+            tensor = TF.gaussian_blur(tensor, kernel_size=k, sigma=self.blur_radius)
+        return tensor
+
+
+# ------------------------------------------------------------------
+# 2. QualityPartition — wrapper thay thế Partition
+#    Thêm: image corruption + data scarcity
+# ------------------------------------------------------------------
+class QualityPartition(object):
+    """
+    Thay thế Partition, thêm:
+      - corruption_transform : CorruptionTransform hoặc None
+      - retain_ratio         : float [0,1], tỉ lệ data giữ lại (scarcity)
+      - label_noise_rate     : float [0,1], tỉ lệ label bị flip
+      - num_classes          : cần cho label noise
+    """
+    def __init__(self, data, index,
+                 corruption_transform=None,
+                 retain_ratio: float = 1.0,
+                 label_noise_rate: float = 0.0,
+                 num_classes: int = 7,
+                 seed: int = 0,
+                 rank: int = 0):
+        self.data = data
+        self.corruption = corruption_transform
+
+        rng = np.random.RandomState(seed + rank + 42)
+
+        # --- scarcity: subsample index ---
+        index = list(index)
+        if retain_ratio < 1.0:
+            keep_n = max(1, int(len(index) * retain_ratio))
+            index  = rng.choice(index, size=keep_n, replace=False).tolist()
+        self.index = index
+
+        # --- label noise: flip labels in-place ---
+        if label_noise_rate > 0.0:
+            n_noisy = int(label_noise_rate * len(self.index))
+            noisy_pos = rng.choice(len(self.index), size=n_noisy, replace=False)
+            for pos in noisy_pos:
+                real_idx = self.index[pos]
+                orig = int(self.data.y[real_idx])
+                others = [c for c in range(num_classes) if c != orig]
+                self.data.y[real_idx] = int(rng.choice(others))
+            print(f"[QualityPartition][Rank {rank}] label noise {n_noisy}/{len(self.index)} "
+                  f"({label_noise_rate*100:.0f}%)")
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, i):
+        data_idx = self.index[i]
+        img, target = self.data[data_idx]          # tensor sau base transform
+        if self.corruption is not None:
+            img = self.corruption(img)
+        return img, target
+
+
+# ------------------------------------------------------------------
+# 3. Helper: build quality profile cho từng rank
+# ------------------------------------------------------------------
+def make_quality_profiles(
+    world_size: int,
+    mode: str = "uniform",
+    seed: int = 0,
+) -> list[dict]:
+    """
+    Trả về list[dict] dài world_size, mỗi dict chứa:
+      {noise_std, blur_radius, retain_ratio, label_noise_rate}
+
+    mode:
+      "uniform"    - tất cả node có quality tốt (baseline, không corrupt)
+      "tiered"     - chia 3 tier: good / medium / poor
+      "random"     - sample ngẫu nhiên theo uniform distribution
+    """
+    rng = np.random.RandomState(seed)
+
+    if mode == "uniform":
+        return [dict(noise_std=0.0, blur_radius=0, retain_ratio=1.0, label_noise_rate=0.0)
+                for _ in range(world_size)]
+
+    if mode == "tiered":
+        profiles = []
+        tier_size = world_size // 3
+        for i in range(world_size):
+            if i < tier_size:                      # Good
+                p = dict(noise_std=0.0,  blur_radius=0, retain_ratio=1.0, label_noise_rate=0.0)
+            elif i < 2 * tier_size:                # Medium
+                p = dict(noise_std=0.08, blur_radius=1, retain_ratio=1.0, label_noise_rate=0.05)
+            else:                                  # Poor
+                p = dict(noise_std=0.20, blur_radius=2, retain_ratio=1.0, label_noise_rate=0.15)
+                                                # ↑ bỏ 0.4, đổi thành 1.0
+            profiles.append(p)
+        return profiles
+
+    if mode == "random":
+        profiles = []
+        for _ in range(world_size):
+            p = dict(
+                noise_std        = float(rng.uniform(0.0, 0.25)),
+                blur_radius      = int(rng.choice([0, 1, 2])),
+                retain_ratio     = 1.0,                          # ← fix
+                label_noise_rate = float(rng.uniform(0.0, 0.20)),
+            )
+            profiles.append(p)
+        return profiles
+
+    raise ValueError(f"Unknown mode: {mode}")
+
 class Partition(object):
     def __init__(self, data, index):
         self.data = data
@@ -264,7 +398,8 @@ class DataPartitioner(object):
         return Partition(self.data, self.partitions[partition])
 
 def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size,
-                        num_classes, noise_rate=0.0, noise_agents=None):
+                        num_classes, noise_rate=0.0, noise_agents=None,
+                        quality_mode: str = "uniform", quality_profiles: list = None):
     """Partitioning dataset""" 
     if dataset_name== 'cifar10':
         normalize   = transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
@@ -342,27 +477,38 @@ def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size,
     #print(partition_sizes, len(dataset))
     partition = DataPartitioner(dataset, partition_sizes, skew=skew, seed=seed, dataset_name=dataset_name)
     partition = partition.use(dist.get_rank())
-    # Inject label noise for chosen agents
+
     rank = dist.get_rank()
-    if noise_rate > 0.0 and noise_agents is not None and rank in noise_agents:
-        rng = np.random.RandomState(seed + rank)
-        n = len(partition)
-        n_noisy = int(noise_rate * n)
-        noisy_indices = rng.choice(n, size=n_noisy, replace=False)
+    size = dist.get_world_size()
+    partition_sizes = [1.0 / size for _ in range(size)]
+    dp = DataPartitioner(dataset, partition_sizes, skew=skew,
+                         seed=seed, dataset_name=dataset_name)
+    raw_partition = dp.use(rank)  # Partition object
 
-        for idx in noisy_indices:
-            # Get index
-            real_idx = partition.index[idx]
-            original_label = int(partition.data.y[real_idx])
-            # Flip to different classes randomly
-            other_classes = [c for c in range(num_classes) if c != original_label]
-            new_label = int(rng.choice(other_classes))
-            partition.data.y[real_idx] = new_label
+    # --- Build quality profile ---
+    if quality_profiles is None:
+        quality_profiles = make_quality_profiles(size, mode=quality_mode, seed=seed)
+    prof = quality_profiles[rank]
 
-        if rank == 0 or True:  # log cho tất cả rank
-            print(f"[DataLoader][Rank {rank}] Injected {n_noisy}/{n} "
-                  f"({noise_rate*100:.0f}%) label noise")
+    corruption = CorruptionTransform(
+        noise_std  = prof["noise_std"],
+        blur_radius= prof["blur_radius"],
+    ) if (prof["noise_std"] > 0 or prof["blur_radius"] > 0) else None
 
+    partition = QualityPartition(
+        data               = raw_partition.data,
+        index              = raw_partition.index,
+        corruption_transform = corruption,
+        retain_ratio       = prof["retain_ratio"],
+        label_noise_rate   = prof["label_noise_rate"],
+        num_classes        = num_classes,
+        seed               = seed,
+        rank               = rank,
+    )
+
+    print(f"[Rank {rank}] quality={prof}, data_size={len(partition)}")
+
+    bsz       = int(batch_size / float(size))
     train_set = torch.utils.data.DataLoader(
         partition, batch_size=bsz, shuffle=True, num_workers=0
     )

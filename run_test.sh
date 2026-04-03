@@ -1,5 +1,6 @@
 python trainer.py \
-  --data-dir ../data \
+  --data-dir ../data/ham10000 \
+  --dataset ham10000 \
   --lr 0.01 \
   --batch-size 160 \
   --world_size 5 \
@@ -11,11 +12,11 @@ python trainer.py \
   --arch cganet \
   --momentum 0.9 \
   --alpha 1.0 \
-  --graph ring \
-  --neighbors 2 \
+  --graph full \
+  --neighbors 4 \
   --nesterov \
   --use-edl \
+  --edl-kl-weight 0.1 \
   --engc-tau-u 0.5 \
   --engc-wa 0.5 \
-  --noise-rate 0.3 \
-  --noise-agents "0,1" \
+  --quality-mode tiered

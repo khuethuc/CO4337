@@ -62,7 +62,7 @@ class ENGC_sender():
     2. Compute cross-gradients on TRAINING batch with EDL loss
     """
 
-    def __init__(self, true_model, device, num_classes=10, use_edl=False, edl_annealing_step=10):
+    def __init__(self, true_model, device, num_classes=10, use_edl=False, edl_annealing_step=10, edl_kl_weight=1.0):
         """
         Args:
             true_model: local model on current node
@@ -86,7 +86,8 @@ class ENGC_sender():
         if self.use_edl:
             self.edl_criterion = EDLLoss(
                 num_classes=num_classes,
-                annealing_step=edl_annealing_step
+                annealing_step=edl_annealing_step,
+                kl_weight=edl_kl_weight
             ).to(device)
 
         # For storing last uncertainty info
@@ -150,34 +151,24 @@ class ENGC_sender():
         return self._compute_uncertainty_and_accuracy(x_val, y_val)
 
     def _accumulate_gradients(self, x, targets, global_step=0):
-        """
-        Compute gradient on TRAINING batch (x, targets) for the current sender model.
-        With EDL: uses evidential loss (NLL + KL).
-
-        Args:
-            x: training input batch
-            targets: training target labels
-            global_step: current training step for EDL annealing
-
-        Returns:
-            gradient_dict: parameter gradients
-        """
         output = self.model(x)
         self.model.zero_grad()
 
-        # Compute loss
-        loss = self.criterion(output, targets)
-
-        # Tính uncertainty riêng để log, không ảnh hưởng gradient
-        with torch.no_grad():
-            uncertainty, alpha = self._compute_uncertainty(output)
+        if self.use_edl:
+            # EDL loss trả về (total_loss, alpha, uncertainty)
+            loss, alpha, uncertainty = self.edl_criterion(output, targets, global_step)
             self.last_uncertainty = uncertainty.mean().item()
             self.last_alpha = alpha
+        else:
+            loss = self.criterion(output, targets)
+            # log uncertainty riêng, không ảnh hưởng gradient
+            with torch.no_grad():
+                uncertainty, alpha = self._compute_uncertainty(output)
+                self.last_uncertainty = uncertainty.mean().item()
+                self.last_alpha = alpha
 
-        # Backward
         loss.backward()
 
-        # Collect gradients
         self._clear_gradient_buffer()
         for name, param in self.model.named_parameters():
             if param.requires_grad:
@@ -375,7 +366,7 @@ class ENGC_receiver():
         # normalized_vacuity = min(vacuity / self.num_classes, 1.0)  # clamp to [0, 1]
         # confidence = 1.0 - normalized_vacuity
 
-        confidence = 1.0 - min(vacuity, 1.0)
+        confidence = 1.0 - min(vacuity / self.num_classes, 1.0)
 
         # s_j = confidence * (w_a * acc + (1 - w_a))
         trust_score = confidence * (self.w_a * accuracy + (1.0 - self.w_a))

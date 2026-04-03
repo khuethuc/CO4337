@@ -108,6 +108,8 @@ parser.add_argument('--noise-rate', dest='noise_rate', default=0.0, type=float,
                     help='label noise rate for designated agents (0.0 = no noise)')
 parser.add_argument('--noise-agents', dest='noise_agents', default='', type=str,
                     help='comma-separated ranks to inject noise, e.g. "0,1"')
+parser.add_argument('--quality-mode', dest='quality_mode', default='uniform', type=str,
+                    help='heterogeneous data quality: uniform | tiered | random')
 
 args = parser.parse_args()
 args.devices = torch.cuda.device_count()
@@ -169,16 +171,18 @@ def run(rank, size):
         else:
             print(summary(base_model, (3, 32, 32), batch_size=int(args.batch_size / size), device='cpu'))
 
-    noise_agents = None
-    if args.noise_agents:
-        noise_agents = [int(r) for r in args.noise_agents.split(',')]
-
     train_loader, bsz_train = partition_trainDataset(
         args.dataset, args.data_dir, args.skew, args.seed, args.batch_size,
-        args.num_classes,
-        noise_rate=args.noise_rate,
-        noise_agents=noise_agents,
+        args.classes,
+        quality_mode=args.quality_mode,
     )
+
+    if rank == 0:
+        from dataloader import make_quality_profiles
+        profiles = make_quality_profiles(size, mode=args.quality_mode, seed=args.seed)
+        print(f"\n[QualityMode={args.quality_mode}] Data quality profiles:")
+        for r, p in enumerate(profiles):
+            print(f"  Rank {r}: {p}")
 
     val_loader, bsz_val = test_Dataset(args.dataset, args.data_dir, seed=args.seed)
 
@@ -210,13 +214,14 @@ def run(rank, size):
         sender = Topk_NGC_sender(base_model, device)
     elif args.optimizer.lower() == 'engc':
         steps_per_epoch = len(train_loader)
-        edl_annealing_step = max(100, steps_per_epoch * 3)
+        edl_annealing_step = max(500, steps_per_epoch * 10)
         sender = ENGC_sender(
             base_model,
             device,
             num_classes=args.classes,
             use_edl=args.use_edl,
-            edl_annealing_step=edl_annealing_step
+            edl_annealing_step=edl_annealing_step,
+            edl_kl_weight=args.edl_kl_weight,
         )
     else:
         sender = None
@@ -414,8 +419,20 @@ def train(train_loader, val_loader, model, criterion, optimizer, epoch, batch_si
         payload_bytes_from_calls += amt_data_transfer
         data_transferred += amt_data_transfer
 
+        if args.use_edl and args.optimizer.lower() == 'engc':
+            from optimizers.engc import EDLLoss
+            edl_criterion = EDLLoss(
+                num_classes=args.classes,
+                annealing_step=args.edl_annealing_step,
+                kl_weight=args.edl_kl_weight,
+            ).to(device)
+        else:
+            edl_criterion = None
         output = model(input_var)
-        loss = criterion(output, target_var)
+        if edl_criterion is not None:
+            loss, _, _ = edl_criterion(output, target_var, global_step=global_steps)
+        else:
+            loss = criterion(output, target_var)
 
         all_outputs.append(output.detach().cpu())
         all_targets.append(target.detach().cpu())
