@@ -510,7 +510,7 @@ def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size,
 
     bsz       = int(batch_size / float(size))
     train_set = torch.utils.data.DataLoader(
-        partition, batch_size=bsz, shuffle=True, num_workers=0
+        partition, batch_size=bsz, shuffle=True, num_workers=4
     )
     return train_set, bsz
 
