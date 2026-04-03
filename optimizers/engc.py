@@ -8,82 +8,48 @@ from .utils import flatten_tensors, unflatten_tensors
 
 
 class EDLLoss(torch.nn.Module):
-    """
-    Evidential Deep Learning Loss for medical imaging classification.
-
-    Combines:
-    - Likelihood loss (negative log likelihood)
-    - KL divergence regularization (for uncertainty)
-
-    Reference: Sensoy et al. "Evidential Deep Learning" (CVPR 2018)
-    """
-    def __init__(self, num_classes, annealing_step=10, kl_weight=0.1):
+    def __init__(self, num_classes, annealing_step=10, kl_weight=1.0):
         super().__init__()
         self.num_classes = num_classes
         self.annealing_step = annealing_step
         self.kl_weight = kl_weight
 
     def _kl_divergence(self, alpha, num_classes):
-        """
-        Compute KL divergence between Dirichlet(alpha) and uniform Dirichlet.
-        """
-        beta = torch.ones(1, num_classes).to(alpha.device)
-        sum_alpha = torch.sum(alpha, dim=1, keepdim=True)
-        sum_beta = torch.sum(beta, dim=1, keepdim=True)
+        """KL( Dir(alpha) || Dir(1,...,1) )"""
+        beta = torch.ones(1, num_classes, device=alpha.device)
+        sum_alpha = alpha.sum(dim=1, keepdim=True)
+        sum_beta  = beta.sum(dim=1, keepdim=True)
 
-        ln_alpha = torch.lgamma(sum_alpha) - torch.sum(torch.lgamma(alpha), dim=1, keepdim=True)
-        ln_beta = torch.lgamma(sum_beta) - torch.sum(torch.lgamma(beta), dim=1, keepdim=True)
-
-        dg_alpha = torch.digamma(alpha) - torch.digamma(sum_alpha)
-        dg_beta = torch.digamma(beta) - torch.digamma(sum_beta)
-
-        kl = ln_alpha - ln_beta + torch.sum((alpha - beta) * dg_alpha, dim=1, keepdim=True)
+        kl = (
+            torch.lgamma(sum_alpha) - torch.lgamma(sum_beta)
+            - torch.lgamma(alpha).sum(dim=1, keepdim=True)
+            + torch.lgamma(beta).sum(dim=1, keepdim=True)
+            + ((alpha - beta) *
+               (torch.digamma(alpha) - torch.digamma(sum_alpha))
+              ).sum(dim=1, keepdim=True)
+        )
         return kl
 
     def forward(self, logits, targets, global_step=0):
-        """
-        Args:
-            logits: raw model outputs [batch_size, num_classes]
-            targets: ground truth labels [batch_size]
-            global_step: current training step for annealing
-
-        Returns:
-            loss: total EDL loss
-            alpha: Dirichlet parameters (for uncertainty computation)
-            uncertainty: per-sample uncertainty
-        """
-        # Convert logits to evidence
         evidence = F.softplus(logits)
-        alpha = evidence + 1
+        alpha    = evidence + 1.0
+        S        = alpha.sum(dim=1, keepdim=True)
 
-        # Expected probability
-        S = torch.sum(alpha, dim=1, keepdim=True)
-        probs = alpha / torch.clamp(S, min=1e-8)
+        y = F.one_hot(targets, self.num_classes).float().to(logits.device)
 
-        # One-hot encoding
-        y_one_hot = F.one_hot(targets, self.num_classes).float().to(logits.device)
+        # Bug 2 fix: Type II Maximum Likelihood (NLL đúng)
+        loss_nll = (y * (torch.log(S) - torch.log(alpha))).sum(dim=1).mean()
 
-        # Likelihood loss (negative log likelihood)
-        loss_likelihood = torch.sum(
-            y_one_hot * torch.log(torch.clamp(probs, min=1e-8)),
-            dim=1
-        ).mean()
+        # KL — chỉ penalize evidence của wrong classes
+        alpha_tilde = y + (1.0 - y) * alpha
+        kl = self._kl_divergence(alpha_tilde, self.num_classes).mean()
 
-        # KL divergence with annealing
-        kl_alpha = (alpha - 1) * (1 - y_one_hot) + 1
-        kl_div = self._kl_divergence(kl_alpha, self.num_classes).mean()
+        # Bug 3 fix: annealing từ 0 → kl_weight
+        annealing_coef = min(1.0, global_step / max(self.annealing_step, 1))
+        total_loss = loss_nll + annealing_coef * self.kl_weight * kl
 
-        # Annealing coefficient
-        annealing_coef = min(1.0, global_step / self.annealing_step)
-
-        # Total loss
-        total_loss = -loss_likelihood + annealing_coef * self.kl_weight * kl_div
-
-        # Per-sample uncertainty for logging
-        uncertainty = self.num_classes / torch.clamp(S.squeeze(1), min=1e-8)
-
+        uncertainty = self.num_classes / S.squeeze(1).clamp(min=1e-8)
         return total_loss, alpha, uncertainty
-
 
 class ENGC_sender():
     """
@@ -200,12 +166,10 @@ class ENGC_sender():
         self.model.zero_grad()
 
         # Compute loss
-        if self.use_edl:
-            loss, alpha, uncertainty = self.edl_criterion(output, targets, global_step)
-            self.last_uncertainty = uncertainty.mean().item()
-            self.last_alpha = alpha
-        else:
-            loss = self.criterion(output, targets)
+        loss = self.criterion(output, targets)
+
+        # Tính uncertainty riêng để log, không ảnh hưởng gradient
+        with torch.no_grad():
             uncertainty, alpha = self._compute_uncertainty(output)
             self.last_uncertainty = uncertainty.mean().item()
             self.last_alpha = alpha
@@ -408,8 +372,10 @@ class ENGC_receiver():
         # s_j = (1 - u_j) * (w_a * acc_j + (1 - w_a))
         # Note: vacuity can be > 1 for K classes, so we normalize to [0, 1] range
         # by using (1 - vacuity/K) instead of (1 - vacuity)
-        normalized_vacuity = min(vacuity / self.num_classes, 1.0)  # clamp to [0, 1]
-        confidence = 1.0 - normalized_vacuity
+        # normalized_vacuity = min(vacuity / self.num_classes, 1.0)  # clamp to [0, 1]
+        # confidence = 1.0 - normalized_vacuity
+
+        confidence = 1.0 - min(vacuity, 1.0)
 
         # s_j = confidence * (w_a * acc + (1 - w_a))
         trust_score = confidence * (self.w_a * accuracy + (1.0 - self.w_a))
@@ -422,12 +388,11 @@ class ENGC_receiver():
         return max(trust_score, 0.0)  # ensure non-negative
 
     def _ema_update_trust(self, peer_rank, trust_score):
-        """Apply EMA smoothing to trust scores."""
         prev = self.trust_score_ema.get(peer_rank, None)
         if prev is None:
             new_score = trust_score
         else:
-            new_score = self.score_momentum * prev + (1.0 - self.score_momentum) * trust_score
+            new_score = 0.5 * prev + 0.5 * trust_score
         self.trust_score_ema[peer_rank] = new_score
         return new_score
 

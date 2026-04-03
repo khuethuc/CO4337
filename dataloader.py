@@ -263,7 +263,8 @@ class DataPartitioner(object):
     def use(self, partition):
         return Partition(self.data, self.partitions[partition])
 
-def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size):
+def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size,
+                        num_classes, noise_rate=0.0, noise_agents=None):
     """Partitioning dataset""" 
     if dataset_name== 'cifar10':
         normalize   = transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
@@ -341,7 +342,30 @@ def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size):
     #print(partition_sizes, len(dataset))
     partition = DataPartitioner(dataset, partition_sizes, skew=skew, seed=seed, dataset_name=dataset_name)
     partition = partition.use(dist.get_rank())
-    train_set = torch.utils.data.DataLoader(partition, batch_size=bsz, shuffle=True, num_workers=0)
+    # Inject label noise for chosen agents
+    rank = dist.get_rank()
+    if noise_rate > 0.0 and noise_agents is not None and rank in noise_agents:
+        rng = np.random.RandomState(seed + rank)
+        n = len(partition)
+        n_noisy = int(noise_rate * n)
+        noisy_indices = rng.choice(n, size=n_noisy, replace=False)
+
+        for idx in noisy_indices:
+            # Get index
+            real_idx = partition.index[idx]
+            original_label = int(partition.data.y[real_idx])
+            # Flip to different classes randomly
+            other_classes = [c for c in range(num_classes) if c != original_label]
+            new_label = int(rng.choice(other_classes))
+            partition.data.y[real_idx] = new_label
+
+        if rank == 0 or True:  # log cho tất cả rank
+            print(f"[DataLoader][Rank {rank}] Injected {n_noisy}/{n} "
+                  f"({noise_rate*100:.0f}%) label noise")
+
+    train_set = torch.utils.data.DataLoader(
+        partition, batch_size=bsz, shuffle=True, num_workers=0
+    )
     return train_set, bsz
 
 

@@ -104,6 +104,10 @@ parser.add_argument('--edl-uncertainty-threshold', dest='edl_uncertainty_thresho
                     help='uncertainty threshold for adaptive alpha adjustment')
 parser.add_argument('--edl-kl-weight', dest='edl_kl_weight', default=0.1, type=float,
                     help='weight for EDL KL divergence regularization')
+parser.add_argument('--noise-rate', dest='noise_rate', default=0.0, type=float,
+                    help='label noise rate for designated agents (0.0 = no noise)')
+parser.add_argument('--noise-agents', dest='noise_agents', default='', type=str,
+                    help='comma-separated ranks to inject noise, e.g. "0,1"')
 
 args = parser.parse_args()
 args.devices = torch.cuda.device_count()
@@ -165,9 +169,17 @@ def run(rank, size):
         else:
             print(summary(base_model, (3, 32, 32), batch_size=int(args.batch_size / size), device='cpu'))
 
+    noise_agents = None
+    if args.noise_agents:
+        noise_agents = [int(r) for r in args.noise_agents.split(',')]
+
     train_loader, bsz_train = partition_trainDataset(
-        args.dataset, args.data_dir, args.skew, args.seed, args.batch_size
+        args.dataset, args.data_dir, args.skew, args.seed, args.batch_size,
+        args.num_classes,
+        noise_rate=args.noise_rate,
+        noise_agents=noise_agents,
     )
+
     val_loader, bsz_val = test_Dataset(args.dataset, args.data_dir, seed=args.seed)
 
     check_noniid(train_loader, rank, args.world_size)
@@ -197,7 +209,8 @@ def run(rank, size):
     elif args.optimizer.lower() == "topkngc":
         sender = Topk_NGC_sender(base_model, device)
     elif args.optimizer.lower() == 'engc':
-        edl_annealing_step = int((args.epochs / 100) * 10)
+        steps_per_epoch = len(train_loader)
+        edl_annealing_step = max(100, steps_per_epoch * 3)
         sender = ENGC_sender(
             base_model,
             device,
@@ -355,6 +368,7 @@ def run(rank, size):
 # # # Train functions # # #
 def train(train_loader, val_loader, model, criterion, optimizer, epoch, batch_size, lr, device,
           receiver=None, sender=None, gpu_index: int = 0, monitor_every: int = 50):
+    global global_steps
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -457,6 +471,9 @@ def train(train_loader, val_loader, model, criterion, optimizer, epoch, batch_si
 
         optimizer.step()
         optimizer.zero_grad()
+
+        if args.optimizer.lower() == 'engc':
+            global_steps += 1
 
         output = output.float()
         loss = loss.float()

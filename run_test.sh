@@ -7,16 +7,15 @@ python trainer.py \
   --gamma 0.1 \
   --normtype evonorm \
   --optimizer engc \
-  --epoch 10 \
+  --epoch 50 \
   --arch cganet \
   --momentum 0.9 \
-  --alpha 0.5 \
+  --alpha 1.0 \
   --graph ring \
   --neighbors 2 \
   --nesterov \
-  --ngc-self-weight 0.60 \
-  --ngc-score-momentum 0.90 \
-  --ngc-temperature 0.20 \
-  --ngc-align-weight 0.80 \
-  --ngc-norm-weight 0.20 \
-  --ngc-min-peer-weight 0.00
+  --use-edl \
+  --engc-tau-u 0.5 \
+  --engc-wa 0.5 \
+  --noise-rate 0.3 \
+  --noise-agents "0,1" \
