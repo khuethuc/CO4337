@@ -384,7 +384,7 @@ def run(rank, size):
     
 # # # Train functions # # #
 def train(train_loader, val_loader, model, criterion, optimizer, epoch, batch_size, lr, device,
-          receiver=None, sender=None, gpu_index: int = 0, monitor_every: int = 50, edl_criterion=None):
+          receiver=None, sender=None, gpu_index: int = 0, monitor_every: int = 50):
     global global_steps
     batch_time = AverageMeter()
     data_time = AverageMeter()

@@ -82,14 +82,6 @@ class ENGC_sender():
         # Standard CE loss
         self.criterion = torch.nn.CrossEntropyLoss().to(device)
 
-        # EDL loss (optional)
-        if self.use_edl:
-            self.edl_criterion = EDLLoss(
-                num_classes=num_classes,
-                annealing_step=edl_annealing_step,
-                kl_weight=edl_kl_weight
-            ).to(device)
-
         # For storing last uncertainty info
         self.last_uncertainty = None
         self.last_alpha = None
