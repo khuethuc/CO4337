@@ -153,19 +153,12 @@ class ENGC_sender():
     def _accumulate_gradients(self, x, targets, global_step=0):
         output = self.model(x)
         self.model.zero_grad()
+        loss = self.criterion(output, targets)
 
-        if self.use_edl:
-            # EDL loss trả về (total_loss, alpha, uncertainty)
-            loss, alpha, uncertainty = self.edl_criterion(output, targets, global_step)
+        with torch.no_grad():
+            uncertainty, alpha = self._compute_uncertainty(output)
             self.last_uncertainty = uncertainty.mean().item()
             self.last_alpha = alpha
-        else:
-            loss = self.criterion(output, targets)
-            # log uncertainty riêng, không ảnh hưởng gradient
-            with torch.no_grad():
-                uncertainty, alpha = self._compute_uncertainty(output)
-                self.last_uncertainty = uncertainty.mean().item()
-                self.last_alpha = alpha
 
         loss.backward()
 
@@ -348,35 +341,17 @@ class ENGC_receiver():
         return X
 
     def _compute_trust_score(self, vacuity, accuracy):
-        """
-        Compute trust score per pseudocode:
-        s_j = (1 - u_j) * (w_a * acc_j + (1 - w_a))
-        if u_j > τ_u: s_j = s_j * exp(-(u_j - τ_u))
-
-        Args:
-            vacuity: u_j (epistemic uncertainty) in [0, K] where K=num_classes
-            accuracy: acc_j in [0, 1]
-
-        Returns:
-            trust_score: s_j >= 0
-        """
-        # s_j = (1 - u_j) * (w_a * acc_j + (1 - w_a))
-        # Note: vacuity can be > 1 for K classes, so we normalize to [0, 1] range
-        # by using (1 - vacuity/K) instead of (1 - vacuity)
-        # normalized_vacuity = min(vacuity / self.num_classes, 1.0)  # clamp to [0, 1]
-        # confidence = 1.0 - normalized_vacuity
-
-        confidence = 1.0 - min(vacuity / self.num_classes, 1.0)
-
-        # s_j = confidence * (w_a * acc + (1 - w_a))
+        normalized = min(vacuity / self.num_classes, 1.0)
+        confidence = 1.0 - normalized
+    
         trust_score = confidence * (self.w_a * accuracy + (1.0 - self.w_a))
-
-        # Soft penalty for high uncertainty: if u_j > τ_u
-        if vacuity > self.tau_u:
-            penalty = math.exp(-(vacuity - self.tau_u))
+    
+        # tau_u nên so sánh với normalized vacuity
+        if normalized > self.tau_u:
+            penalty = math.exp(-(normalized - self.tau_u))
             trust_score = trust_score * penalty
 
-        return max(trust_score, 0.0)  # ensure non-negative
+        return max(trust_score, 0.0)
 
     def _ema_update_trust(self, peer_rank, trust_score):
         prev = self.trust_score_ema.get(peer_rank, None)

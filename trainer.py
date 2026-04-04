@@ -226,6 +226,16 @@ def run(rank, size):
     else:
         sender = None
 
+    if args.use_edl and args.optimizer.lower() == 'engc':
+        from optimizers.engc import EDLLoss
+        edl_criterion = EDLLoss(
+            num_classes=args.classes,
+            annealing_step=edl_annealing_step,   # biến này đã có từ sender init
+            kl_weight=args.edl_kl_weight,
+        ).to(device)
+    else:
+        edl_criterion = None
+
     if args.graph.lower() == 'ring':
         graph = RingGraph(rank, size, args.devices, peers_per_itr=args.neighbors)
     elif args.graph.lower() == 'torus':
@@ -311,6 +321,7 @@ def run(rank, size):
         print('current lr {:.5e}'.format(optimizer.param_groups[0]['lr']))
         model.block()
 
+        # run() — gọi train():
         dt, prec1, loss, m = train(
             train_loader=train_loader,
             val_loader=val_loader,
@@ -325,6 +336,7 @@ def run(rank, size):
             sender=sender,
             gpu_index=rank,
             monitor_every=max(10, args.print_freq),
+            edl_criterion=edl_criterion,          # ← thêm
         )
         data_transferred += dt
 
@@ -372,7 +384,7 @@ def run(rank, size):
     
 # # # Train functions # # #
 def train(train_loader, val_loader, model, criterion, optimizer, epoch, batch_size, lr, device,
-          receiver=None, sender=None, gpu_index: int = 0, monitor_every: int = 50):
+          receiver=None, sender=None, gpu_index: int = 0, monitor_every: int = 50, edl_criterion=None):
     global global_steps
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -419,20 +431,8 @@ def train(train_loader, val_loader, model, criterion, optimizer, epoch, batch_si
         payload_bytes_from_calls += amt_data_transfer
         data_transferred += amt_data_transfer
 
-        if args.use_edl and args.optimizer.lower() == 'engc':
-            from optimizers.engc import EDLLoss
-            edl_criterion = EDLLoss(
-                num_classes=args.classes,
-                annealing_step=args.edl_annealing_step,
-                kl_weight=args.edl_kl_weight,
-            ).to(device)
-        else:
-            edl_criterion = None
         output = model(input_var)
-        if edl_criterion is not None:
-            loss, _, _ = edl_criterion(output, target_var, global_step=global_steps)
-        else:
-            loss = criterion(output, target_var)
+        loss = criterion(output, target_var) 
 
         all_outputs.append(output.detach().cpu())
         all_targets.append(target.detach().cpu())
