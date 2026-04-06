@@ -470,9 +470,12 @@ def train(
             output  = model(input_var)
             ce_loss = criterion(output, target_var)
 
-            # EDL-gated KD: dùng neighbor weights từ gossip
-            # kd_loss_fn tự load neighbor model bên trong
-            if kd_loss_fn is not None:
+            # Bước 1: gọi sender TRƯỚC để cập nhật last_neighbor_weights
+            # và tính cross-gradient
+            cross_grad, ref_buf = sender(cross_weights, input_var, target_var)
+
+            # Bước 2: KD dùng last_neighbor_weights đã được cập nhật
+            if kd_loss_fn is not None and sender.last_neighbor_weights:
                 loss = kd_loss_fn(
                     student_logits   = output,
                     targets          = target_var,
@@ -481,7 +484,6 @@ def train(
                     neighbor_model   = kd_neighbor_model,
                     ce_loss          = ce_loss,
                 )
-                # Log KD stats mỗi print_freq steps
                 if i % args.print_freq == 0:
                     kd_loss_fn.log_stats(dist.get_rank(), global_steps)
             else:
@@ -490,12 +492,11 @@ def train(
             all_outputs.append(output.detach().cpu())
             all_targets.append(target.detach().cpu())
 
+            # Bước 3: backward trên total loss (CE + KD)
             loss.backward()
 
-            # Cross-gradient giống NGC (CE loss, uniform aggregation)
-            cross_grad, ref_buf = sender(cross_weights, input_var, target_var)
-            cross_grad_copy     = copy.deepcopy(cross_grad)
-
+            # Bước 4: exchange và aggregate gradients
+            cross_grad_copy = copy.deepcopy(cross_grad)
             _, amt_data_transfer, received_cross_grad = model.transfer_additional(cross_grad)
             comm_calls_transfer_additional += 1
             payload_bytes_from_calls       += amt_data_transfer

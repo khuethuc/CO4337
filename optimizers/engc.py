@@ -11,23 +11,18 @@ from .utils import flatten_tensors, unflatten_tensors
 # Không dùng để train, chỉ dùng để tính confident mask cho KD gate
 # ---------------------------------------------------------------------------
 
-def compute_edl_vacuity(logits: torch.Tensor, num_classes: int) -> torch.Tensor:
+# engc.py — compute_edl_vacuity: thay bằng entropy-based uncertainty
+def compute_uncertainty_gate(logits: torch.Tensor) -> torch.Tensor:
     """
-    Tính epistemic uncertainty (vacuity) per sample từ logits.
-    Normalized về [0, 1]: 0 = hoàn toàn confident, 1 = hoàn toàn uncertain.
-
-    Args:
-        logits : [B, K] raw model output
-        num_classes : K
-
-    Returns:
-        vacuity_norm : [B] trong khoảng [0, 1]
+    Tính uncertainty từ softmax entropy — hoạt động với CE-trained model.
+    Normalized về [0, 1]: 0 = confident, 1 = maximum uncertain.
+    
+    Entropy = -Σ p_k log(p_k), max = log(K) khi uniform
     """
-    evidence = F.softplus(logits)          # [B, K], non-negative
-    alpha    = evidence + 1.0              # Dirichlet params
-    S        = alpha.sum(dim=1)            # [B], Dirichlet strength
-    vacuity  = num_classes / S.clamp(min=1e-8)          # [B], range [0, K]
-    return (vacuity / num_classes).clamp(0.0, 1.0)      # normalized [0, 1]
+    probs   = F.softmax(logits, dim=1)              # [B, K]
+    entropy = -(probs * (probs + 1e-8).log()).sum(dim=1)  # [B]
+    max_entropy = math.log(logits.size(1))           # log(K)
+    return (entropy / max_entropy).clamp(0.0, 1.0)  # normalized [0, 1]
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +313,7 @@ class EDLGatedKDLoss(torch.nn.Module):
             teacher_logits = self._get_neighbor_logits(neighbor_model, input_x)
 
             # Tính vacuity normalized [0, 1]
-            vacuity_norm = compute_edl_vacuity(teacher_logits, self.num_classes)
+            vacuity_norm = compute_uncertainty_gate(teacher_logits)
 
             # Confident mask: teacher phải biết về sample này
             conf_mask = vacuity_norm < self.tau_u   # [B] bool
@@ -349,13 +344,13 @@ class EDLGatedKDLoss(torch.nn.Module):
         return ce_loss + self.lambda_kd * mean_kd
 
     def log_stats(self, rank: int, step: int):
-        """In thống kê confident ratio và KD loss để debug."""
         if not self.last_conf_ratios:
             return
         parts = []
         for r in sorted(self.last_conf_ratios):
             parts.append(
                 f"peer{r}: conf={self.last_conf_ratios[r]:.2f} "
-                f"kd={self.last_kd_losses.get(r, 0.0):.4f}"
+                f"kd_raw={self.last_kd_losses.get(r, 0.0):.6f} "   # ← thêm 6 decimal
+                f"kd_weighted={self.last_kd_losses.get(r,0.0)*self.lambda_kd:.6f}"
             )
         print(f"[ENGC-KD][Rank {rank}][Step {step}] " + " | ".join(parts))

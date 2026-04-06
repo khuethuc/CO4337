@@ -17,8 +17,8 @@ python trainer.py \
   --neighbors 4 \
   --nesterov \
   --use-edl \
-  --kd-tau-u 0.4 \
-  --kd-temperature 2.0 \
-  --kd-lambda 0.5 \
-  --kd-min-conf 0.1 \
+  --kd-tau-u 0.6 \
+  --kd-temperature 6.0 \
+  --kd-lambda 1.0 \
+  --kd-min-conf 0.05 \
   --quality-mode tiered
