@@ -7,22 +7,60 @@ from .utils import flatten_tensors, unflatten_tensors
 
 
 # ---------------------------------------------------------------------------
-# EDL utility: forward-only uncertainty computation
-# Không dùng để train, chỉ dùng để tính confident mask cho KD gate
+# EDL utility — Sensoy et al. (2018) "Evidential Deep Learning to Quantify
+# Classification Uncertainty"
+#
+# Quy trình:
+#   evidence = softplus(logits)          # e_k >= 0
+#   alpha    = evidence + 1              # Dirichlet params, α_k >= 1
+#   S        = Σ alpha_k                 # Dirichlet strength
+#   vacuity  = K / S  ∈ (0, 1]          # 0 = confident, 1 = maximally uncertain
 # ---------------------------------------------------------------------------
 
-# engc.py — compute_edl_vacuity: thay bằng entropy-based uncertainty
-def compute_uncertainty_gate(logits: torch.Tensor) -> torch.Tensor:
+def _edl_params(logits: torch.Tensor):
     """
-    Tính uncertainty từ softmax entropy — hoạt động với CE-trained model.
-    Normalized về [0, 1]: 0 = confident, 1 = maximum uncertain.
-    
-    Entropy = -Σ p_k log(p_k), max = log(K) khi uniform
+    Trả về (evidence, alpha, S) theo EDL.
+    evidence = softplus(logits) >= 0
+    alpha    = evidence + 1  (Dirichlet params)
+    S        = sum(alpha, dim=1)  (Dirichlet strength)
     """
-    probs   = F.softmax(logits, dim=1)              # [B, K]
-    entropy = -(probs * (probs + 1e-8).log()).sum(dim=1)  # [B]
-    max_entropy = math.log(logits.size(1))           # log(K)
-    return (entropy / max_entropy).clamp(0.0, 1.0)  # normalized [0, 1]
+    evidence = F.softplus(logits)              # [B, K]
+    alpha    = evidence + 1.0                  # [B, K]
+    S        = alpha.sum(dim=1)                # [B]
+    return evidence, alpha, S
+
+
+def compute_edl_vacuity(logits: torch.Tensor) -> torch.Tensor:
+    """
+    EDL vacuity = K / S  ∈ (0, 1].
+    0 → model rất confident, 1 → hoàn toàn uncertain (uniform Dirichlet).
+    """
+    K = logits.size(1)
+    _, _, S = _edl_params(logits)
+    return (K / S).clamp(0.0, 1.0)            # [B]
+
+
+def _kl_dirichlet(alpha: torch.Tensor) -> torch.Tensor:
+    """
+    KL[Dir(alpha) || Dir(1)]  — uniform Dirichlet prior.
+
+    Công thức (Sensoy et al. 2018, Appendix):
+      KL = lgamma(S) - lgamma(K)
+           - Σ_k lgamma(α_k)
+           + Σ_k (α_k - 1)(digamma(α_k) - digamma(S))
+
+    với S = Σ α_k, K = number of classes.
+    lgamma(1) = 0 nên không cần trừ Σ lgamma(1).
+    """
+    K = alpha.size(1)
+    S = alpha.sum(dim=1)                       # [B]
+
+    kl = (torch.lgamma(S)
+          - math.lgamma(K)
+          - torch.lgamma(alpha).sum(dim=1)
+          + ((alpha - 1.0) * (torch.digamma(alpha)
+             - torch.digamma(S.unsqueeze(1)))).sum(dim=1))
+    return kl                                  # [B]
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +86,6 @@ class ENGC_sender():
         self.gradient_buffer = {}
         self.device          = device
         self.num_classes     = num_classes
-        self.criterion       = torch.nn.CrossEntropyLoss().to(device)
 
         # Lưu neighbor weights gần nhất để trainer dùng cho KD
         self.last_neighbor_weights = {}
@@ -58,10 +95,19 @@ class ENGC_sender():
             p.data.copy_(w.data)
 
     def _accumulate_gradients(self, x, targets):
-        """CE loss — giống NGC_sender hoàn toàn."""
-        output = self.model(x)
+        """
+        EDL NLL loss — nhất quán với local training loss.
+        L_NLL = mean[ ψ(S) - ψ(α_y) ]
+        Chỉ dùng NLL (không KL) vì cross-gradient phản ánh fit với data,
+        không phải regularization.
+        """
         self.model.zero_grad()
-        loss = self.criterion(output, targets)
+        output   = self.model(x)
+        evidence = F.softplus(output)
+        alpha    = evidence + 1.0
+        S        = alpha.sum(dim=1)
+        alpha_y  = alpha[torch.arange(len(targets), device=output.device), targets]
+        loss     = (torch.digamma(S) - torch.digamma(alpha_y)).mean()
         loss.backward()
         self._clear_gradient_buffer()
         for name, param in self.model.named_parameters():
@@ -222,30 +268,33 @@ class ENGC_receiver():
 
 # ---------------------------------------------------------------------------
 # EDL-gated Knowledge Distillation loss
-# Đây là phần mới hoàn toàn — core contribution của Hướng 3
+# Theo Sensoy et al. (2018) + standard KD (Hinton et al. 2015)
 # ---------------------------------------------------------------------------
 
 class EDLGatedKDLoss(torch.nn.Module):
     """
-    Knowledge Distillation loss được gate bởi EDL uncertainty.
+    EDL-gated Knowledge Distillation Loss (Sensoy et al. 2018).
 
-    Với mỗi neighbor model j và local batch (x, y):
-    1. Chạy neighbor model forward (no grad) → teacher_logits, vacuity_j
-    2. Tạo confident_mask: vacuity_j < tau_u (normalized [0,1])
-    3. KD loss chỉ trên confident samples:
-       L_KD = KL( student[mask] / T  ||  teacher[mask] / T )
+    Local training loss thay CE bằng EDL:
+      L_EDL = L_NLL + annealing_coef * lambda_reg * L_KL
 
-    Tổng loss:
-       L = L_CE + lambda_kd * mean(L_KD_j  for j in neighbors)
+      L_NLL(i) = ψ(S_i) - ψ(α_{i,y_i})         ← NLL dưới Dirichlet
+      L_KL     = KL[Dir(α̃) || Dir(1)]           ← regularize non-target evidence
+                 với α̃_k = y_k + (1-y_k)*α_k
+
+    KD loss chỉ áp dụng khi teacher (neighbor) confident — EDL vacuity < tau_u:
+      L_KD(j) = KL(softmax(s/T) || softmax(t/T)) * T²  [chỉ trên conf_mask]
+
+    Tổng:
+      L = L_EDL + lambda_kd * mean_j(L_KD_j)
 
     Args:
-        num_classes  : K — số class
-        tau_u        : ngưỡng uncertainty [0,1], default 0.4
-                       sample bị loại nếu vacuity_norm >= tau_u
-        temperature  : T cho KD softmax, default 2.0
-        lambda_kd    : weight của KD loss, default 0.5
-        min_conf_ratio: nếu % confident sample < ratio này thì skip KD
-                        tránh KD từ quá ít samples, default 0.1
+        num_classes   : K
+        tau_u         : EDL vacuity threshold ∈ (0,1], loại sample nếu u >= tau_u
+        temperature   : T cho KD (Hinton)
+        lambda_kd     : weight của KD loss
+        min_conf_ratio: skip KD nếu confident ratio < giá trị này
+        lambda_reg    : weight KL regularization trong EDL loss
     """
 
     def __init__(
@@ -255,21 +304,73 @@ class EDLGatedKDLoss(torch.nn.Module):
         temperature    : float = 2.0,
         lambda_kd      : float = 0.5,
         min_conf_ratio : float = 0.1,
+        lambda_reg     : float = 0.1,
     ):
         super().__init__()
-        self.num_classes    = num_classes
+        self.K              = num_classes
         self.tau_u          = tau_u
         self.T              = temperature
         self.lambda_kd      = lambda_kd
         self.min_conf_ratio = min_conf_ratio
+        self.lambda_reg     = lambda_reg
 
         # Logging
-        self.last_conf_ratios  = {}   # rank -> float
-        self.last_kd_losses    = {}   # rank -> float
-        self.last_n_conf       = {}   # rank -> int
+        self.last_conf_ratios = {}   # rank -> float
+        self.last_kd_losses   = {}   # rank -> float
+        self.last_n_conf      = {}   # rank -> int
+        self.last_edl_loss    = 0.0
+        self.last_kl_loss     = 0.0
+
+    # ------------------------------------------------------------------
+    # EDL loss components
+    # ------------------------------------------------------------------
+
+    def edl_loss(
+        self,
+        logits         : torch.Tensor,
+        targets        : torch.Tensor,
+        annealing_coef : float = 1.0,
+        class_weights  : torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        EDL training loss = L_NLL + annealing_coef * lambda_reg * L_KL
+
+        L_NLL = mean[ ψ(S_i) - ψ(α_{i,y_i}) ]  (class-weighted nếu có)
+        L_KL  = mean[ KL[Dir(α̃_i) || Dir(1)] ]
+                với α̃_k = y_k + (1 - y_k) * α_k
+                (chỉ penalize evidence của các class sai)
+
+        class_weights: [K] inverse-frequency weights để upweight minority classes.
+                       Nếu None, dùng plain mean (hành vi cũ).
+        """
+        _, alpha, S = _edl_params(logits)                # [B,K], [B,K], [B]
+
+        # --- NLL term: ψ(S) - ψ(α_y) ---
+        alpha_y = alpha[torch.arange(len(targets), device=logits.device), targets]
+        nll_per_sample = torch.digamma(S) - torch.digamma(alpha_y)  # [B]
+
+        if class_weights is not None:
+            w   = class_weights[targets]                 # [B] — weight theo class của mỗi sample
+            nll = (nll_per_sample * w).sum() / w.sum()  # weighted mean
+        else:
+            nll = nll_per_sample.mean()
+
+        # --- KL term: only penalize non-target evidence ---
+        y_one_hot   = F.one_hot(targets, self.K).float()           # [B, K]
+        alpha_tilde = y_one_hot + (1.0 - y_one_hot) * alpha        # zero target evidence
+        kl = _kl_dirichlet(alpha_tilde).mean()
+
+        self.last_edl_loss = nll.item()
+        self.last_kl_loss  = kl.item()
+
+        return nll + annealing_coef * self.lambda_reg * kl
+
+    # ------------------------------------------------------------------
+    # Inference helpers
+    # ------------------------------------------------------------------
 
     def _get_neighbor_logits(self, neighbor_model, x):
-        """Forward pass neighbor model, no gradient."""
+        """Forward pass neighbor model — no gradient, restore train mode."""
         was_training = neighbor_model.training
         neighbor_model.eval()
         with torch.no_grad():
@@ -278,6 +379,10 @@ class EDLGatedKDLoss(torch.nn.Module):
             neighbor_model.train()
         return logits
 
+    # ------------------------------------------------------------------
+    # forward
+    # ------------------------------------------------------------------
+
     def forward(
         self,
         student_logits   : torch.Tensor,
@@ -285,72 +390,101 @@ class EDLGatedKDLoss(torch.nn.Module):
         neighbor_weights : dict,
         input_x          : torch.Tensor,
         neighbor_model   : torch.nn.Module,
-        ce_loss          : torch.Tensor,
+        annealing_coef   : float = 1.0,
+        class_weights    : torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Args:
-            student_logits   : [B, K] output của local model (đã forward)
-            targets          : [B] ground truth labels
-            neighbor_weights : dict rank -> state_dict (từ cross_weights)
+            student_logits   : [B, K] logits của local model
+            targets          : [B]   ground-truth labels
+            neighbor_weights : dict  rank -> list[param tensors]
             input_x          : [B, C, H, W] input batch
-            neighbor_model   : copy của model dùng để load neighbor weights
-            ce_loss          : CE loss đã tính sẵn (scalar tensor)
+            neighbor_model   : model dùng để load neighbor weights
+            annealing_coef   : λ_anneal ∈ [0,1], tăng dần theo epoch
+            class_weights    : [K] inverse-frequency weights (từ local data).
+                               Dùng để upweight minority class trong EDL loss
+                               và KD loss. None = hành vi cũ (uniform).
 
         Returns:
-            total_loss : ce_loss + lambda_kd * mean_kd_loss
+            L_EDL + lambda_kd * mean(L_KD_j)
         """
+        # --- Local EDL loss (class-weighted nếu có) ---
+        total_loss = self.edl_loss(student_logits, targets, annealing_coef,
+                                   class_weights=class_weights)
+
         if not neighbor_weights:
-            return ce_loss
+            return total_loss
 
         kd_losses = []
 
         for rank, w in neighbor_weights.items():
-            # Load neighbor weights
+            # Load teacher weights
             for param_w, param_m in zip(w, neighbor_model.parameters()):
                 param_m.data.copy_(param_w.data)
 
-            # Forward neighbor — no gradient
+            # Teacher forward — no gradient
             teacher_logits = self._get_neighbor_logits(neighbor_model, input_x)
 
-            # Tính vacuity normalized [0, 1]
-            vacuity_norm = compute_uncertainty_gate(teacher_logits)
+            # EDL vacuity của teacher: u = K / S ∈ (0, 1]
+            vacuity = compute_edl_vacuity(teacher_logits)          # [B]
 
-            # Confident mask: teacher phải biết về sample này
-            conf_mask = vacuity_norm < self.tau_u   # [B] bool
-            n_conf    = conf_mask.sum().item()
+            # Confident mask: teacher uncertain ít
+            conf_mask  = vacuity < self.tau_u
+            n_conf     = conf_mask.sum().item()
             conf_ratio = n_conf / max(len(conf_mask), 1)
 
-            # Log
             self.last_conf_ratios[rank] = conf_ratio
             self.last_n_conf[rank]      = n_conf
 
-            # Skip nếu quá ít confident samples
             if conf_ratio < self.min_conf_ratio or n_conf == 0:
                 self.last_kd_losses[rank] = 0.0
                 continue
 
-            # KD loss chỉ trên confident samples
-            s_soft = F.log_softmax(student_logits[conf_mask] / self.T, dim=1)
-            t_soft = F.softmax(teacher_logits[conf_mask]  / self.T, dim=1)
+            # Fix 3: skip nếu tất cả confident samples đều predict cùng 1 class
+            # → tránh KD chỉ reinforcing majority class
+            teacher_pred = teacher_logits[conf_mask].argmax(dim=1)
+            if teacher_pred.unique().numel() < 2:
+                self.last_kd_losses[rank] = 0.0
+                continue
 
-            kd_loss = F.kl_div(s_soft, t_soft, reduction='batchmean') * (self.T ** 2)
+            # KD loss (Hinton 2015) chỉ trên confident samples
+            s_soft = F.log_softmax(student_logits[conf_mask] / self.T, dim=1)
+            t_soft = F.softmax(teacher_logits[conf_mask]     / self.T, dim=1)
+
+            if class_weights is not None:
+                # Upweight KD signal từ minority class teacher predictions
+                kd_w          = class_weights[teacher_pred]        # [N_conf]
+                kd_w          = kd_w / kd_w.sum()
+                kd_per_sample = F.kl_div(s_soft, t_soft.detach(),
+                                         reduction='none').sum(dim=1)  # [N_conf]
+                kd_loss       = (kd_per_sample * kd_w).sum() * (self.T ** 2)
+            else:
+                kd_loss = F.kl_div(s_soft, t_soft.detach(),
+                                   reduction='batchmean') * (self.T ** 2)
+
             kd_losses.append(kd_loss)
             self.last_kd_losses[rank] = kd_loss.item()
 
-        if not kd_losses:
-            return ce_loss
+        if kd_losses:
+            total_loss = total_loss + self.lambda_kd * torch.stack(kd_losses).mean()
 
-        mean_kd = torch.stack(kd_losses).mean()
-        return ce_loss + self.lambda_kd * mean_kd
+        return total_loss
+
+    # ------------------------------------------------------------------
+    # Logging
+    # ------------------------------------------------------------------
 
     def log_stats(self, rank: int, step: int):
         if not self.last_conf_ratios:
             return
-        parts = []
+        parts = [
+            f"edl_nll={self.last_edl_loss:.6f}",
+            f"kl_reg={self.last_kl_loss:.6f}",
+        ]
         for r in sorted(self.last_conf_ratios):
             parts.append(
                 f"peer{r}: conf={self.last_conf_ratios[r]:.2f} "
-                f"kd_raw={self.last_kd_losses.get(r, 0.0):.6f} "   # ← thêm 6 decimal
-                f"kd_weighted={self.last_kd_losses.get(r,0.0)*self.lambda_kd:.6f}"
+                f"kd_raw={self.last_kd_losses.get(r, 0.0):.6f} "
+                f"kd_weighted={self.last_kd_losses.get(r, 0.0) * self.lambda_kd:.6f}"
             )
         print(f"[ENGC-KD][Rank {rank}][Step {step}] " + " | ".join(parts))

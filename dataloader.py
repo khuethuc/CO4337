@@ -243,13 +243,27 @@ class QualityPartition(object):
 
         # --- label noise: flip labels in-place ---
         if label_noise_rate > 0.0:
+            # Resolve the label array regardless of dataset type
+            if hasattr(self.data, 'y'):
+                y_arr = self.data.y
+            elif hasattr(self.data, 'targets'):
+                y_arr = self.data.targets
+            else:
+                raise AttributeError("Dataset has neither .y nor .targets")
+
             n_noisy = int(label_noise_rate * len(self.index))
             noisy_pos = rng.choice(len(self.index), size=n_noisy, replace=False)
             for pos in noisy_pos:
-                real_idx = self.index[pos]
-                orig = int(self.data.y[real_idx])
+                dataset_pos = self.index[pos]
+                # For datasets with an .indices mapping (e.g. HAM10000 train/val split),
+                # dataset_pos is a position into dataset, not into y directly.
+                if hasattr(self.data, 'indices'):
+                    actual_idx = int(self.data.indices[dataset_pos])
+                else:
+                    actual_idx = dataset_pos
+                orig = int(y_arr[actual_idx])
                 others = [c for c in range(num_classes) if c != orig]
-                self.data.y[real_idx] = int(rng.choice(others))
+                y_arr[actual_idx] = int(rng.choice(others))
             print(f"[QualityPartition][Rank {rank}] label noise {n_noisy}/{len(self.index)} "
                   f"({label_noise_rate*100:.0f}%)")
 
@@ -389,9 +403,11 @@ class DataPartitioner(object):
                         mixed.append(idx)
 
                 part_len = int(frac * data_len)
+                assigned = set(mixed[:part_len])
                 self.partitions.append(mixed[:part_len])
 
                 sort_indices = mixed[part_len:]
+                indices_rand = [x for x in indices_rand if x not in assigned]
 
 
     def use(self, partition):
@@ -469,15 +485,6 @@ def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size,
         ])
         dataset = _load_ham10000_images(data_dir=data_dir, seed=seed, train=True, transform=train_tf)    
        
-    size = dist.get_world_size()
-    #print(size)
-    bsz = int((batch_size) / float(size))
-    
-    partition_sizes = [1.0/size for _ in range(size)]
-    #print(partition_sizes, len(dataset))
-    partition = DataPartitioner(dataset, partition_sizes, skew=skew, seed=seed, dataset_name=dataset_name)
-    partition = partition.use(dist.get_rank())
-
     rank = dist.get_rank()
     size = dist.get_world_size()
     partition_sizes = [1.0 / size for _ in range(size)]

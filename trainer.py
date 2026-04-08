@@ -476,13 +476,16 @@ def train(
 
             # Bước 2: KD dùng last_neighbor_weights đã được cập nhật
             if kd_loss_fn is not None and sender.last_neighbor_weights:
+                # annealing_coef tăng tuyến tính 0→1 qua nửa đầu training
+                annealing_coef = min(1.0, epoch / max(1, args.epochs // 2))
                 loss = kd_loss_fn(
                     student_logits   = output,
                     targets          = target_var,
                     neighbor_weights = sender.last_neighbor_weights,
                     input_x          = input_var,
                     neighbor_model   = kd_neighbor_model,
-                    ce_loss          = ce_loss,
+                    annealing_coef   = annealing_coef,
+                    class_weights    = local_class_weights,
                 )
                 if i % args.print_freq == 0:
                     kd_loss_fn.log_stats(dist.get_rank(), global_steps)
