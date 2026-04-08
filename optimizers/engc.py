@@ -330,34 +330,24 @@ class EDLGatedKDLoss(torch.nn.Module):
         logits         : torch.Tensor,
         targets        : torch.Tensor,
         annealing_coef : float = 1.0,
-        class_weights  : torch.Tensor = None,
     ) -> torch.Tensor:
         """
         EDL training loss = L_NLL + annealing_coef * lambda_reg * L_KL
 
-        L_NLL = mean[ ψ(S_i) - ψ(α_{i,y_i}) ]  (class-weighted nếu có)
+        L_NLL = mean[ ψ(S_i) - ψ(α_{i,y_i}) ]
         L_KL  = mean[ KL[Dir(α̃_i) || Dir(1)] ]
                 với α̃_k = y_k + (1 - y_k) * α_k
                 (chỉ penalize evidence của các class sai)
-
-        class_weights: [K] inverse-frequency weights để upweight minority classes.
-                       Nếu None, dùng plain mean (hành vi cũ).
         """
         _, alpha, S = _edl_params(logits)                # [B,K], [B,K], [B]
 
         # --- NLL term: ψ(S) - ψ(α_y) ---
         alpha_y = alpha[torch.arange(len(targets), device=logits.device), targets]
-        nll_per_sample = torch.digamma(S) - torch.digamma(alpha_y)  # [B]
-
-        if class_weights is not None:
-            w   = class_weights[targets]                 # [B] — weight theo class của mỗi sample
-            nll = (nll_per_sample * w).sum() / w.sum()  # weighted mean
-        else:
-            nll = nll_per_sample.mean()
+        nll = (torch.digamma(S) - torch.digamma(alpha_y)).mean()
 
         # --- KL term: only penalize non-target evidence ---
-        y_one_hot   = F.one_hot(targets, self.K).float()           # [B, K]
-        alpha_tilde = y_one_hot + (1.0 - y_one_hot) * alpha        # zero target evidence
+        y_one_hot  = F.one_hot(targets, self.K).float()           # [B, K]
+        alpha_tilde = y_one_hot + (1.0 - y_one_hot) * alpha       # zero target evidence
         kl = _kl_dirichlet(alpha_tilde).mean()
 
         self.last_edl_loss = nll.item()
@@ -401,16 +391,13 @@ class EDLGatedKDLoss(torch.nn.Module):
             input_x          : [B, C, H, W] input batch
             neighbor_model   : model dùng để load neighbor weights
             annealing_coef   : λ_anneal ∈ [0,1], tăng dần theo epoch
-            class_weights    : [K] inverse-frequency weights (từ local data).
-                               Dùng để upweight minority class trong EDL loss
-                               và KD loss. None = hành vi cũ (uniform).
+            class_weights    : unused, kept for API compatibility
 
         Returns:
             L_EDL + lambda_kd * mean(L_KD_j)
         """
-        # --- Local EDL loss (class-weighted nếu có) ---
-        total_loss = self.edl_loss(student_logits, targets, annealing_coef,
-                                   class_weights=class_weights)
+        # --- Local EDL loss ---
+        total_loss = self.edl_loss(student_logits, targets, annealing_coef)
 
         if not neighbor_weights:
             return total_loss
@@ -428,39 +415,32 @@ class EDLGatedKDLoss(torch.nn.Module):
             # EDL vacuity của teacher: u = K / S ∈ (0, 1]
             vacuity = compute_edl_vacuity(teacher_logits)          # [B]
 
-            # Confident mask: teacher uncertain ít
-            conf_mask  = vacuity < self.tau_u
-            n_conf     = conf_mask.sum().item()
-            conf_ratio = n_conf / max(len(conf_mask), 1)
+            # Gate 1: teacher confident (vacuity thấp)
+            conf_mask = vacuity < self.tau_u                       # [B]
+
+            # Gate 2: teacher predict đúng trên data CỦA STUDENT
+            # Chỉ học KD khi hàng xóm vừa tự tin VÀ đoán đúng
+            teacher_pred = teacher_logits.argmax(dim=1)            # [B]
+            correct_mask = (teacher_pred == targets)               # [B]
+
+            # Combined mask: confident AND correct
+            final_mask  = conf_mask & correct_mask
+            n_conf      = conf_mask.sum().item()
+            n_correct   = correct_mask.sum().item()
+            n_final     = final_mask.sum().item()
+            conf_ratio  = n_final / max(len(final_mask), 1)
 
             self.last_conf_ratios[rank] = conf_ratio
-            self.last_n_conf[rank]      = n_conf
+            self.last_n_conf[rank]      = n_final
 
-            if conf_ratio < self.min_conf_ratio or n_conf == 0:
+            if conf_ratio < self.min_conf_ratio or n_final == 0:
                 self.last_kd_losses[rank] = 0.0
                 continue
 
-            # Fix 3: skip nếu tất cả confident samples đều predict cùng 1 class
-            # → tránh KD chỉ reinforcing majority class
-            teacher_pred = teacher_logits[conf_mask].argmax(dim=1)
-            if teacher_pred.unique().numel() < 2:
-                self.last_kd_losses[rank] = 0.0
-                continue
-
-            # KD loss (Hinton 2015) chỉ trên confident samples
-            s_soft = F.log_softmax(student_logits[conf_mask] / self.T, dim=1)
-            t_soft = F.softmax(teacher_logits[conf_mask]     / self.T, dim=1)
-
-            if class_weights is not None:
-                # Upweight KD signal từ minority class teacher predictions
-                kd_w          = class_weights[teacher_pred]        # [N_conf]
-                kd_w          = kd_w / kd_w.sum()
-                kd_per_sample = F.kl_div(s_soft, t_soft.detach(),
-                                         reduction='none').sum(dim=1)  # [N_conf]
-                kd_loss       = (kd_per_sample * kd_w).sum() * (self.T ** 2)
-            else:
-                kd_loss = F.kl_div(s_soft, t_soft.detach(),
-                                   reduction='batchmean') * (self.T ** 2)
+            # KD loss (Hinton 2015) chỉ trên samples mà teacher vừa tự tin vừa đúng
+            s_soft  = F.log_softmax(student_logits[final_mask] / self.T, dim=1)
+            t_soft  = F.softmax(teacher_logits[final_mask]     / self.T, dim=1)
+            kd_loss = F.kl_div(s_soft, t_soft.detach(), reduction='batchmean') * (self.T ** 2)
 
             kd_losses.append(kd_loss)
             self.last_kd_losses[rank] = kd_loss.item()
@@ -483,7 +463,8 @@ class EDLGatedKDLoss(torch.nn.Module):
         ]
         for r in sorted(self.last_conf_ratios):
             parts.append(
-                f"peer{r}: conf={self.last_conf_ratios[r]:.2f} "
+                f"peer{r}: gate={self.last_conf_ratios[r]:.2f}(conf&correct) "
+                f"n={self.last_n_conf.get(r, 0)} "
                 f"kd_raw={self.last_kd_losses.get(r, 0.0):.6f} "
                 f"kd_weighted={self.last_kd_losses.get(r, 0.0) * self.lambda_kd:.6f}"
             )

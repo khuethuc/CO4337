@@ -485,7 +485,6 @@ def train(
                     input_x          = input_var,
                     neighbor_model   = kd_neighbor_model,
                     annealing_coef   = annealing_coef,
-                    class_weights    = local_class_weights,
                 )
                 if i % args.print_freq == 0:
                     kd_loss_fn.log_stats(dist.get_rank(), global_steps)
@@ -828,6 +827,32 @@ def compute_local_class_weights(train_loader, num_classes, device, eps=1e-8):
     weights = weights / weights.mean()
     weights = torch.clamp(weights, max=3.0)
     return weights.to(device)
+
+
+def compute_global_class_prior(train_loader, num_classes, device):
+    """
+    Tính class-weighted Dirichlet prior W_k theo FedEvPrompt (arXiv:2411.10071):
+        W_k = K/(K-1) * (1 - N_k/N),  sum(W) = K
+
+    W_k lớn ở rare class → KL term trong EDL loss upweight rare classes,
+    ngăn model collapse về majority class (giải quyết overconfidence).
+
+    Dùng all_reduce để tính N_k global (không phải local non-IID counts).
+    """
+    K = num_classes
+    local_counts = torch.zeros(K, dtype=torch.float32, device=device)
+    for _, targets in train_loader:
+        if isinstance(targets, torch.Tensor):
+            t = targets.view(-1)
+            local_counts += torch.bincount(t.to(device), minlength=K).float()
+
+    # Aggregate across all ranks để có global distribution
+    dist.all_reduce(local_counts, op=dist.ReduceOp.SUM)
+
+    N  = local_counts.sum().clamp(min=1.0)
+    W  = (K / (K - 1)) * (1.0 - local_counts / N)  # [K], sum = K
+    W  = W.clamp(min=1e-3)                           # numerical stability
+    return W
 
 
 def get_next_batch(loader_iter, loader):
