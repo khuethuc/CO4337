@@ -89,6 +89,11 @@ class ENGC_sender():
 
         # Lưu neighbor weights gần nhất để trainer dùng cho KD
         self.last_neighbor_weights = {}
+        # Per-neighbor EDL vacuity on MY local data (no gradient)
+        self.vacuity_scores       = {}   # rank -> float in [0, 1]
+        # Per-neighbor sample weight stats (logged for diagnostics)
+        self.sample_weight_stats  = {}   # rank -> {mean, frac_low}
+        self._last_sample_weights = None
 
     def _update_model(self, state_dict):
         for w, p in zip(state_dict, self.model.parameters()):
@@ -96,19 +101,36 @@ class ENGC_sender():
 
     def _accumulate_gradients(self, x, targets):
         """
-        EDL NLL loss — nhất quán với local training loss.
-        L_NLL = mean[ ψ(S) - ψ(α_y) ]
-        Chỉ dùng NLL (không KL) vì cross-gradient phản ánh fit với data,
-        không phải regularization.
+        Cross-gradient với per-sample vacuity weighting.
+
+        NGC dùng uniform CE loss — mọi sample trong batch được weight đều nhau,
+        kể cả sample OOD (neighbor model không biết class đó).
+
+        ENGC: down-weight sample mà neighbor model uncertain (vacuity cao):
+            w_i = (1 - vacuity_i).clamp(min=0.05)
+            loss = mean(CE_i × w_i)
+
+        Kết quả: cross-gradient phản ánh nhiều hơn các sample mà neighbor model
+        thật sự hiểu → ít noise OOD → gradient direction clean hơn.
         """
         self.model.zero_grad()
-        output   = self.model(x)
-        evidence = F.softplus(output)
-        alpha    = evidence + 1.0
-        S        = alpha.sum(dim=1)
-        alpha_y  = alpha[torch.arange(len(targets), device=output.device), targets]
-        loss     = (torch.digamma(S) - torch.digamma(alpha_y)).mean()
+        output = self.model(x)
+
+        # Per-sample vacuity — computed without gradient (weights are constants)
+        with torch.no_grad():
+            vacuity = compute_edl_vacuity(output.detach())   # [B]
+            w_raw  = (1.0 - vacuity).clamp(min=0.05)         # [B], floor 0.05
+            # Normalize so mean(w_norm) = 1 → gradient magnitude ≈ NGC baseline
+            # This changes gradient DIRECTION (confident samples matter more)
+            # without shrinking gradient MAGNITUDE (which would kill cross-gradient signal)
+            w_norm = w_raw / (w_raw.mean() + 1e-8)           # [B], mean ≈ 1.0
+            self._last_sample_weights = w_raw.cpu()          # log raw for diagnostics
+
+        # Direction-only reweighted CE: same magnitude as NGC, better direction
+        ce_per_sample = F.cross_entropy(output, targets, reduction='none')  # [B]
+        loss = (ce_per_sample * w_norm).mean()
         loss.backward()
+
         self._clear_gradient_buffer()
         for name, param in self.model.named_parameters():
             if param.requires_grad:
@@ -133,12 +155,26 @@ class ENGC_sender():
         """
         # Lưu lại để trainer truy cập qua sender.last_neighbor_weights
         self.last_neighbor_weights = neighbor_weight
+        self.vacuity_scores        = {}
 
+        self.sample_weight_stats = {}
         output = {}
         g      = None
         for rank, w in neighbor_weight.items():
             self._update_model(w)
-            g            = self._accumulate_gradients(batch_x, targets)
+            # Mean vacuity: computed inside _accumulate_gradients via _last_sample_weights
+            # We do a pre-pass here to store mean vacuity for per-neighbor logging
+            with torch.no_grad():
+                logits = self.model(batch_x)
+                self.vacuity_scores[rank] = compute_edl_vacuity(logits).mean().item()
+            g = self._accumulate_gradients(batch_x, targets)
+            # Store sample weight stats after each neighbor's gradient computation
+            if self._last_sample_weights is not None:
+                sw = self._last_sample_weights
+                self.sample_weight_stats[rank] = {
+                    'mean':     float(sw.mean()),
+                    'frac_low': float((sw < 0.2).float().mean()),
+                }
             output[rank] = self._flatten_(g)
         return output, g
 
@@ -188,11 +224,65 @@ class ENGC_receiver():
             self.prev_params.append(copy.deepcopy(param.data))
 
     def _average_gradients(self, grad_list):
-        """Uniform averaging với weight π = 1/(|N|+1)."""
+        """Uniform averaging với weight π = 1/(|N|+1). Kept for reference."""
         new_grad = torch.zeros_like(grad_list[0])
         for g in grad_list:
             new_grad += self.pi * g
         return new_grad
+
+    def _weighted_average(self, self_grad, neighbor_grads_dict, vacuity_scores=None):
+        """
+        Vacuity-adaptive averaging (Murmura-style applied to cross-gradients).
+
+        self keeps pi_self = 1/(N+1).
+        Neighbor budget = N/(N+1) is distributed proportional to trust scores:
+            trust_j = max(MIN_TRUST, 1 - vacuity_j)
+        Low vacuity → neighbor understands my distribution → higher cross-gradient weight.
+        If vacuity_scores is None → falls back to uniform (identical to NGC).
+        """
+        N = len(neighbor_grads_dict)
+        if N == 0:
+            return self_grad.clone()
+
+        pi_self           = 1.0 / (N + 1)
+        pi_neighbor_total = N   / (N + 1)   # weight budget for all neighbors
+
+        if vacuity_scores:
+            MIN_TRUST  = 0.1                # floor: no neighbor fully silenced
+            trusts     = {r: max(MIN_TRUST, 1.0 - vacuity_scores.get(r, 0.5))
+                          for r in neighbor_grads_dict}
+            total      = sum(trusts.values()) or 1.0
+            weights    = {r: (trusts[r] / total) * pi_neighbor_total for r in trusts}
+        else:
+            w_uniform  = pi_neighbor_total / N
+            weights    = {r: w_uniform for r in neighbor_grads_dict}
+
+        result = pi_self * self_grad
+        for r, grad in neighbor_grads_dict.items():
+            grad_clean = self._project_conflict(self_grad, grad)
+            result = result + weights[r] * grad_clean
+        return result
+
+    @staticmethod
+    def _project_conflict(self_grad, neighbor_grad):
+        """
+        Gradient Surgery (Yu et al. 2020 / PCGrad):
+        Nếu neighbor_grad xung đột với self_grad (cos_sim < 0),
+        project ra khỏi hướng xung đột → giữ phần trực giao (không gây hại).
+
+        Applied per-parameter tensor — mỗi layer được xét độc lập.
+        """
+        norm_self = self_grad.norm()
+        norm_nbr  = neighbor_grad.norm()
+        if norm_self < 1e-12 or norm_nbr < 1e-12:
+            return neighbor_grad          # zero gradient: no conflict possible
+        dot     = (neighbor_grad * self_grad).sum()
+        cos_sim = dot / (norm_self * norm_nbr)
+        if cos_sim < 0:
+            # Remove conflicting component: grad_clean = grad - (dot/||self||²) * self
+            proj = dot / (norm_self ** 2 + 1e-12)
+            return neighbor_grad - proj * self_grad
+        return neighbor_grad
 
     def _unflatten_(self, flat_tensor, ref_buf):
         ref  = list(ref_buf.values())
@@ -200,8 +290,13 @@ class ENGC_receiver():
         unflat = unflatten_tensors(flat_tensor, ref)
         return {k: v for k, v in zip(keys, unflat)}
 
-    def __call__(self, neighbor_grads_comm, neighbor_grads_comp, ref_buf):
-        """Uniform gradient aggregation — giống NGC_receiver."""
+    def __call__(self, neighbor_grads_comm, neighbor_grads_comp, ref_buf,
+                 vacuity_scores=None):
+        """
+        Vacuity-adaptive gradient aggregation.
+        vacuity_scores: dict rank -> float (từ ENGC_sender.vacuity_scores).
+        None → identical to NGC uniform averaging.
+        """
         for rank, ft in neighbor_grads_comm.items():
             neighbor_grads_comm[rank] = self._unflatten_(ft, ref_buf)
         for rank, ft in neighbor_grads_comp.items():
@@ -210,16 +305,13 @@ class ENGC_receiver():
         for name, self_params in self.model.module.named_parameters():
             if not self_params.requires_grad:
                 continue
+            self_grad = self_params.grad.data
 
-            # Communication branch
-            comm_list = [neigh[name] for neigh in neighbor_grads_comm.values()]
-            comm_list.append(self_params.grad.data)
-            p_comm = self._average_gradients(comm_list)
+            comm_neighbor = {r: g[name] for r, g in neighbor_grads_comm.items()}
+            comp_neighbor = {r: g[name] for r, g in neighbor_grads_comp.items()}
 
-            # Computation branch
-            comp_list = [neigh[name] for neigh in neighbor_grads_comp.values()]
-            comp_list.append(self_params.grad.data)
-            p_comp = self._average_gradients(comp_list)
+            p_comm = self._weighted_average(self_grad, comm_neighbor, vacuity_scores)
+            p_comp = self._weighted_average(self_grad, comp_neighbor, vacuity_scores)
 
             # NGC branch fusion
             self.proj_grads[name] = (1.0 - self.alpha) * p_comp + self.alpha * p_comm
@@ -264,6 +356,46 @@ class ENGC_receiver():
                         p.grad.data.copy_(buf)
 
         self.lr = lr
+
+
+# ---------------------------------------------------------------------------
+# Vacuity logging helper (used by trainer)
+# ---------------------------------------------------------------------------
+
+def log_vacuity_stats(rank: int, step: int, vacuity_scores: dict,
+                      sample_weight_stats: dict = None):
+    """
+    Log per-neighbor:
+      vac      — mean EDL vacuity of neighbor model on my data (0=confident, 1=uncertain)
+      w        — effective cross-gradient mixing weight after trust normalization
+      sw_mean  — mean per-sample weight inside cross-gradient (1-vacuity per sample)
+      sw_fl    — fraction of samples with weight < 0.2 (nearly-filtered OOD samples)
+    """
+    N = len(vacuity_scores)
+    if N == 0:
+        return
+    MIN_TRUST  = 0.1
+    pi_self    = 1.0 / (N + 1)
+    pi_nbr_tot = N   / (N + 1)
+
+    trusts  = {r: max(MIN_TRUST, 1.0 - v) for r, v in vacuity_scores.items()}
+    total   = sum(trusts.values()) or 1.0
+    weights = {r: (trusts[r] / total) * pi_nbr_tot for r in trusts}
+
+    parts = [f"pi_self={pi_self:.3f}"]
+    for r in sorted(vacuity_scores):
+        sw = (sample_weight_stats or {}).get(r, {})
+        peer_str = (
+            f"peer{r}: vac={vacuity_scores[r]:.3f} "
+            f"w={weights.get(r, 0):.3f}"
+        )
+        if sw:
+            peer_str += (
+                f" sw_mean={sw.get('mean', 0):.2f}"
+                f" sw_fl={sw.get('frac_low', 0):.2f}"
+            )
+        parts.append(peer_str)
+    print(f"[ENGC-Adaptive][Rank {rank}][Step {step}] " + " | ".join(parts))
 
 
 # ---------------------------------------------------------------------------
@@ -415,31 +547,23 @@ class EDLGatedKDLoss(torch.nn.Module):
             # EDL vacuity của teacher: u = K / S ∈ (0, 1]
             vacuity = compute_edl_vacuity(teacher_logits)          # [B]
 
-            # Gate 1: teacher confident (vacuity thấp)
-            conf_mask = vacuity < self.tau_u                       # [B]
-
-            # Gate 2: teacher predict đúng trên data CỦA STUDENT
-            # Chỉ học KD khi hàng xóm vừa tự tin VÀ đoán đúng
-            teacher_pred = teacher_logits.argmax(dim=1)            # [B]
-            correct_mask = (teacher_pred == targets)               # [B]
-
-            # Combined mask: confident AND correct
-            final_mask  = conf_mask & correct_mask
-            n_conf      = conf_mask.sum().item()
-            n_correct   = correct_mask.sum().item()
-            n_final     = final_mask.sum().item()
-            conf_ratio  = n_final / max(len(final_mask), 1)
+            # Gate: teacher confident (vacuity thấp) — single gate
+            # Trong non-IID cực đoan, teacher predict sai vẫn mang diversity signal hữu ích
+            # Dual gate (conf & correct) loại bỏ cross-class knowledge transfer
+            conf_mask  = vacuity < self.tau_u                      # [B]
+            n_conf     = conf_mask.sum().item()
+            conf_ratio = n_conf / max(len(conf_mask), 1)
 
             self.last_conf_ratios[rank] = conf_ratio
-            self.last_n_conf[rank]      = n_final
+            self.last_n_conf[rank]      = n_conf
 
-            if conf_ratio < self.min_conf_ratio or n_final == 0:
+            if conf_ratio < self.min_conf_ratio or n_conf == 0:
                 self.last_kd_losses[rank] = 0.0
                 continue
 
-            # KD loss (Hinton 2015) chỉ trên samples mà teacher vừa tự tin vừa đúng
-            s_soft  = F.log_softmax(student_logits[final_mask] / self.T, dim=1)
-            t_soft  = F.softmax(teacher_logits[final_mask]     / self.T, dim=1)
+            # KD loss (Hinton 2015) chỉ trên confident samples
+            s_soft  = F.log_softmax(student_logits[conf_mask] / self.T, dim=1)
+            t_soft  = F.softmax(teacher_logits[conf_mask]     / self.T, dim=1)
             kd_loss = F.kl_div(s_soft, t_soft.detach(), reduction='batchmean') * (self.T ** 2)
 
             kd_losses.append(kd_loss)
@@ -457,13 +581,12 @@ class EDLGatedKDLoss(torch.nn.Module):
     def log_stats(self, rank: int, step: int):
         if not self.last_conf_ratios:
             return
-        parts = [
-            f"edl_nll={self.last_edl_loss:.6f}",
-            f"kl_reg={self.last_kl_loss:.6f}",
-        ]
+        parts = [f"edl_nll={self.last_edl_loss:.6f}"]
+        if self.lambda_reg > 0:
+            parts.append(f"kl_reg={self.last_kl_loss:.6f}(x{self.lambda_reg})")
         for r in sorted(self.last_conf_ratios):
             parts.append(
-                f"peer{r}: gate={self.last_conf_ratios[r]:.2f}(conf&correct) "
+                f"peer{r}: gate={self.last_conf_ratios[r]:.2f} "
                 f"n={self.last_n_conf.get(r, 0)} "
                 f"kd_raw={self.last_kd_losses.get(r, 0.0):.6f} "
                 f"kd_weighted={self.last_kd_losses.get(r, 0.0) * self.lambda_kd:.6f}"

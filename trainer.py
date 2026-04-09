@@ -107,6 +107,9 @@ parser.add_argument('--kd-lambda', dest='kd_lambda', default=0.5, type=float,
                     help='Weight of KD loss: total_loss = CE + kd_lambda * KD')
 parser.add_argument('--kd-min-conf', dest='kd_min_conf', default=0.1, type=float,
                     help='Minimum ratio of confident samples to apply KD (skip if below)')
+parser.add_argument('--kd-lambda-reg', dest='kd_lambda_reg', default=0.0, type=float,
+                    help='KL regularization weight in EDL loss (lambda_reg). '
+                         '0.0 = NLL only (no KL), prevents KL fighting KD signal')
 
 # --- Data quality / noise args ---
 parser.add_argument('--noise-rate', dest='noise_rate', default=0.0, type=float,
@@ -235,7 +238,7 @@ def run(rank, size):
         sender = None
 
     # --- EDL-gated KD loss (chỉ dùng với ENGC + use_edl) ---
-    if args.use_edl and args.optimizer.lower() == 'engc':
+    if args.use_edl and args.optimizer.lower() == 'engc' and args.kd_lambda > 0.0:
         from optimizers.engc import EDLGatedKDLoss
         kd_loss_fn = EDLGatedKDLoss(
             num_classes    = args.classes,
@@ -243,6 +246,7 @@ def run(rank, size):
             temperature    = args.kd_temperature,
             lambda_kd      = args.kd_lambda,
             min_conf_ratio = args.kd_min_conf,
+            lambda_reg     = args.kd_lambda_reg,
         ).to(device)
         # Model copy riêng để load neighbor weights khi tính KD
         # eval mode cố định, không ảnh hưởng local training
@@ -251,7 +255,7 @@ def run(rank, size):
         if rank == 0:
             print(f"[ENGC-H3] EDL-gated KD enabled: tau_u={args.kd_tau_u}, "
                   f"T={args.kd_temperature}, lambda={args.kd_lambda}, "
-                  f"min_conf={args.kd_min_conf}")
+                  f"min_conf={args.kd_min_conf}, lambda_reg={args.kd_lambda_reg}")
     else:
         kd_loss_fn        = None
         kd_neighbor_model = None
@@ -467,16 +471,14 @@ def train(
         # ENGC Hướng 3: CE + EDL-gated KD → backward → NGC aggregation
         # ----------------------------------------------------------------
         if args.optimizer.lower() == 'engc':
-            output  = model(input_var)
-            ce_loss = criterion(output, target_var)
+            output = model(input_var)
 
-            # Bước 1: gọi sender TRƯỚC để cập nhật last_neighbor_weights
-            # và tính cross-gradient
+            # Sender: computes CE cross-gradients AND EDL vacuity scores per neighbor
             cross_grad, ref_buf = sender(cross_weights, input_var, target_var)
 
-            # Bước 2: KD dùng last_neighbor_weights đã được cập nhật
+            # Local loss: CE (same as NGC) — EDL used only for vacuity signal, not loss
             if kd_loss_fn is not None and sender.last_neighbor_weights:
-                # annealing_coef tăng tuyến tính 0→1 qua nửa đầu training
+                # Legacy KD path (only active when --kd-lambda > 0)
                 annealing_coef = min(1.0, epoch / max(1, args.epochs // 2))
                 loss = kd_loss_fn(
                     student_logits   = output,
@@ -489,22 +491,28 @@ def train(
                 if i % args.print_freq == 0:
                     kd_loss_fn.log_stats(dist.get_rank(), global_steps)
             else:
-                loss = ce_loss
+                loss = criterion(output, target_var)  # plain CE
 
             all_outputs.append(output.detach().cpu())
             all_targets.append(target.detach().cpu())
 
-            # Bước 3: backward trên total loss (CE + KD)
             loss.backward()
 
-            # Bước 4: exchange và aggregate gradients
             cross_grad_copy = copy.deepcopy(cross_grad)
             _, amt_data_transfer, received_cross_grad = model.transfer_additional(cross_grad)
             comm_calls_transfer_additional += 1
             payload_bytes_from_calls       += amt_data_transfer
             data_transferred               += amt_data_transfer
 
-            receiver(received_cross_grad, cross_grad_copy, ref_buf)
+            # Adaptive vacuity-weighted aggregation (use_edl=True) vs uniform (False)
+            vacuity_scores = sender.vacuity_scores if args.use_edl else None
+            if vacuity_scores and i % args.print_freq == 0:
+                from optimizers.engc import log_vacuity_stats
+                log_vacuity_stats(dist.get_rank(), global_steps, vacuity_scores,
+                                  getattr(sender, 'sample_weight_stats', None))
+
+            receiver(received_cross_grad, cross_grad_copy, ref_buf,
+                     vacuity_scores=vacuity_scores)
             receiver.project_gradients(lr)
 
             global_steps += 1
