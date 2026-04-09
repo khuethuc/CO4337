@@ -259,30 +259,8 @@ class ENGC_receiver():
 
         result = pi_self * self_grad
         for r, grad in neighbor_grads_dict.items():
-            grad_clean = self._project_conflict(self_grad, grad)
-            result = result + weights[r] * grad_clean
+            result = result + weights[r] * grad
         return result
-
-    @staticmethod
-    def _project_conflict(self_grad, neighbor_grad):
-        """
-        Gradient Surgery (Yu et al. 2020 / PCGrad):
-        Nếu neighbor_grad xung đột với self_grad (cos_sim < 0),
-        project ra khỏi hướng xung đột → giữ phần trực giao (không gây hại).
-
-        Applied per-parameter tensor — mỗi layer được xét độc lập.
-        """
-        norm_self = self_grad.norm()
-        norm_nbr  = neighbor_grad.norm()
-        if norm_self < 1e-12 or norm_nbr < 1e-12:
-            return neighbor_grad          # zero gradient: no conflict possible
-        dot     = (neighbor_grad * self_grad).sum()
-        cos_sim = dot / (norm_self * norm_nbr)
-        if cos_sim < 0:
-            # Remove conflicting component: grad_clean = grad - (dot/||self||²) * self
-            proj = dot / (norm_self ** 2 + 1e-12)
-            return neighbor_grad - proj * self_grad
-        return neighbor_grad
 
     def _unflatten_(self, flat_tensor, ref_buf):
         ref  = list(ref_buf.values())
