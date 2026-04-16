@@ -17,5 +17,6 @@ python trainer.py \
   --neighbors 4 \
   --nesterov \
   --use-edl \
-  --kd-lambda 0.0 \
-  --quality-mode uniform
+  --quality-mode uniform \
+  # --noise-type dirichlet \
+  # --noise-alpha 0.1

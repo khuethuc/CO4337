@@ -2,6 +2,7 @@ import argparse
 import os
 import shutil
 import time
+import math
 from tkinter import E
 import numpy as np
 import statistics
@@ -16,7 +17,6 @@ import torch.utils.data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 from torchsummary import summary
-import torch.nn.functional as F
 from math import ceil
 import random
 import subprocess
@@ -64,7 +64,7 @@ parser.add_argument('--momentum', default=0.9, type=float, metavar='M', help='mo
 parser.add_argument('--weight_decay', default=0.0, type=float, help='weight_decay')
 parser.add_argument('-world_size', '--world_size', default=10, type=int, help='total number of nodes')
 parser.add_argument('--epochs', default=100, type=int, metavar='N', help='number of total epochs to run')
-parser.add_argument('--optimizer', default='ngc', type=str, help='global optimizer = [d-psgd, cga, ngc, compcga, compngc, topkngc, engc]')
+parser.add_argument('--optimizer', default='ngc', type=str, help='global optimizer = [d-psgd, cga, ngc, compcga, compngc, topkngc, engc, adaptive_ngc]')
 parser.add_argument('--graph', '-g', default='ring', help='graph structure - [ring, torus, full, chain]')
 parser.add_argument('--neighbors', default=2, type=int, help='number of neighbors per node')
 parser.add_argument('-d', '--devices', default=4, type=int, help='number of gpus/devices on the card')
@@ -95,21 +95,9 @@ parser.add_argument('--ngc-norm-weight', dest='ngc_norm_weight', default=0.25, t
 parser.add_argument('--ngc-min-peer-weight', dest='ngc_min_peer_weight', default=0.00, type=float,
                     help='minimum peer weight floor after normalization')
 
-# --- EDL / KD args (ENGC Hướng 3) ---
+# --- EDL / vacuity args (ENGC) ---
 parser.add_argument('--use-edl', dest='use_edl', action='store_true',
-                    help='enable EDL-gated Knowledge Distillation (ENGC Direction 3)')
-parser.add_argument('--kd-tau-u', dest='kd_tau_u', default=0.4, type=float,
-                    help='EDL vacuity threshold [0,1] for KD gate: '
-                         'sample excluded from KD if teacher vacuity >= kd_tau_u')
-parser.add_argument('--kd-temperature', dest='kd_temperature', default=2.0, type=float,
-                    help='Temperature T for KD softmax')
-parser.add_argument('--kd-lambda', dest='kd_lambda', default=0.5, type=float,
-                    help='Weight of KD loss: total_loss = CE + kd_lambda * KD')
-parser.add_argument('--kd-min-conf', dest='kd_min_conf', default=0.1, type=float,
-                    help='Minimum ratio of confident samples to apply KD (skip if below)')
-parser.add_argument('--kd-lambda-reg', dest='kd_lambda_reg', default=0.0, type=float,
-                    help='KL regularization weight in EDL loss (lambda_reg). '
-                         '0.0 = NLL only (no KL), prevents KL fighting KD signal')
+                    help='enable vacuity-adaptive cross-gradient weighting (ENGC)')
 
 # --- Data quality / noise args ---
 parser.add_argument('--noise-rate', dest='noise_rate', default=0.0, type=float,
@@ -118,6 +106,11 @@ parser.add_argument('--noise-agents', dest='noise_agents', default='', type=str,
                     help='comma-separated ranks to inject noise, e.g. "0,1"')
 parser.add_argument('--quality-mode', dest='quality_mode', default='uniform', type=str,
                     help='heterogeneous data quality: uniform | tiered | random')
+parser.add_argument('--noise-type', dest='noise_type', default='uniform', type=str,
+                    help='label noise distribution: uniform (USN) | dirichlet')
+parser.add_argument('--noise-alpha', dest='noise_alpha', default=0.1, type=float,
+                    help='Dirichlet concentration for label noise: '
+                         'small (0.01) = near pair-flip; large (10) = near uniform')
 
 args = parser.parse_args()
 args.devices = torch.cuda.device_count()
@@ -151,18 +144,26 @@ def run(rank, size):
     data_transferred = 0
     global_steps = 0
 
-    # Train time / resource tracking
-    total_train_time_s = 0.0
-    total_cpu_pct_sum  = 0.0
-    total_gpu_pct_sum  = 0.0
-    total_cpu_cnt      = 0
-    total_gpu_cnt      = 0
-
-    # Accuracy and loss lists for plotting
+    # Accuracy and loss lists
     train_acc_list  = []
     train_loss_list = []
     val_acc_list    = []
     val_loss_list   = []
+
+    # Per-epoch resource / communication tracking
+    train_time_list  = []   # seconds per epoch
+    cpu_pct_list     = []   # %CPU per epoch
+    gpu_pct_list     = []   # %GPU per epoch
+    comm_bytes_list  = []   # bytes transferred per epoch
+    comm_pkgs_list   = []   # total comm packages per epoch
+
+    # ENGC per-epoch diagnostic tracking (empty for non-ENGC optimizers)
+    # engc_trust_list[ep][r]   = mean weight assigned to neighbor r in epoch ep
+    # engc_vac_c_list[ep][r]   = mean vacuity of peer r's model when it predicts CORRECTLY
+    # engc_vac_w_list[ep][r]   = mean vacuity of peer r's model when it predicts WRONGLY
+    engc_trust_list  = []
+    engc_vac_c_list  = []
+    engc_vac_w_list  = []
 
     # --- Build base model ---
     if args.arch.lower() == 'resnet':
@@ -193,6 +194,8 @@ def run(rank, size):
         args.dataset, args.data_dir, args.skew, args.seed, args.batch_size,
         args.classes,
         quality_mode=args.quality_mode,
+        noise_type=args.noise_type,
+        noise_alpha=args.noise_alpha,
     )
 
     if rank == 0:
@@ -228,37 +231,15 @@ def run(rank, size):
     elif args.optimizer.lower() == 'topkngc':
         sender = Topk_NGC_sender(base_model, device)
     elif args.optimizer.lower() == 'engc':
-        # ENGC Hướng 3: sender đơn giản như NGC, không cần EDL loss
         sender = ENGC_sender(
             base_model,
             device,
             num_classes=args.classes,
         )
+    elif args.optimizer.lower() == 'adaptive_ngc':
+        sender = AdaptiveNGC_sender(base_model, device)
     else:
         sender = None
-
-    # --- EDL-gated KD loss (chỉ dùng với ENGC + use_edl) ---
-    if args.use_edl and args.optimizer.lower() == 'engc' and args.kd_lambda > 0.0:
-        from optimizers.engc import EDLGatedKDLoss
-        kd_loss_fn = EDLGatedKDLoss(
-            num_classes    = args.classes,
-            tau_u          = args.kd_tau_u,
-            temperature    = args.kd_temperature,
-            lambda_kd      = args.kd_lambda,
-            min_conf_ratio = args.kd_min_conf,
-            lambda_reg     = args.kd_lambda_reg,
-        ).to(device)
-        # Model copy riêng để load neighbor weights khi tính KD
-        # eval mode cố định, không ảnh hưởng local training
-        kd_neighbor_model = copy.deepcopy(base_model).to(device)
-        kd_neighbor_model.eval()
-        if rank == 0:
-            print(f"[ENGC-H3] EDL-gated KD enabled: tau_u={args.kd_tau_u}, "
-                  f"T={args.kd_temperature}, lambda={args.kd_lambda}, "
-                  f"min_conf={args.kd_min_conf}, lambda_reg={args.kd_lambda_reg}")
-    else:
-        kd_loss_fn        = None
-        kd_neighbor_model = None
 
     # --- Build graph and gossip model ---
     if args.graph.lower() == 'ring':
@@ -317,6 +298,19 @@ def run(rank, size):
             neighbors=args.neighbors,
             alpha=args.alpha,
         )
+    elif args.optimizer.lower() == 'adaptive_ngc':
+        receiver = AdaptiveNGC_receiver(
+            model,
+            device,
+            rank,
+            args.lr,
+            args.momentum,
+            args.qgm,
+            args.nesterov,
+            weight_decay=args.weight_decay,
+            neighbors=args.neighbors,
+            alpha=args.alpha,
+        )
     else:
         receiver = DSGD_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay)
 
@@ -355,19 +349,25 @@ def run(rank, size):
             sender            = sender,
             gpu_index         = rank,
             monitor_every     = max(10, args.print_freq),
-            kd_loss_fn        = kd_loss_fn,
-            kd_neighbor_model = kd_neighbor_model,
         )
         data_transferred += dt
 
         train_acc_list.append(float(prec1))
         train_loss_list.append(float(loss))
 
-        total_train_time_s += m["train_time_s"]
-        total_cpu_pct_sum  += m["cpu_pct_avg"]
-        total_gpu_pct_sum  += m["gpu_pct_avg"]
-        total_cpu_cnt      += 1
-        total_gpu_cnt      += 1
+        train_time_list.append(float(m["train_time_s"]))
+        cpu_pct_list.append(float(m["cpu_pct_avg"]))
+        gpu_pct_list.append(float(m["gpu_pct_avg"]))
+        comm_bytes_list.append(int(m["payload_bytes_from_calls"]))
+        comm_pkgs_list.append(
+            int(m["comm_calls_transfer_params"]) +
+            int(m["comm_calls_transfer_additional"])
+        )
+
+        # ENGC per-epoch diagnostics
+        engc_trust_list.append(m.get("engc_trust",       {}))
+        engc_vac_c_list.append(m.get("engc_vac_correct", {}))
+        engc_vac_w_list.append(m.get("engc_vac_wrong",   {}))
 
         lr_scheduler.step()
 
@@ -386,19 +386,101 @@ def run(rank, size):
     average_parameters(model)
     print('Final test accuracy')
     prec1_final, _ = validate(val_loader, model, criterion, bsz_val, device, epoch)
-    print("Rank : ", rank, "Data transferred(in GB) during training: ", data_transferred / 1.0e9, "\n")
+
+    # --- ENGC: print per-epoch trust score evolution (rank 0 only) ---
+    if args.optimizer.lower() == 'engc' and rank == 0 and engc_trust_list:
+        noise_ranks = set(
+            int(x) for x in args.noise_agents.split(',') if x.strip()
+        ) if args.noise_agents else set()
+
+        # Collect all neighbor ranks that appeared
+        all_nbr_ranks = sorted({
+            r for ep_d in engc_trust_list for r in ep_d if r != 'self'
+        })
+
+        W = 72
+        print("\n" + "=" * W)
+        print(f"  ENGC DIAGNOSTIC SUMMARY  [Rank {rank} | {args.graph} | skew={args.skew}]")
+        print(f"  Noisy agents: {sorted(noise_ranks) if noise_ranks else 'none'}")
+        print("=" * W)
+
+        # --- Table 1: per-epoch trust score per neighbor ---
+        hdr = f"  {'Epoch':>5}"
+        hdr += f"  {'self':>6}"
+        for r in all_nbr_ranks:
+            tag = '[N]' if r in noise_ranks else '[c]'
+            hdr += f"  peer{r}{tag:>3}"
+        print(hdr)
+        print("  " + "-" * (W - 2))
+        for ep, ep_trust in enumerate(engc_trust_list):
+            row = f"  {ep+1:>5}  {ep_trust.get('self', float('nan')):>6.3f}"
+            for r in all_nbr_ranks:
+                row += f"  {ep_trust.get(r, float('nan')):>9.3f}"
+            print(row)
+        print("=" * W)
+
+        # --- Table 2: epoch-mean vacuity correct vs wrong per neighbor ---
+        print(f"\n  Vacuity correct (↓) vs wrong (↑) — confirms uncertainty signal quality")
+        hdr2 = f"  {'Epoch':>5}"
+        for r in all_nbr_ranks:
+            tag = '[N]' if r in noise_ranks else '[c]'
+            hdr2 += f"  p{r}{tag}vac_ok  p{r}{tag}vac_err"
+        print(hdr2)
+        print("  " + "-" * (W - 2))
+        for ep, (ep_vc, ep_vw) in enumerate(zip(engc_vac_c_list, engc_vac_w_list)):
+            row = f"  {ep+1:>5}"
+            for r in all_nbr_ranks:
+                vc = ep_vc.get(r, float('nan'))
+                vw = ep_vw.get(r, float('nan'))
+                row += f"  {vc:>12.3f}  {vw:>11.3f}"
+            print(row)
+        print("=" * W + "\n")
+
+    total_comm_gb   = data_transferred / 1.0e9
+    total_time_s    = sum(train_time_list)
+    avg_cpu_pct     = sum(cpu_pct_list)  / max(len(cpu_pct_list),  1)
+    avg_gpu_pct     = sum(gpu_pct_list)  / max(len(gpu_pct_list),  1)
+    total_comm_pkgs = sum(comm_pkgs_list)
+    last_comm_mb    = comm_bytes_list[-1] / 1e6 if comm_bytes_list else 0.0
+    last_time_s     = train_time_list[-1]        if train_time_list else 0.0
+
+    # Print in rank order so output is readable with multiple processes
+    for r in range(dist.get_world_size()):
+        dist.barrier()
+        if dist.get_rank() == r:
+            W = 62
+            print("\n" + "=" * W)
+            print(f"  RANK {rank} — POST-TRAINING METRICS  "
+                  f"[{args.optimizer.upper()} | {args.graph} | skew={args.skew}]")
+            print("=" * W)
+            print(f"  {'Metric':<30} {'Last epoch':>12}  {'Total / Avg':>12}")
+            print("  " + "-" * (W - 2))
+            print(f"  {'Training time (s)':<30} {last_time_s:>12.2f}  {total_time_s:>11.1f}s")
+            print(f"  {'CPU usage (%)':<30} {cpu_pct_list[-1] if cpu_pct_list else 0:>12.1f}  {avg_cpu_pct:>11.1f}%")
+            print(f"  {'GPU usage (%)':<30} {gpu_pct_list[-1] if gpu_pct_list else 0:>12.1f}  {avg_gpu_pct:>11.1f}%")
+            print(f"  {'Comm payload (MB)':<30} {last_comm_mb:>12.2f}  {total_comm_gb*1e3:>10.2f}MB")
+            print(f"  {'Comm packages':<30} {comm_pkgs_list[-1] if comm_pkgs_list else 0:>12}  {total_comm_pkgs:>12}")
+            print(f"  {'Val accuracy (%)':<30} {'—':>12}  {prec1_final:>11.2f}%")
+            print("=" * W + "\n")
 
     result = {
-        "acc_last_epoch": float(prec1),
-        "acc_final":      float(prec1_final),
-        "payload_gb":     float(data_transferred / 1.0e9),
-        "train_time_s":   float(total_train_time_s),
-        "cpu_pct_avg":    float(total_cpu_pct_sum / max(total_cpu_cnt, 1)),
-        "gpu_pct_avg":    float(total_gpu_pct_sum / max(total_gpu_cnt, 1)),
-        "train_acc_list": train_acc_list,
-        "train_loss_list": train_loss_list,
-        "val_acc_list":   val_acc_list,
-        "val_loss_list":  val_loss_list,
+        "acc_last_epoch":  float(prec1),
+        "acc_final":       float(prec1_final),
+        "payload_gb":      float(total_comm_gb),
+        "train_time_s":    float(total_time_s),
+        "cpu_pct_avg":     float(avg_cpu_pct),
+        "gpu_pct_avg":     float(avg_gpu_pct),
+        "comm_pkgs_total": int(total_comm_pkgs),
+        # per-epoch lists
+        "train_acc_list":   train_acc_list,
+        "train_loss_list":  train_loss_list,
+        "val_acc_list":     val_acc_list,
+        "val_loss_list":    val_loss_list,
+        "train_time_list":  train_time_list,
+        "cpu_pct_list":     cpu_pct_list,
+        "gpu_pct_list":     gpu_pct_list,
+        "comm_bytes_list":  comm_bytes_list,
+        "comm_pkgs_list":   comm_pkgs_list,
     }
     torch.save(result, os.path.join(args.save_dir, "excel_data", f"rank_{rank}.sp"))
 
@@ -418,8 +500,6 @@ def train(
     sender            = None,
     gpu_index         : int   = 0,
     monitor_every     : int   = 50,
-    kd_loss_fn        = None,   # EDLGatedKDLoss instance (ENGC H3 only)
-    kd_neighbor_model = None,   # deepcopy model để load neighbor weights
 ):
     global global_steps
 
@@ -446,6 +526,12 @@ def train(
     comm_calls_transfer_additional  = 0
     payload_bytes_from_calls        = 0
 
+    # ENGC per-batch diagnostic accumulators (empty for non-ENGC)
+    # Keys are neighbor ranks (int); 'self' for own weight
+    _engc_vac_correct = {}   # {rank -> [float]}  vacuity when peer predicts correctly
+    _engc_vac_wrong   = {}   # {rank -> [float]}  vacuity when peer predicts wrongly
+    _engc_trust       = {}   # {rank/'self' -> [float]}  weight assigned each step
+
     end   = time.time()
     step  = len(train_loader) * batch_size * epoch
 
@@ -468,30 +554,13 @@ def train(
         data_transferred           += amt_data_transfer
 
         # ----------------------------------------------------------------
-        # ENGC Hướng 3: CE + EDL-gated KD → backward → NGC aggregation
+        # ENGC
         # ----------------------------------------------------------------
         if args.optimizer.lower() == 'engc':
             output = model(input_var)
-
-            # Sender: computes CE cross-gradients AND EDL vacuity scores per neighbor
             cross_grad, ref_buf = sender(cross_weights, input_var, target_var)
 
-            # Local loss: CE (same as NGC) — EDL used only for vacuity signal, not loss
-            if kd_loss_fn is not None and sender.last_neighbor_weights:
-                # Legacy KD path (only active when --kd-lambda > 0)
-                annealing_coef = min(1.0, epoch / max(1, args.epochs // 2))
-                loss = kd_loss_fn(
-                    student_logits   = output,
-                    targets          = target_var,
-                    neighbor_weights = sender.last_neighbor_weights,
-                    input_x          = input_var,
-                    neighbor_model   = kd_neighbor_model,
-                    annealing_coef   = annealing_coef,
-                )
-                if i % args.print_freq == 0:
-                    kd_loss_fn.log_stats(dist.get_rank(), global_steps)
-            else:
-                loss = criterion(output, target_var)  # plain CE
+            loss = criterion(output, target_var)
 
             all_outputs.append(output.detach().cpu())
             all_targets.append(target.detach().cpu())
@@ -504,7 +573,7 @@ def train(
             payload_bytes_from_calls       += amt_data_transfer
             data_transferred               += amt_data_transfer
 
-            # Adaptive vacuity-weighted aggregation (use_edl=True) vs uniform (False)
+            # Vacuity-adaptive aggregation (use_edl=True) vs uniform (False)
             vacuity_scores = sender.vacuity_scores if args.use_edl else None
             if vacuity_scores and i % args.print_freq == 0:
                 from optimizers.engc import log_vacuity_stats
@@ -514,6 +583,39 @@ def train(
             receiver(received_cross_grad, cross_grad_copy, ref_buf,
                      vacuity_scores=vacuity_scores)
             receiver.project_gradients(lr)
+
+            # --- Accumulate ENGC diagnostics ---
+            for r, s in sender.vacuity_by_pred.items():
+                vc = s['vac_correct']
+                vw = s['vac_wrong']
+                if vc == vc:   # not NaN
+                    _engc_vac_correct.setdefault(r, []).append(vc)
+                if vw == vw:   # not NaN
+                    _engc_vac_wrong.setdefault(r, []).append(vw)
+            for r, w in receiver.last_neighbor_weights.items():
+                _engc_trust.setdefault(r, []).append(w)
+
+            # --- Periodic diagnostic print ---
+            if i % args.print_freq == 0 and sender.vacuity_by_pred:
+                noise_ranks = set(
+                    int(x) for x in args.noise_agents.split(',') if x.strip()
+                ) if args.noise_agents else set()
+                parts = []
+                for r in sorted(sender.vacuity_by_pred):
+                    s   = sender.vacuity_by_pred[r]
+                    tag = '[N]' if r in noise_ranks else '[c]'
+                    tw  = receiver.last_neighbor_weights.get(r, float('nan'))
+                    parts.append(
+                        f"peer{r}{tag} "
+                        f"vac_ok={s['vac_correct']:.3f} "
+                        f"vac_err={s['vac_wrong']:.3f} "
+                        f"trust={tw:.3f}"
+                    )
+                print(
+                    f"[ENGC-Diag][Rank {dist.get_rank()}]"
+                    f"[Ep {epoch}][{i}/{len(train_loader)}] "
+                    + " | ".join(parts)
+                )
 
             global_steps += 1
 
@@ -600,6 +702,9 @@ def train(
     cpu_avg = float(sum(cpu_samples) / max(len(cpu_samples), 1)) if cpu_samples else 0.0
     gpu_avg = float(sum(gpu_samples) / max(len(gpu_samples), 1)) if gpu_samples else 0.0
 
+    def _emean(d):
+        return {r: float(sum(v) / len(v)) if v else float('nan') for r, v in d.items()}
+
     metrics = {
         "train_time_s":                   train_time_s,
         "cpu_pct_avg":                    cpu_avg,
@@ -607,24 +712,24 @@ def train(
         "comm_calls_transfer_params":     comm_calls_transfer_params,
         "comm_calls_transfer_additional": comm_calls_transfer_additional,
         "payload_bytes_from_calls":       int(payload_bytes_from_calls),
+        # ENGC diagnostics (empty dicts for non-ENGC optimizers)
+        "engc_trust":       _emean(_engc_trust),
+        "engc_vac_correct": _emean(_engc_vac_correct),
+        "engc_vac_wrong":   _emean(_engc_vac_wrong),
     }
     return data_transferred, top1.avg, losses.avg, metrics
 
 
 # # # Validation function # # #
 def validate(val_loader, model, criterion, batch_size, device, epoch=0):
-    """
-    Run evaluation. Nếu use_edl=True, log thêm EDL uncertainty metrics.
-    """
     batch_time = AverageMeter()
     losses     = AverageMeter()
     top1       = AverageMeter()
 
     model.eval()
 
-    all_outputs       = []
-    all_targets       = []
-    all_uncertainties = []
+    all_outputs = []
+    all_targets = []
 
     step = len(val_loader) * batch_size * epoch
     end  = time.time()
@@ -638,14 +743,6 @@ def validate(val_loader, model, criterion, batch_size, device, epoch=0):
             loss   = criterion(output, target_var)
             output = output.float()
             loss   = loss.float()
-
-            # Log EDL uncertainty nếu use_edl
-            if args.use_edl:
-                evidence    = F.softplus(output)
-                alpha       = evidence + 1
-                S           = torch.sum(alpha, dim=1, keepdim=True)
-                uncertainty = args.classes / torch.clamp(S.squeeze(1), min=1e-8)
-                all_uncertainties.append(uncertainty.cpu())
 
             all_outputs.append(output.cpu())
             all_targets.append(target.cpu())
@@ -680,16 +777,6 @@ def validate(val_loader, model, criterion, batch_size, device, epoch=0):
             f"Recall = {rec:.2f}  "
             f"F1 = {f1:.2f}  "
         )
-
-        if args.use_edl and len(all_uncertainties) > 0:
-            all_uncertainties = torch.cat(all_uncertainties, dim=0)
-            mean_unc = all_uncertainties.mean().item()
-            std_unc  = all_uncertainties.std().item()
-            print(
-                f"[Val][Epoch {epoch}] "
-                f"Mean Uncertainty = {mean_unc:.4f}  "
-                f"Std Uncertainty = {std_unc:.4f}"
-            )
 
     return top1.avg, losses.avg
 
@@ -837,32 +924,6 @@ def compute_local_class_weights(train_loader, num_classes, device, eps=1e-8):
     return weights.to(device)
 
 
-def compute_global_class_prior(train_loader, num_classes, device):
-    """
-    Tính class-weighted Dirichlet prior W_k theo FedEvPrompt (arXiv:2411.10071):
-        W_k = K/(K-1) * (1 - N_k/N),  sum(W) = K
-
-    W_k lớn ở rare class → KL term trong EDL loss upweight rare classes,
-    ngăn model collapse về majority class (giải quyết overconfidence).
-
-    Dùng all_reduce để tính N_k global (không phải local non-IID counts).
-    """
-    K = num_classes
-    local_counts = torch.zeros(K, dtype=torch.float32, device=device)
-    for _, targets in train_loader:
-        if isinstance(targets, torch.Tensor):
-            t = targets.view(-1)
-            local_counts += torch.bincount(t.to(device), minlength=K).float()
-
-    # Aggregate across all ranks để có global distribution
-    dist.all_reduce(local_counts, op=dist.ReduceOp.SUM)
-
-    N  = local_counts.sum().clamp(min=1.0)
-    W  = (K / (K - 1)) * (1.0 - local_counts / N)  # [K], sum = K
-    W  = W.clamp(min=1e-3)                           # numerical stability
-    return W
-
-
 def get_next_batch(loader_iter, loader):
     try:
         batch = next(loader_iter)
@@ -870,27 +931,6 @@ def get_next_batch(loader_iter, loader):
         loader_iter = iter(loader)
         batch       = next(loader_iter)
     return batch, loader_iter
-
-
-@torch.no_grad()
-def evaluate_self_evidential(model, x, y, num_classes):
-    was_training = model.training
-    model.eval()
-
-    output  = model(x)
-    evidence = F.softplus(output)
-    alpha    = evidence + 1.0
-    S        = torch.sum(alpha, dim=1, keepdim=True)
-    probs    = alpha / torch.clamp(S, min=1e-8)
-
-    pred = probs.argmax(dim=1)
-    acc  = (pred == y).float().mean().item()
-    unc  = (float(num_classes) / torch.clamp(S.squeeze(1), min=1e-8)).mean().item()
-
-    if was_training:
-        model.train()
-
-    return {"accuracy": float(acc), "uncertainty": float(unc)}
 
 
 # # # Main # # #
@@ -901,72 +941,135 @@ if __name__ == '__main__':
 
     # Read stored data
     excel_data = {
-        'data':       args.dataset,
-        "graph":      args.graph,
-        "nodes":      size,
-        'arch':       args.arch,
-        "norm":       args.normtype,
-        'depth':      args.depth,
-        'optimizer':  args.optimizer,
+        'data':          args.dataset,
+        "graph":         args.graph,
+        "nodes":         size,
+        'arch':          args.arch,
+        "norm":          args.normtype,
+        'depth':         args.depth,
+        'optimizer':     args.optimizer,
         "learning rate": args.lr,
-        "momentum":   args.momentum,
-        "qgm":        args.qgm,
-        "nesterov":   args.nesterov,
-        "weight_decay": args.weight_decay,
-        "skew":       args.skew,
-        "gamma":      args.gamma,
-        "alpha":      args.alpha,
-        "epochs":     args.epochs,
+        "momentum":      args.momentum,
+        "qgm":           args.qgm,
+        "nesterov":      args.nesterov,
+        "weight_decay":  args.weight_decay,
+        "skew":          args.skew,
+        "gamma":         args.gamma,
+        "alpha":         args.alpha,
+        "epochs":        args.epochs,
+        "seed":          args.seed,
+        # scalar per-rank
         "avg test acc":       [0.0 for _ in range(size)],
         "avg test acc final": [0.0 for _ in range(size)],
         "data transferred":   [0.0 for _ in range(size)],
-        "seed": args.seed,
+        "train_time_s":       [0.0 for _ in range(size)],
+        "cpu_pct_avg":        [0.0 for _ in range(size)],
+        "gpu_pct_avg":        [0.0 for _ in range(size)],
+        "comm_pkgs_total":    [0   for _ in range(size)],
+        # per-epoch lists per-rank
+        "train_acc_list":   [[] for _ in range(size)],
+        "train_loss_list":  [[] for _ in range(size)],
+        "val_acc_list":     [[] for _ in range(size)],
+        "val_loss_list":    [[] for _ in range(size)],
+        "train_time_list":  [[] for _ in range(size)],
+        "cpu_pct_list":     [[] for _ in range(size)],
+        "gpu_pct_list":     [[] for _ in range(size)],
+        "comm_bytes_list":  [[] for _ in range(size)],
+        "comm_pkgs_list":   [[] for _ in range(size)],
     }
-    excel_data.update({
-        "train_acc_list":  [[] for _ in range(size)],
-        "train_loss_list": [[] for _ in range(size)],
-        "val_acc_list":    [[] for _ in range(size)],
-        "val_loss_list":   [[] for _ in range(size)],
-    })
 
     for i in range(size):
         r = torch.load(os.path.join(args.save_dir, "excel_data", f"rank_{i}.sp"))
         excel_data["avg test acc"][i]       = r["acc_last_epoch"]
         excel_data["avg test acc final"][i] = r["acc_final"]
         excel_data["data transferred"][i]   = r["payload_gb"]
-        excel_data["train_acc_list"][i]     = r.get("train_acc_list", [])
+        excel_data["train_time_s"][i]       = r["train_time_s"]
+        excel_data["cpu_pct_avg"][i]        = r["cpu_pct_avg"]
+        excel_data["gpu_pct_avg"][i]        = r["gpu_pct_avg"]
+        excel_data["comm_pkgs_total"][i]    = r["comm_pkgs_total"]
+        excel_data["train_acc_list"][i]     = r.get("train_acc_list",  [])
         excel_data["train_loss_list"][i]    = r.get("train_loss_list", [])
-        excel_data["val_acc_list"][i]       = r.get("val_acc_list", [])
-        excel_data["val_loss_list"][i]      = r.get("val_loss_list", [])
+        excel_data["val_acc_list"][i]       = r.get("val_acc_list",    [])
+        excel_data["val_loss_list"][i]      = r.get("val_loss_list",   [])
+        excel_data["train_time_list"][i]    = r.get("train_time_list", [])
+        excel_data["cpu_pct_list"][i]       = r.get("cpu_pct_list",    [])
+        excel_data["gpu_pct_list"][i]       = r.get("gpu_pct_list",    [])
+        excel_data["comm_bytes_list"][i]    = r.get("comm_bytes_list", [])
+        excel_data["comm_pkgs_list"][i]     = r.get("comm_pkgs_list",  [])
 
     torch.save(excel_data, os.path.join(args.save_dir, "excel_data", "dict"))
 
-    def plot_epoch_acc(excel_data, out_dir, which="val"):
-        key      = f"{which}_acc_list"
-        lists    = excel_data.get(key, [])
-        max_len  = max((len(l) for l in lists if l), default=0)
+    def _build_matrix(lists):
+        """Stack per-rank lists into a (n_ranks x n_epochs) numpy matrix."""
+        max_len = max((len(l) for l in lists if l), default=0)
         if max_len == 0:
-            print(f"[plot] No data for {key}")
-            return
-
+            return None, max_len
         mat = np.full((len(lists), max_len), np.nan, dtype=float)
         for i, l in enumerate(lists):
             mat[i, :len(l)] = np.array(l, dtype=float)
+        return mat, max_len
 
+    def plot_epoch_metric(lists, out_dir, filename, ylabel, title=None):
+        mat, max_len = _build_matrix(lists)
+        if mat is None:
+            return
         mean   = np.nanmean(mat, axis=0)
         epochs = np.arange(1, max_len + 1)
-
         plt.figure()
         for i in range(mat.shape[0]):
             plt.plot(epochs, mat[i], alpha=0.25)
         plt.plot(epochs, mean, linewidth=2.5, label="mean")
+        if title:
+            plt.title(title)
         plt.xlabel("Epoch")
-        plt.ylabel(f"{which} accuracy (%)")
+        plt.ylabel(ylabel)
         plt.grid(True, alpha=0.3)
         plt.legend()
         plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, f"{which}_accuracy_vs_epoch.png"), dpi=200)
+        plt.savefig(os.path.join(out_dir, filename), dpi=200)
         plt.close()
 
-    plot_epoch_acc(excel_data, args.save_dir, which="train")
-    plot_epoch_acc(excel_data, args.save_dir, which="val")
+    # Accuracy plots
+    plot_epoch_metric(excel_data["train_acc_list"], args.save_dir,
+                      "train_accuracy_vs_epoch.png", "Train accuracy (%)")
+    plot_epoch_metric(excel_data["val_acc_list"],   args.save_dir,
+                      "val_accuracy_vs_epoch.png",   "Val accuracy (%)")
+
+    # Resource / communication plots
+    plot_epoch_metric(excel_data["train_time_list"], args.save_dir,
+                      "train_time_vs_epoch.png", "Training time (s/epoch)",
+                      title="Training time per epoch")
+    plot_epoch_metric(excel_data["cpu_pct_list"], args.save_dir,
+                      "cpu_usage_vs_epoch.png", "CPU usage (%)",
+                      title="CPU usage per epoch")
+    plot_epoch_metric(excel_data["gpu_pct_list"], args.save_dir,
+                      "gpu_usage_vs_epoch.png", "GPU usage (%)",
+                      title="GPU usage per epoch")
+    plot_epoch_metric(
+        [[b / 1e6 for b in row] for row in excel_data["comm_bytes_list"]],
+        args.save_dir, "comm_cost_vs_epoch.png", "Communication cost (MB/epoch)",
+        title="Communication cost per epoch",
+    )
+    plot_epoch_metric(excel_data["comm_pkgs_list"], args.save_dir,
+                      "comm_packages_vs_epoch.png", "# comm packages/epoch",
+                      title="Communication packages per epoch")
+
+    # Print cross-rank summary table
+    print("\n" + "=" * 72)
+    print(f"  FINAL SUMMARY  [{args.optimizer.upper()} | {args.graph} | "
+          f"{size} nodes | skew={args.skew}]")
+    print("=" * 72)
+    print(f"  {'Rank':<6} {'ValAcc%':>8} {'FinalAcc%':>10} "
+          f"{'Time(s)':>9} {'CPU%':>7} {'GPU%':>7} "
+          f"{'CommGB':>8} {'Pkgs':>7}")
+    print("  " + "-" * 68)
+    for i in range(size):
+        print(f"  {i:<6} "
+              f"{excel_data['avg test acc'][i]:>8.2f} "
+              f"{excel_data['avg test acc final'][i]:>10.2f} "
+              f"{excel_data['train_time_s'][i]:>9.1f} "
+              f"{excel_data['cpu_pct_avg'][i]:>7.1f} "
+              f"{excel_data['gpu_pct_avg'][i]:>7.1f} "
+              f"{excel_data['data transferred'][i]:>8.4f} "
+              f"{excel_data['comm_pkgs_total'][i]:>7}")
+    print("=" * 72 + "\n")

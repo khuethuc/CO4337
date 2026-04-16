@@ -228,7 +228,9 @@ class QualityPartition(object):
                  label_noise_rate: float = 0.0,
                  num_classes: int = 7,
                  seed: int = 0,
-                 rank: int = 0):
+                 rank: int = 0,
+                 noise_type: str = 'uniform',
+                 noise_alpha: float = 0.1):
         self.data = data
         self.corruption = corruption_transform
 
@@ -251,21 +253,63 @@ class QualityPartition(object):
             else:
                 raise AttributeError("Dataset has neither .y nor .targets")
 
-            n_noisy = int(label_noise_rate * len(self.index))
-            noisy_pos = rng.choice(len(self.index), size=n_noisy, replace=False)
-            for pos in noisy_pos:
-                dataset_pos = self.index[pos]
-                # For datasets with an .indices mapping (e.g. HAM10000 train/val split),
-                # dataset_pos is a position into dataset, not into y directly.
-                if hasattr(self.data, 'indices'):
-                    actual_idx = int(self.data.indices[dataset_pos])
-                else:
-                    actual_idx = dataset_pos
-                orig = int(y_arr[actual_idx])
-                others = [c for c in range(num_classes) if c != orig]
-                y_arr[actual_idx] = int(rng.choice(others))
-            print(f"[QualityPartition][Rank {rank}] label noise {n_noisy}/{len(self.index)} "
-                  f"({label_noise_rate*100:.0f}%)")
+            if noise_type == 'dirichlet':
+                # ----------------------------------------------------------
+                # Dirichlet label noise
+                # Mỗi true class i có transition row T[i]:
+                #   T[i, i]   = 1 - noise_rate          (giữ nguyên)
+                #   T[i, j≠i] = noise_rate · w_j         (flip theo Dirichlet)
+                #   w ~ Dirichlet(alpha · 1_{K-1})
+                # alpha nhỏ → gần pair-flip; alpha lớn → gần USN
+                # ----------------------------------------------------------
+                T = _build_dirichlet_transition(num_classes, label_noise_rate,
+                                                noise_alpha, rng)
+                if rank == 0:
+                    print(f"[DirichletNoise][Rank {rank}] "
+                          f"alpha={noise_alpha:.3f}  noise_rate={label_noise_rate:.2f}")
+                    print("  Transition matrix T (rows = true class, cols = noisy class):")
+                    header = "       " + "".join(f"  c{k:<3}" for k in range(num_classes))
+                    print(header)
+                    for c in range(num_classes):
+                        row_str = "".join(f"  {T[c,k]:.3f}" for k in range(num_classes))
+                        print(f"  c{c} → {row_str}")
+
+                n_flipped = 0
+                for pos in range(len(self.index)):
+                    dataset_pos = self.index[pos]
+                    if hasattr(self.data, 'indices'):
+                        actual_idx = int(self.data.indices[dataset_pos])
+                    else:
+                        actual_idx = dataset_pos
+                    orig      = int(y_arr[actual_idx])
+                    new_label = int(rng.choice(num_classes, p=T[orig]))
+                    if new_label != orig:
+                        y_arr[actual_idx] = new_label
+                        n_flipped += 1
+                actual_rate = n_flipped / max(len(self.index), 1)
+                print(f"[DirichletNoise][Rank {rank}] "
+                      f"flipped={n_flipped}/{len(self.index)} "
+                      f"(actual {actual_rate*100:.1f}%, "
+                      f"expected ~{label_noise_rate*100:.0f}%)")
+
+            else:
+                # ----------------------------------------------------------
+                # Uniform Symmetric Noise (USN) — hành vi gốc
+                # Chọn cố định n_noisy mẫu, flip sang class ngẫu nhiên ≠ orig
+                # ----------------------------------------------------------
+                n_noisy   = int(label_noise_rate * len(self.index))
+                noisy_pos = rng.choice(len(self.index), size=n_noisy, replace=False)
+                for pos in noisy_pos:
+                    dataset_pos = self.index[pos]
+                    if hasattr(self.data, 'indices'):
+                        actual_idx = int(self.data.indices[dataset_pos])
+                    else:
+                        actual_idx = dataset_pos
+                    orig   = int(y_arr[actual_idx])
+                    others = [c for c in range(num_classes) if c != orig]
+                    y_arr[actual_idx] = int(rng.choice(others))
+                print(f"[UniformNoise][Rank {rank}] label noise {n_noisy}/{len(self.index)} "
+                      f"({label_noise_rate*100:.0f}%)")
 
     def __len__(self):
         return len(self.index)
@@ -279,26 +323,74 @@ class QualityPartition(object):
 
 
 # ------------------------------------------------------------------
-# 3. Helper: build quality profile cho từng rank
+# 3. Dirichlet noise transition matrix
+# ------------------------------------------------------------------
+def _build_dirichlet_transition(
+    num_classes: int,
+    noise_rate: float,
+    alpha: float,
+    rng: np.random.RandomState,
+) -> np.ndarray:
+    """
+    Xây dựng noise transition matrix T ∈ [0,1]^{K×K} theo phân phối Dirichlet.
+
+    Với mỗi true class i:
+        off-diagonal weights  w ~ Dirichlet(alpha · 1_{K-1})
+        T[i, j≠i] = noise_rate · w_j    (xác suất flip sang class j)
+        T[i, i]   = 1 - noise_rate       (xác suất giữ nguyên)
+
+    Tham số alpha điều chỉnh "độ tập trung" của noise:
+        alpha → 0   : gần pair-flip — gần như tất cả noise đổ vào một class
+        alpha = 1.0 : uniform trên off-diagonal simplex
+        alpha → ∞   : tiệm cận Uniform Symmetric Noise (USN)
+
+    Returns: T shape (K, K), mỗi hàng là một phân phối xác suất.
+    """
+    T = np.zeros((num_classes, num_classes), dtype=np.float64)
+    for c in range(num_classes):
+        alpha_vec        = np.ones(num_classes - 1) * alpha
+        off_diag_weights = rng.dirichlet(alpha_vec)   # shape (K-1,), sums to 1
+        j = 0
+        for k in range(num_classes):
+            if k == c:
+                T[c, k] = 1.0 - noise_rate
+            else:
+                T[c, k] = noise_rate * off_diag_weights[j]
+                j += 1
+    return T
+
+
+# ------------------------------------------------------------------
+# 4. Helper: build quality profile cho từng rank
 # ------------------------------------------------------------------
 def make_quality_profiles(
     world_size: int,
     mode: str = "uniform",
     seed: int = 0,
+    noise_type: str = "uniform",
+    noise_alpha: float = 0.1,
 ) -> list[dict]:
     """
     Trả về list[dict] dài world_size, mỗi dict chứa:
-      {noise_std, blur_radius, retain_ratio, label_noise_rate}
+      {noise_std, blur_radius, retain_ratio, label_noise_rate,
+       noise_type, noise_alpha}
 
     mode:
       "uniform"    - tất cả node có quality tốt (baseline, không corrupt)
       "tiered"     - chia 3 tier: good / medium / poor
       "random"     - sample ngẫu nhiên theo uniform distribution
+
+    noise_type: "uniform" | "dirichlet"
+    noise_alpha: tham số concentration của Dirichlet (chỉ dùng khi noise_type="dirichlet")
     """
     rng = np.random.RandomState(seed)
 
+    def _prof(**kw):
+        """Thêm noise_type / noise_alpha vào mọi profile."""
+        return dict(**kw, noise_type=noise_type, noise_alpha=noise_alpha)
+
     if mode == "uniform":
-        return [dict(noise_std=0.0, blur_radius=0, retain_ratio=1.0, label_noise_rate=0.0)
+        return [_prof(noise_std=0.0, blur_radius=0, retain_ratio=1.0, label_noise_rate=0.0)
                 for _ in range(world_size)]
 
     if mode == "tiered":
@@ -306,22 +398,21 @@ def make_quality_profiles(
         tier_size = world_size // 3
         for i in range(world_size):
             if i < tier_size:                      # Good
-                p = dict(noise_std=0.0,  blur_radius=0, retain_ratio=1.0, label_noise_rate=0.0)
+                p = _prof(noise_std=0.0,  blur_radius=0, retain_ratio=1.0, label_noise_rate=0.0)
             elif i < 2 * tier_size:                # Medium
-                p = dict(noise_std=0.08, blur_radius=1, retain_ratio=1.0, label_noise_rate=0.05)
+                p = _prof(noise_std=0.08, blur_radius=1, retain_ratio=1.0, label_noise_rate=0.05)
             else:                                  # Poor
-                p = dict(noise_std=0.20, blur_radius=2, retain_ratio=1.0, label_noise_rate=0.15)
-                                                # ↑ bỏ 0.4, đổi thành 1.0
+                p = _prof(noise_std=0.20, blur_radius=2, retain_ratio=1.0, label_noise_rate=0.15)
             profiles.append(p)
         return profiles
 
     if mode == "random":
         profiles = []
         for _ in range(world_size):
-            p = dict(
+            p = _prof(
                 noise_std        = float(rng.uniform(0.0, 0.25)),
                 blur_radius      = int(rng.choice([0, 1, 2])),
-                retain_ratio     = 1.0,                          # ← fix
+                retain_ratio     = 1.0,
                 label_noise_rate = float(rng.uniform(0.0, 0.20)),
             )
             profiles.append(p)
@@ -415,7 +506,8 @@ class DataPartitioner(object):
 
 def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size,
                         num_classes, noise_rate=0.0, noise_agents=None,
-                        quality_mode: str = "uniform", quality_profiles: list = None):
+                        quality_mode: str = "uniform", quality_profiles: list = None,
+                        noise_type: str = "uniform", noise_alpha: float = 0.1):
     """Partitioning dataset""" 
     if dataset_name== 'cifar10':
         normalize   = transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
@@ -494,7 +586,10 @@ def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size,
 
     # --- Build quality profile ---
     if quality_profiles is None:
-        quality_profiles = make_quality_profiles(size, mode=quality_mode, seed=seed)
+        quality_profiles = make_quality_profiles(
+            size, mode=quality_mode, seed=seed,
+            noise_type=noise_type, noise_alpha=noise_alpha,
+        )
     prof = quality_profiles[rank]
 
     corruption = CorruptionTransform(
@@ -503,14 +598,16 @@ def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size,
     ) if (prof["noise_std"] > 0 or prof["blur_radius"] > 0) else None
 
     partition = QualityPartition(
-        data               = raw_partition.data,
-        index              = raw_partition.index,
+        data                 = raw_partition.data,
+        index                = raw_partition.index,
         corruption_transform = corruption,
-        retain_ratio       = prof["retain_ratio"],
-        label_noise_rate   = prof["label_noise_rate"],
-        num_classes        = num_classes,
-        seed               = seed,
-        rank               = rank,
+        retain_ratio         = prof["retain_ratio"],
+        label_noise_rate     = prof["label_noise_rate"],
+        num_classes          = num_classes,
+        seed                 = seed,
+        rank                 = rank,
+        noise_type           = prof.get("noise_type", "uniform"),
+        noise_alpha          = prof.get("noise_alpha", 0.1),
     )
 
     print(f"[Rank {rank}] quality={prof}, data_size={len(partition)}")

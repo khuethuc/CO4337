@@ -10,7 +10,7 @@ from .utils import flatten_tensors, unflatten_tensors
 # EDL utility — Sensoy et al. (2018) "Evidential Deep Learning to Quantify
 # Classification Uncertainty"
 #
-# Quy trình:
+# Formulas:
 #   evidence = softplus(logits)          # e_k >= 0
 #   alpha    = evidence + 1              # Dirichlet params, α_k >= 1
 #   S        = Σ alpha_k                 # Dirichlet strength
@@ -18,66 +18,23 @@ from .utils import flatten_tensors, unflatten_tensors
 # ---------------------------------------------------------------------------
 
 def _edl_params(logits: torch.Tensor):
-    """
-    Trả về (evidence, alpha, S) theo EDL.
-    evidence = softplus(logits) >= 0
-    alpha    = evidence + 1  (Dirichlet params)
-    S        = sum(alpha, dim=1)  (Dirichlet strength)
-    """
     evidence = F.softplus(logits)              # [B, K]
     alpha    = evidence + 1.0                  # [B, K]
     S        = alpha.sum(dim=1)                # [B]
     return evidence, alpha, S
 
-
 def compute_edl_vacuity(logits: torch.Tensor) -> torch.Tensor:
     """
     EDL vacuity = K / S  ∈ (0, 1].
-    0 → model rất confident, 1 → hoàn toàn uncertain (uniform Dirichlet).
+    0 - confident
+    1 - uncertain (uniform Dirichlet)
     """
     K = logits.size(1)
     _, _, S = _edl_params(logits)
     return (K / S).clamp(0.0, 1.0)            # [B]
 
 
-def _kl_dirichlet(alpha: torch.Tensor) -> torch.Tensor:
-    """
-    KL[Dir(alpha) || Dir(1)]  — uniform Dirichlet prior.
-
-    Công thức (Sensoy et al. 2018, Appendix):
-      KL = lgamma(S) - lgamma(K)
-           - Σ_k lgamma(α_k)
-           + Σ_k (α_k - 1)(digamma(α_k) - digamma(S))
-
-    với S = Σ α_k, K = number of classes.
-    lgamma(1) = 0 nên không cần trừ Σ lgamma(1).
-    """
-    K = alpha.size(1)
-    S = alpha.sum(dim=1)                       # [B]
-
-    kl = (torch.lgamma(S)
-          - math.lgamma(K)
-          - torch.lgamma(alpha).sum(dim=1)
-          + ((alpha - 1.0) * (torch.digamma(alpha)
-             - torch.digamma(S.unsqueeze(1)))).sum(dim=1))
-    return kl                                  # [B]
-
-
-# ---------------------------------------------------------------------------
-# ENGC_sender — giữ nguyên hoàn toàn từ NGC_sender
-# Cross-gradient vẫn dùng CE loss, không thay đổi
-# Thêm: trả về neighbor model weights để trainer dùng cho KD gate
-# ---------------------------------------------------------------------------
-
 class ENGC_sender():
-    """
-    ENGC Sender (Hướng 3):
-    - Giữ nguyên logic cross-gradient từ NGC (CE loss)
-    - Thêm: lưu lại neighbor weights để trainer tính KD gate sau
-
-    Không còn trust score, không còn uncertainty per-neighbor.
-    EDL chỉ được dùng trong trainer để tạo confident mask per-sample.
-    """
 
     def __init__(self, true_model, device, num_classes: int = 10):
         self.model           = copy.deepcopy(true_model)
@@ -87,13 +44,19 @@ class ENGC_sender():
         self.device          = device
         self.num_classes     = num_classes
 
-        # Lưu neighbor weights gần nhất để trainer dùng cho KD
-        self.last_neighbor_weights = {}
         # Per-neighbor EDL vacuity on MY local data (no gradient)
         self.vacuity_scores       = {}   # rank -> float in [0, 1]
         # Per-neighbor sample weight stats (logged for diagnostics)
         self.sample_weight_stats  = {}   # rank -> {mean, frac_low}
         self._last_sample_weights = None
+
+        # Diagnostic: per-neighbor vacuity split by prediction correctness
+        # vacuity_by_pred[r] = {vac_correct, vac_wrong, frac_wrong}
+        # vac_correct: mean vacuity of neighbor r's model on samples it predicts correctly
+        # vac_wrong:   mean vacuity of neighbor r's model on samples it predicts wrongly
+        # Expected: vac_wrong > vac_correct  (uncertain when wrong)
+        self.vacuity_by_pred      = {}
+        self._last_vacuity_by_pred = {}
 
     def _update_model(self, state_dict):
         for w, p in zip(state_dict, self.model.parameters()):
@@ -101,32 +64,36 @@ class ENGC_sender():
 
     def _accumulate_gradients(self, x, targets):
         """
-        Cross-gradient với per-sample vacuity weighting.
+        Cross-gradient with per-sample vacuity weighting.
 
-        NGC dùng uniform CE loss — mọi sample trong batch được weight đều nhau,
-        kể cả sample OOD (neighbor model không biết class đó).
-
-        ENGC: down-weight sample mà neighbor model uncertain (vacuity cao):
+        ENGC: down-weight samples where neighbor model is uncertain (high vacuity):
             w_i = (1 - vacuity_i).clamp(min=0.05)
-            loss = mean(CE_i × w_i)
+            loss = mean(CE_i * w_i)
 
-        Kết quả: cross-gradient phản ánh nhiều hơn các sample mà neighbor model
-        thật sự hiểu → ít noise OOD → gradient direction clean hơn.
+        Also tracks vacuity_by_pred: split vacuity by correct vs wrong predictions
+        to verify that the uncertainty signal is meaningful.
         """
         self.model.zero_grad()
         output = self.model(x)
 
-        # Per-sample vacuity — computed without gradient (weights are constants)
         with torch.no_grad():
             vacuity = compute_edl_vacuity(output.detach())   # [B]
-            w_raw  = (1.0 - vacuity).clamp(min=0.05)         # [B], floor 0.05
+            w_raw   = (1.0 - vacuity).clamp(min=0.05)        # [B], floor 0.05
             # Normalize so mean(w_norm) = 1 → gradient magnitude ≈ NGC baseline
-            # This changes gradient DIRECTION (confident samples matter more)
-            # without shrinking gradient MAGNITUDE (which would kill cross-gradient signal)
-            w_norm = w_raw / (w_raw.mean() + 1e-8)           # [B], mean ≈ 1.0
-            self._last_sample_weights = w_raw.cpu()          # log raw for diagnostics
+            w_norm  = w_raw / (w_raw.mean() + 1e-8)          # [B], mean ≈ 1.0
+            self._last_sample_weights = w_raw.cpu()
 
-        # Direction-only reweighted CE: same magnitude as NGC, better direction
+            # --- Diagnostic: vacuity split by prediction correctness ---
+            preds        = output.detach().argmax(dim=1)
+            correct_mask = (preds == targets)
+            n_wrong      = int((~correct_mask).sum().item())
+            n_total      = len(targets)
+            self._last_vacuity_by_pred = {
+                'vac_correct': vacuity[correct_mask].mean().item()  if correct_mask.any() else float('nan'),
+                'vac_wrong':   vacuity[~correct_mask].mean().item() if n_wrong > 0        else float('nan'),
+                'frac_wrong':  n_wrong / max(n_total, 1),
+            }
+
         ce_per_sample = F.cross_entropy(output, targets, reduction='none')  # [B]
         loss = (ce_per_sample * w_norm).mean()
         loss.backward()
@@ -145,52 +112,29 @@ class ENGC_sender():
         return flatten_tensors(grad).to(self.device)
 
     def __call__(self, neighbor_weight, batch_x, targets):
-        """
-        Giống NGC_sender.__call__ hoàn toàn.
-        Thêm: lưu neighbor_weight để trainer dùng cho KD gate.
-
-        Returns:
-            output : dict[rank] -> flattened gradient
-            g      : reference gradient buffer (shapes)
-        """
-        # Lưu lại để trainer truy cập qua sender.last_neighbor_weights
-        self.last_neighbor_weights = neighbor_weight
-        self.vacuity_scores        = {}
-
+        self.vacuity_scores      = {}
         self.sample_weight_stats = {}
+        self.vacuity_by_pred     = {}
         output = {}
         g      = None
         for rank, w in neighbor_weight.items():
             self._update_model(w)
-            # Mean vacuity: computed inside _accumulate_gradients via _last_sample_weights
-            # We do a pre-pass here to store mean vacuity for per-neighbor logging
             with torch.no_grad():
                 logits = self.model(batch_x)
                 self.vacuity_scores[rank] = compute_edl_vacuity(logits).mean().item()
             g = self._accumulate_gradients(batch_x, targets)
-            # Store sample weight stats after each neighbor's gradient computation
             if self._last_sample_weights is not None:
                 sw = self._last_sample_weights
                 self.sample_weight_stats[rank] = {
                     'mean':     float(sw.mean()),
                     'frac_low': float((sw < 0.2).float().mean()),
                 }
+            self.vacuity_by_pred[rank] = self._last_vacuity_by_pred
             output[rank] = self._flatten_(g)
         return output, g
 
 
-# ---------------------------------------------------------------------------
-# ENGC_receiver — giữ nguyên hoàn toàn từ NGC_receiver
-# Gradient aggregation uniform, không thay đổi
-# ---------------------------------------------------------------------------
-
 class ENGC_receiver():
-    """
-    ENGC Receiver (Hướng 3):
-    Giữ nguyên hoàn toàn từ NGC_receiver.
-    Uniform gradient aggregation — không cần trust score nữa.
-    Cải tiến đến từ KD loss trong trainer, không phải ở đây.
-    """
 
     def __init__(
         self,
@@ -200,10 +144,10 @@ class ENGC_receiver():
         lr,
         momentum,
         qgm,
-        nesterov   = True,
+        nesterov     = True,
         weight_decay = 0,
-        neighbors  = 2,
-        alpha      = 1.0,
+        neighbors    = 2,
+        alpha        = 1.0,
     ):
         self.model        = model
         self.rank         = rank
@@ -223,40 +167,37 @@ class ENGC_receiver():
             self.momentum_buff.append(torch.zeros_like(param.data))
             self.prev_params.append(copy.deepcopy(param.data))
 
-    def _average_gradients(self, grad_list):
-        """Uniform averaging với weight π = 1/(|N|+1). Kept for reference."""
-        new_grad = torch.zeros_like(grad_list[0])
-        for g in grad_list:
-            new_grad += self.pi * g
-        return new_grad
+        # Diagnostic: weights assigned to self and each neighbor in the last step.
+        # last_neighbor_weights = {'self': pi_self, rank_r: w_r, ...}
+        # Use this to verify: noisy neighbors get lower weights than clean ones.
+        self.last_neighbor_weights = {}
 
-    def _weighted_average(self, self_grad, neighbor_grads_dict, vacuity_scores=None):
+    def _compute_weights(self, neighbor_ranks, vacuity_scores=None):
         """
-        Vacuity-adaptive averaging (Murmura-style applied to cross-gradients).
-
-        self keeps pi_self = 1/(N+1).
-        Neighbor budget = N/(N+1) is distributed proportional to trust scores:
-            trust_j = max(MIN_TRUST, 1 - vacuity_j)
-        Low vacuity → neighbor understands my distribution → higher cross-gradient weight.
-        If vacuity_scores is None → falls back to uniform (identical to NGC).
+        Compute pi_self and per-neighbor weights in one place.
+        Stores result in self.last_neighbor_weights for external logging.
+        Returns (pi_self, {rank: weight}).
         """
-        N = len(neighbor_grads_dict)
-        if N == 0:
-            return self_grad.clone()
-
+        N                 = len(neighbor_ranks)
         pi_self           = 1.0 / (N + 1)
-        pi_neighbor_total = N   / (N + 1)   # weight budget for all neighbors
+        pi_neighbor_total = N   / (N + 1)
 
         if vacuity_scores:
-            MIN_TRUST  = 0.1                # floor: no neighbor fully silenced
-            trusts     = {r: max(MIN_TRUST, 1.0 - vacuity_scores.get(r, 0.5))
-                          for r in neighbor_grads_dict}
-            total      = sum(trusts.values()) or 1.0
-            weights    = {r: (trusts[r] / total) * pi_neighbor_total for r in trusts}
+            MIN_TRUST = 0.1
+            trusts    = {r: max(MIN_TRUST, 1.0 - vacuity_scores.get(r, 0.5))
+                         for r in neighbor_ranks}
+            total     = sum(trusts.values()) or 1.0
+            weights   = {r: (trusts[r] / total) * pi_neighbor_total for r in trusts}
         else:
-            w_uniform  = pi_neighbor_total / N
-            weights    = {r: w_uniform for r in neighbor_grads_dict}
+            w_uniform = pi_neighbor_total / N
+            weights   = {r: w_uniform for r in neighbor_ranks}
 
+        self.last_neighbor_weights = {'self': pi_self, **weights}
+        return pi_self, weights
+
+    def _weighted_average(self, self_grad, neighbor_grads_dict, pi_self, weights):
+        """Apply pre-computed weights. Separated from _compute_weights so weights
+        are computed once per step, not once per parameter."""
         result = pi_self * self_grad
         for r, grad in neighbor_grads_dict.items():
             result = result + weights[r] * grad
@@ -270,28 +211,25 @@ class ENGC_receiver():
 
     def __call__(self, neighbor_grads_comm, neighbor_grads_comp, ref_buf,
                  vacuity_scores=None):
-        """
-        Vacuity-adaptive gradient aggregation.
-        vacuity_scores: dict rank -> float (từ ENGC_sender.vacuity_scores).
-        None → identical to NGC uniform averaging.
-        """
         for rank, ft in neighbor_grads_comm.items():
             neighbor_grads_comm[rank] = self._unflatten_(ft, ref_buf)
         for rank, ft in neighbor_grads_comp.items():
             neighbor_grads_comp[rank] = self._unflatten_(ft, ref_buf)
 
+        # Compute weights ONCE per step (stored in self.last_neighbor_weights)
+        pi_self, weights = self._compute_weights(
+            list(neighbor_grads_comm.keys()), vacuity_scores
+        )
+
         for name, self_params in self.model.module.named_parameters():
             if not self_params.requires_grad:
                 continue
-            self_grad = self_params.grad.data
-
+            self_grad     = self_params.grad.data
             comm_neighbor = {r: g[name] for r, g in neighbor_grads_comm.items()}
             comp_neighbor = {r: g[name] for r, g in neighbor_grads_comp.items()}
 
-            p_comm = self._weighted_average(self_grad, comm_neighbor, vacuity_scores)
-            p_comp = self._weighted_average(self_grad, comp_neighbor, vacuity_scores)
-
-            # NGC branch fusion
+            p_comm = self._weighted_average(self_grad, comm_neighbor, pi_self, weights)
+            p_comp = self._weighted_average(self_grad, comp_neighbor, pi_self, weights)
             self.proj_grads[name] = (1.0 - self.alpha) * p_comp + self.alpha * p_comm
 
     def project_gradients(self, lr):
@@ -342,13 +280,6 @@ class ENGC_receiver():
 
 def log_vacuity_stats(rank: int, step: int, vacuity_scores: dict,
                       sample_weight_stats: dict = None):
-    """
-    Log per-neighbor:
-      vac      — mean EDL vacuity of neighbor model on my data (0=confident, 1=uncertain)
-      w        — effective cross-gradient mixing weight after trust normalization
-      sw_mean  — mean per-sample weight inside cross-gradient (1-vacuity per sample)
-      sw_fl    — fraction of samples with weight < 0.2 (nearly-filtered OOD samples)
-    """
     N = len(vacuity_scores)
     if N == 0:
         return
@@ -374,199 +305,3 @@ def log_vacuity_stats(rank: int, step: int, vacuity_scores: dict,
             )
         parts.append(peer_str)
     print(f"[ENGC-Adaptive][Rank {rank}][Step {step}] " + " | ".join(parts))
-
-
-# ---------------------------------------------------------------------------
-# EDL-gated Knowledge Distillation loss
-# Theo Sensoy et al. (2018) + standard KD (Hinton et al. 2015)
-# ---------------------------------------------------------------------------
-
-class EDLGatedKDLoss(torch.nn.Module):
-    """
-    EDL-gated Knowledge Distillation Loss (Sensoy et al. 2018).
-
-    Local training loss thay CE bằng EDL:
-      L_EDL = L_NLL + annealing_coef * lambda_reg * L_KL
-
-      L_NLL(i) = ψ(S_i) - ψ(α_{i,y_i})         ← NLL dưới Dirichlet
-      L_KL     = KL[Dir(α̃) || Dir(1)]           ← regularize non-target evidence
-                 với α̃_k = y_k + (1-y_k)*α_k
-
-    KD loss chỉ áp dụng khi teacher (neighbor) confident — EDL vacuity < tau_u:
-      L_KD(j) = KL(softmax(s/T) || softmax(t/T)) * T²  [chỉ trên conf_mask]
-
-    Tổng:
-      L = L_EDL + lambda_kd * mean_j(L_KD_j)
-
-    Args:
-        num_classes   : K
-        tau_u         : EDL vacuity threshold ∈ (0,1], loại sample nếu u >= tau_u
-        temperature   : T cho KD (Hinton)
-        lambda_kd     : weight của KD loss
-        min_conf_ratio: skip KD nếu confident ratio < giá trị này
-        lambda_reg    : weight KL regularization trong EDL loss
-    """
-
-    def __init__(
-        self,
-        num_classes    : int,
-        tau_u          : float = 0.4,
-        temperature    : float = 2.0,
-        lambda_kd      : float = 0.5,
-        min_conf_ratio : float = 0.1,
-        lambda_reg     : float = 0.1,
-    ):
-        super().__init__()
-        self.K              = num_classes
-        self.tau_u          = tau_u
-        self.T              = temperature
-        self.lambda_kd      = lambda_kd
-        self.min_conf_ratio = min_conf_ratio
-        self.lambda_reg     = lambda_reg
-
-        # Logging
-        self.last_conf_ratios = {}   # rank -> float
-        self.last_kd_losses   = {}   # rank -> float
-        self.last_n_conf      = {}   # rank -> int
-        self.last_edl_loss    = 0.0
-        self.last_kl_loss     = 0.0
-
-    # ------------------------------------------------------------------
-    # EDL loss components
-    # ------------------------------------------------------------------
-
-    def edl_loss(
-        self,
-        logits         : torch.Tensor,
-        targets        : torch.Tensor,
-        annealing_coef : float = 1.0,
-    ) -> torch.Tensor:
-        """
-        EDL training loss = L_NLL + annealing_coef * lambda_reg * L_KL
-
-        L_NLL = mean[ ψ(S_i) - ψ(α_{i,y_i}) ]
-        L_KL  = mean[ KL[Dir(α̃_i) || Dir(1)] ]
-                với α̃_k = y_k + (1 - y_k) * α_k
-                (chỉ penalize evidence của các class sai)
-        """
-        _, alpha, S = _edl_params(logits)                # [B,K], [B,K], [B]
-
-        # --- NLL term: ψ(S) - ψ(α_y) ---
-        alpha_y = alpha[torch.arange(len(targets), device=logits.device), targets]
-        nll = (torch.digamma(S) - torch.digamma(alpha_y)).mean()
-
-        # --- KL term: only penalize non-target evidence ---
-        y_one_hot  = F.one_hot(targets, self.K).float()           # [B, K]
-        alpha_tilde = y_one_hot + (1.0 - y_one_hot) * alpha       # zero target evidence
-        kl = _kl_dirichlet(alpha_tilde).mean()
-
-        self.last_edl_loss = nll.item()
-        self.last_kl_loss  = kl.item()
-
-        return nll + annealing_coef * self.lambda_reg * kl
-
-    # ------------------------------------------------------------------
-    # Inference helpers
-    # ------------------------------------------------------------------
-
-    def _get_neighbor_logits(self, neighbor_model, x):
-        """Forward pass neighbor model — no gradient, restore train mode."""
-        was_training = neighbor_model.training
-        neighbor_model.eval()
-        with torch.no_grad():
-            logits = neighbor_model(x)
-        if was_training:
-            neighbor_model.train()
-        return logits
-
-    # ------------------------------------------------------------------
-    # forward
-    # ------------------------------------------------------------------
-
-    def forward(
-        self,
-        student_logits   : torch.Tensor,
-        targets          : torch.Tensor,
-        neighbor_weights : dict,
-        input_x          : torch.Tensor,
-        neighbor_model   : torch.nn.Module,
-        annealing_coef   : float = 1.0,
-        class_weights    : torch.Tensor = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            student_logits   : [B, K] logits của local model
-            targets          : [B]   ground-truth labels
-            neighbor_weights : dict  rank -> list[param tensors]
-            input_x          : [B, C, H, W] input batch
-            neighbor_model   : model dùng để load neighbor weights
-            annealing_coef   : λ_anneal ∈ [0,1], tăng dần theo epoch
-            class_weights    : unused, kept for API compatibility
-
-        Returns:
-            L_EDL + lambda_kd * mean(L_KD_j)
-        """
-        # --- Local EDL loss ---
-        total_loss = self.edl_loss(student_logits, targets, annealing_coef)
-
-        if not neighbor_weights:
-            return total_loss
-
-        kd_losses = []
-
-        for rank, w in neighbor_weights.items():
-            # Load teacher weights
-            for param_w, param_m in zip(w, neighbor_model.parameters()):
-                param_m.data.copy_(param_w.data)
-
-            # Teacher forward — no gradient
-            teacher_logits = self._get_neighbor_logits(neighbor_model, input_x)
-
-            # EDL vacuity của teacher: u = K / S ∈ (0, 1]
-            vacuity = compute_edl_vacuity(teacher_logits)          # [B]
-
-            # Gate: teacher confident (vacuity thấp) — single gate
-            # Trong non-IID cực đoan, teacher predict sai vẫn mang diversity signal hữu ích
-            # Dual gate (conf & correct) loại bỏ cross-class knowledge transfer
-            conf_mask  = vacuity < self.tau_u                      # [B]
-            n_conf     = conf_mask.sum().item()
-            conf_ratio = n_conf / max(len(conf_mask), 1)
-
-            self.last_conf_ratios[rank] = conf_ratio
-            self.last_n_conf[rank]      = n_conf
-
-            if conf_ratio < self.min_conf_ratio or n_conf == 0:
-                self.last_kd_losses[rank] = 0.0
-                continue
-
-            # KD loss (Hinton 2015) chỉ trên confident samples
-            s_soft  = F.log_softmax(student_logits[conf_mask] / self.T, dim=1)
-            t_soft  = F.softmax(teacher_logits[conf_mask]     / self.T, dim=1)
-            kd_loss = F.kl_div(s_soft, t_soft.detach(), reduction='batchmean') * (self.T ** 2)
-
-            kd_losses.append(kd_loss)
-            self.last_kd_losses[rank] = kd_loss.item()
-
-        if kd_losses:
-            total_loss = total_loss + self.lambda_kd * torch.stack(kd_losses).mean()
-
-        return total_loss
-
-    # ------------------------------------------------------------------
-    # Logging
-    # ------------------------------------------------------------------
-
-    def log_stats(self, rank: int, step: int):
-        if not self.last_conf_ratios:
-            return
-        parts = [f"edl_nll={self.last_edl_loss:.6f}"]
-        if self.lambda_reg > 0:
-            parts.append(f"kl_reg={self.last_kl_loss:.6f}(x{self.lambda_reg})")
-        for r in sorted(self.last_conf_ratios):
-            parts.append(
-                f"peer{r}: gate={self.last_conf_ratios[r]:.2f} "
-                f"n={self.last_n_conf.get(r, 0)} "
-                f"kd_raw={self.last_kd_losses.get(r, 0.0):.6f} "
-                f"kd_weighted={self.last_kd_losses.get(r, 0.0) * self.lambda_kd:.6f}"
-            )
-        print(f"[ENGC-KD][Rank {rank}][Step {step}] " + " | ".join(parts))
