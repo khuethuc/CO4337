@@ -592,6 +592,10 @@ def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size,
         )
     prof = quality_profiles[rank]
 
+    # Override label_noise_rate from CLI --noise-rate (0.0 = use profile default)
+    if noise_rate > 0.0:
+        prof = dict(prof, label_noise_rate=noise_rate)
+
     corruption = CorruptionTransform(
         noise_std  = prof["noise_std"],
         blur_radius= prof["blur_radius"],

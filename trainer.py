@@ -1,3 +1,6 @@
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
+
 import argparse
 import os
 import shutil
@@ -99,6 +102,24 @@ parser.add_argument('--ngc-min-peer-weight', dest='ngc_min_peer_weight', default
 parser.add_argument('--use-edl', dest='use_edl', action='store_true',
                     help='enable vacuity-adaptive cross-gradient weighting (ENGC)')
 
+# --- MURMURA args ---
+parser.add_argument('--murmura-self-weight', dest='murmura_self_weight', default=0.5, type=float,
+                    help='MURMURA: weight for own model in aggregation (0=full neighbor, 1=no aggregation)')
+parser.add_argument('--murmura-vacuity-threshold', dest='murmura_vacuity_threshold', default=0.5, type=float,
+                    help='MURMURA: vacuity above this incurs exponential trust penalty')
+parser.add_argument('--murmura-accuracy-weight', dest='murmura_accuracy_weight', default=0.5, type=float,
+                    help='MURMURA: weight of accuracy vs baseline in trust score')
+parser.add_argument('--murmura-trust-threshold', dest='murmura_trust_threshold', default=0.1, type=float,
+                    help='MURMURA: minimum trust to accept a neighbor')
+parser.add_argument('--murmura-trust-momentum', dest='murmura_trust_momentum', default=0.7, type=float,
+                    help='MURMURA: EMA momentum for trust score smoothing')
+parser.add_argument('--murmura-tightening-gamma', dest='murmura_tightening_gamma', default=0.5, type=float,
+                    help='MURMURA: initial leniency factor for threshold tightening')
+parser.add_argument('--murmura-tightening-kappa', dest='murmura_tightening_kappa', default=1.0, type=float,
+                    help='MURMURA: tightening rate (higher = faster tightening)')
+parser.add_argument('--murmura-max-eval', dest='murmura_max_eval', default=100, type=int,
+                    help='MURMURA: max samples per neighbor for trust evaluation')
+
 # --- Data quality / noise args ---
 parser.add_argument('--noise-rate', dest='noise_rate', default=0.0, type=float,
                     help='label noise rate for designated agents (0.0 = no noise)')
@@ -194,6 +215,7 @@ def run(rank, size):
         args.dataset, args.data_dir, args.skew, args.seed, args.batch_size,
         args.classes,
         quality_mode=args.quality_mode,
+        noise_rate=args.noise_rate,
         noise_type=args.noise_type,
         noise_alpha=args.noise_alpha,
     )
@@ -237,7 +259,16 @@ def run(rank, size):
             num_classes=args.classes,
         )
     elif args.optimizer.lower() == 'adaptive_ngc':
-        sender = AdaptiveNGC_sender(base_model, device)
+        sender = Adaptive_NGC_sender(base_model, device)
+    elif args.optimizer.lower() == 'murmura':
+        sender = MURMURA_sender(
+            base_model, device,
+            num_classes=args.classes,
+            vacuity_threshold=args.murmura_vacuity_threshold,
+            accuracy_weight=args.murmura_accuracy_weight,
+            trust_momentum=args.murmura_trust_momentum,
+            max_eval_samples=args.murmura_max_eval,
+        )
     else:
         sender = None
 
@@ -299,7 +330,7 @@ def run(rank, size):
             alpha=args.alpha,
         )
     elif args.optimizer.lower() == 'adaptive_ngc':
-        receiver = AdaptiveNGC_receiver(
+        receiver = Adaptive_NGC_receiver(
             model,
             device,
             rank,
@@ -310,6 +341,18 @@ def run(rank, size):
             weight_decay=args.weight_decay,
             neighbors=args.neighbors,
             alpha=args.alpha,
+        )
+    elif args.optimizer.lower() == 'murmura':
+        receiver = MURMURA_receiver(
+            model, device, rank,
+            args.lr, args.momentum, args.qgm, args.nesterov,
+            weight_decay=args.weight_decay,
+            neighbors=args.neighbors,
+            self_weight=args.murmura_self_weight,
+            trust_threshold=args.murmura_trust_threshold,
+            tightening_gamma=args.murmura_tightening_gamma,
+            tightening_kappa=args.murmura_tightening_kappa,
+            total_rounds=args.epochs,
         )
     else:
         receiver = DSGD_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay)
@@ -382,6 +425,17 @@ def run(rank, size):
 
         val_acc_list.append(float(prec1))
         val_loss_list.append(float(loss))
+
+        if rank == 0:
+            t_loss = train_loss_list[-1]
+            v_loss = val_loss_list[-1]
+            t_acc  = train_acc_list[-1]
+            gap    = v_loss - t_loss
+            print(
+                f"[Loss][Epoch {epoch:>3}] "
+                f"Train={t_loss:.4f}  Val={v_loss:.4f}  "
+                f"Gap={gap:+.4f}  TrainAcc={t_acc:.2f}%  ValAcc={prec1:.2f}%"
+            )
 
     average_parameters(model)
     print('Final test accuracy')
@@ -620,6 +674,45 @@ def train(
             global_steps += 1
 
         # ----------------------------------------------------------------
+        # MURMURA — model averaging, no cross-gradient transfer
+        # ----------------------------------------------------------------
+        elif args.optimizer.lower() == 'murmura':
+            output = model(input_var)
+            loss   = criterion(output, target_var)
+
+            all_outputs.append(output.detach().cpu())
+            all_targets.append(target.detach().cpu())
+
+            loss.backward()
+
+            # Trust scores from neighbor model eval (no 2nd comm round)
+            trust_scores = sender(cross_weights, input_var, target_var)
+            receiver.prepare(cross_weights, trust_scores,
+                             step=epoch + 1e-3 * i)
+            receiver.project_gradients(lr)   # no-op
+
+            if i % args.print_freq == 0:
+                noise_ranks = set(
+                    int(x) for x in args.noise_agents.split(',') if x.strip()
+                ) if args.noise_agents else set()
+                parts = [f"tau={receiver.last_threshold:.3f}"]
+                for r in sorted(trust_scores):
+                    tag = '[N]' if r in noise_ranks else '[c]'
+                    parts.append(
+                        f"peer{r}{tag} "
+                        f"trust={trust_scores[r]:.3f} "
+                        f"vac={sender.last_vacuities.get(r, float('nan')):.3f} "
+                        f"acc={sender.last_accuracies.get(r, float('nan')):.3f}"
+                    )
+                print(
+                    f"[MURMURA-Diag][Rank {dist.get_rank()}]"
+                    f"[Ep {epoch}][{i}/{len(train_loader)}] "
+                    + " | ".join(parts)
+                )
+
+            global_steps += 1
+
+        # ----------------------------------------------------------------
         # NGC, CGA, và các optimizer khác — giữ nguyên hoàn toàn
         # ----------------------------------------------------------------
         else:
@@ -649,6 +742,10 @@ def train(
         # ----------------------------------------------------------------
         optimizer.step()
         optimizer.zero_grad()
+
+        # MURMURA: model averaging happens AFTER local gradient update
+        if args.optimizer.lower() == 'murmura':
+            receiver.post_step_aggregate()
 
         output = output.float()
         loss   = loss.float()
@@ -1073,3 +1170,18 @@ if __name__ == '__main__':
               f"{excel_data['data transferred'][i]:>8.4f} "
               f"{excel_data['comm_pkgs_total'][i]:>7}")
     print("=" * 72 + "\n")
+
+    # --- Loss curve (rank 0 only) ---
+    r0_train = excel_data["train_loss_list"][0]
+    r0_val   = excel_data["val_loss_list"][0]
+    if r0_train and r0_val:
+        print("=" * 72)
+        print(f"  LOSS CURVE  [Rank 0 — {args.optimizer.upper()}]")
+        print("=" * 72)
+        print(f"  {'Epoch':>6}  {'TrainLoss':>10}  {'ValLoss':>10}  {'Gap(V-T)':>10}  {'Overfit?':>9}")
+        print("  " + "-" * 60)
+        for ep, (tl, vl) in enumerate(zip(r0_train, r0_val)):
+            gap      = vl - tl
+            overfit  = "YES" if gap > 0.1 else ""
+            print(f"  {ep:>6}  {tl:>10.4f}  {vl:>10.4f}  {gap:>+10.4f}  {overfit:>9}")
+        print("=" * 72 + "\n")
