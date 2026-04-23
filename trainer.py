@@ -101,6 +101,10 @@ parser.add_argument('--ngc-min-peer-weight', dest='ngc_min_peer_weight', default
 # --- EDL / vacuity args (ENGC) ---
 parser.add_argument('--use-edl', dest='use_edl', action='store_true',
                     help='enable vacuity-adaptive cross-gradient weighting (ENGC)')
+parser.add_argument('--edl-main', dest='edl_main', action='store_true',
+                    help='use EDL loss for main local training (not just cross-gradients)')
+parser.add_argument('--edl-lambda', dest='edl_lambda', default=1.0, type=float,
+                    help='KL weight lambda in EDL loss (applies to both main and cross-gradient loss)')
 
 # --- MURMURA args ---
 parser.add_argument('--murmura-self-weight', dest='murmura_self_weight', default=0.5, type=float,
@@ -257,6 +261,7 @@ def run(rank, size):
             base_model,
             device,
             num_classes=args.classes,
+            edl_lambda=args.edl_lambda,
         )
     elif args.optimizer.lower() == 'adaptive_ngc':
         sender = Adaptive_NGC_sender(base_model, device)
@@ -614,7 +619,11 @@ def train(
             output = model(input_var)
             cross_grad, ref_buf = sender(cross_weights, input_var, target_var)
 
-            loss = criterion(output, target_var)
+            if args.edl_main:
+                loss = edl_loss(output, target_var, args.classes,
+                                lambda_kl=args.edl_lambda)
+            else:
+                loss = criterion(output, target_var)
 
             all_outputs.append(output.detach().cpu())
             all_targets.append(target.detach().cpu())
@@ -631,8 +640,7 @@ def train(
             vacuity_scores = sender.vacuity_scores if args.use_edl else None
             if vacuity_scores and i % args.print_freq == 0:
                 from optimizers.engc import log_vacuity_stats
-                log_vacuity_stats(dist.get_rank(), global_steps, vacuity_scores,
-                                  getattr(sender, 'sample_weight_stats', None))
+                log_vacuity_stats(dist.get_rank(), global_steps, vacuity_scores)
 
             receiver(received_cross_grad, cross_grad_copy, ref_buf,
                      vacuity_scores=vacuity_scores)
@@ -867,18 +875,46 @@ def validate(val_loader, model, criterion, batch_size, device, epoch=0):
 
     prec, rec, f1 = precision_recall_f1(all_outputs, all_targets, num_classes=args.classes)
 
+    ece = compute_ece(all_outputs, all_targets)
+
+    mean_vacuity = float('nan')
+    if args.optimizer.lower() == 'engc':
+        mean_vacuity = compute_edl_vacuity(all_outputs).mean().item()
+
     if dist.get_rank() == 0:
+        vac_str = f"  Vacuity = {mean_vacuity:.4f}" if not math.isnan(mean_vacuity) else ""
         print(
             f"[Val][Epoch {epoch}] "
             f"Precision = {prec:.2f}  "
             f"Recall = {rec:.2f}  "
             f"F1 = {f1:.2f}  "
+            f"ECE = {ece:.4f}"
+            f"{vac_str}"
         )
 
     return top1.avg, losses.avg
 
 
 # # # Helper functions # # #
+def compute_ece(logits: torch.Tensor, labels: torch.Tensor, n_bins: int = 15) -> float:
+    """Expected Calibration Error — measures gap between confidence and accuracy.
+    Lower is better. Perfect calibration = 0."""
+    probs = torch.softmax(logits, dim=1)
+    confidences, predictions = probs.max(dim=1)
+    correct = predictions.eq(labels).float()
+    ece = 0.0
+    bin_edges = torch.linspace(0.0, 1.0, n_bins + 1)
+    for i in range(n_bins):
+        lo, hi = bin_edges[i].item(), bin_edges[i + 1].item()
+        in_bin = (confidences > lo) & (confidences <= hi)
+        prop = in_bin.float().mean().item()
+        if prop > 0:
+            acc  = correct[in_bin].mean().item()
+            conf = confidences[in_bin].mean().item()
+            ece += prop * abs(conf - acc)
+    return ece
+
+
 class AverageMeter(object):
     """Computes and stores the average and current value"""
     def __init__(self):

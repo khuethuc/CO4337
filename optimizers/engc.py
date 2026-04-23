@@ -34,28 +34,68 @@ def compute_edl_vacuity(logits: torch.Tensor) -> torch.Tensor:
     return (K / S).clamp(0.0, 1.0)            # [B]
 
 
+def edl_loss(logits: torch.Tensor, targets: torch.Tensor,
+             num_classes: int, lambda_kl: float = 1.0) -> torch.Tensor:
+    """
+    EDL loss — Sensoy et al. (2018) Eq. 5:
+
+        L = L_NLL + lambda_kl * L_KL
+
+    L_NLL = E_{p~Dir(α)}[-log p(y|p)]
+          = Σ_k y_k * (ψ(S) - ψ(α_k))          digamma-based NLL
+
+    L_KL  = KL(Dir(α̃) || Dir(1,...,1))
+    α̃_k  = y_k + (1 - y_k) * α_k               zero out true-class evidence
+                                                  before penalizing wrong-class confidence
+
+    Properties guaranteed by this loss (unlike weighted-CE):
+      - KL term forces evidence → 0 for wrong classes when prediction is wrong
+      - Model learns to express high vacuity when uncertain, not just when loss is high
+    """
+    evidence, alpha, S = _edl_params(logits)                        # [B,K], [B,K], [B]
+    y = F.one_hot(targets, num_classes=num_classes).float()         # [B,K]
+
+    # NLL term: Σ_k y_k * (ψ(S) - ψ(α_k))
+    l_nll = (y * (torch.digamma(S.unsqueeze(1).expand_as(alpha))
+                  - torch.digamma(alpha))).sum(dim=1)               # [B]
+
+    # KL regularizer
+    alpha_tilde = y + (1.0 - y) * alpha                            # [B,K]
+    S_tilde     = alpha_tilde.sum(dim=1)                           # [B]
+    lgamma_K    = torch.lgamma(
+        torch.tensor(float(num_classes), device=logits.device)
+    )
+    l_kl = (
+        torch.lgamma(S_tilde)
+        - lgamma_K
+        - torch.lgamma(alpha_tilde).sum(dim=1)
+        + ((alpha_tilde - 1.0) * (
+            torch.digamma(alpha_tilde)
+            - torch.digamma(S_tilde.unsqueeze(1).expand_as(alpha_tilde))
+        )).sum(dim=1)
+    )                                                               # [B]
+
+    return (l_nll + lambda_kl * l_kl).mean()
+
+
 class ENGC_sender():
 
-    def __init__(self, true_model, device, num_classes: int = 10):
+    def __init__(self, true_model, device, num_classes: int = 10,
+                 edl_lambda: float = 1.0):
         self.model           = copy.deepcopy(true_model)
         self.model.train()
         self.model           = self.model.to(device)
         self.gradient_buffer = {}
         self.device          = device
         self.num_classes     = num_classes
+        self.edl_lambda      = edl_lambda   # KL weight λ in EDL loss
 
         # Per-neighbor EDL vacuity on MY local data (no gradient)
         self.vacuity_scores       = {}   # rank -> float in [0, 1]
-        # Per-neighbor sample weight stats (logged for diagnostics)
-        self.sample_weight_stats  = {}   # rank -> {mean, frac_low}
-        self._last_sample_weights = None
 
         # Diagnostic: per-neighbor vacuity split by prediction correctness
-        # vacuity_by_pred[r] = {vac_correct, vac_wrong, frac_wrong}
-        # vac_correct: mean vacuity of neighbor r's model on samples it predicts correctly
-        # vac_wrong:   mean vacuity of neighbor r's model on samples it predicts wrongly
-        # Expected: vac_wrong > vac_correct  (uncertain when wrong)
-        self.vacuity_by_pred      = {}
+        # vac_wrong > vac_correct confirms EDL calibration is working
+        self.vacuity_by_pred       = {}
         self._last_vacuity_by_pred = {}
 
     def _update_model(self, state_dict):
@@ -64,26 +104,21 @@ class ENGC_sender():
 
     def _accumulate_gradients(self, x, targets):
         """
-        Cross-gradient with per-sample vacuity weighting.
+        Cross-gradient using proper EDL loss (Sensoy et al. 2018):
 
-        ENGC: down-weight samples where neighbor model is uncertain (high vacuity):
-            w_i = (1 - vacuity_i).clamp(min=0.05)
-            loss = mean(CE_i * w_i)
+            L = L_NLL + lambda_kl * L_KL
 
-        Also tracks vacuity_by_pred: split vacuity by correct vs wrong predictions
-        to verify that the uncertainty signal is meaningful.
+        Unlike the previous weighted-CE approach, the KL term directly penalizes
+        the model for assigning evidence to wrong classes — guaranteeing that
+        vac_wrong > vac_correct when the loss is working correctly.
         """
         self.model.zero_grad()
         output = self.model(x)
 
         with torch.no_grad():
             vacuity = compute_edl_vacuity(output.detach())   # [B]
-            w_raw   = (1.0 - vacuity).clamp(min=0.05)        # [B], floor 0.05
-            # Normalize so mean(w_norm) = 1 → gradient magnitude ≈ NGC baseline
-            w_norm  = w_raw / (w_raw.mean() + 1e-8)          # [B], mean ≈ 1.0
-            self._last_sample_weights = w_raw.cpu()
 
-            # --- Diagnostic: vacuity split by prediction correctness ---
+            # Diagnostic: confirm KL term is calibrating vacuity correctly
             preds        = output.detach().argmax(dim=1)
             correct_mask = (preds == targets)
             n_wrong      = int((~correct_mask).sum().item())
@@ -94,8 +129,7 @@ class ENGC_sender():
                 'frac_wrong':  n_wrong / max(n_total, 1),
             }
 
-        ce_per_sample = F.cross_entropy(output, targets, reduction='none')  # [B]
-        loss = (ce_per_sample * w_norm).mean()
+        loss = edl_loss(output, targets, self.num_classes, lambda_kl=self.edl_lambda)
         loss.backward()
 
         self._clear_gradient_buffer()
@@ -112,9 +146,8 @@ class ENGC_sender():
         return flatten_tensors(grad).to(self.device)
 
     def __call__(self, neighbor_weight, batch_x, targets):
-        self.vacuity_scores      = {}
-        self.sample_weight_stats = {}
-        self.vacuity_by_pred     = {}
+        self.vacuity_scores  = {}
+        self.vacuity_by_pred = {}
         output = {}
         g      = None
         for rank, w in neighbor_weight.items():
@@ -123,12 +156,6 @@ class ENGC_sender():
                 logits = self.model(batch_x)
                 self.vacuity_scores[rank] = compute_edl_vacuity(logits).mean().item()
             g = self._accumulate_gradients(batch_x, targets)
-            if self._last_sample_weights is not None:
-                sw = self._last_sample_weights
-                self.sample_weight_stats[rank] = {
-                    'mean':     float(sw.mean()),
-                    'frac_low': float((sw < 0.2).float().mean()),
-                }
             self.vacuity_by_pred[rank] = self._last_vacuity_by_pred
             output[rank] = self._flatten_(g)
         return output, g
@@ -278,8 +305,7 @@ class ENGC_receiver():
 # Vacuity logging helper (used by trainer)
 # ---------------------------------------------------------------------------
 
-def log_vacuity_stats(rank: int, step: int, vacuity_scores: dict,
-                      sample_weight_stats: dict = None):
+def log_vacuity_stats(rank: int, step: int, vacuity_scores: dict):
     N = len(vacuity_scores)
     if N == 0:
         return
@@ -293,15 +319,7 @@ def log_vacuity_stats(rank: int, step: int, vacuity_scores: dict,
 
     parts = [f"pi_self={pi_self:.3f}"]
     for r in sorted(vacuity_scores):
-        sw = (sample_weight_stats or {}).get(r, {})
-        peer_str = (
-            f"peer{r}: vac={vacuity_scores[r]:.3f} "
-            f"w={weights.get(r, 0):.3f}"
+        parts.append(
+            f"peer{r}: vac={vacuity_scores[r]:.3f} w={weights.get(r, 0):.3f}"
         )
-        if sw:
-            peer_str += (
-                f" sw_mean={sw.get('mean', 0):.2f}"
-                f" sw_fl={sw.get('frac_low', 0):.2f}"
-            )
-        parts.append(peer_str)
     print(f"[ENGC-Adaptive][Rank {rank}][Step {step}] " + " | ".join(parts))

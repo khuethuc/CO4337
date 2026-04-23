@@ -5,5 +5,5 @@ from .compressngc import *
 from .dsgd import *
 from .topkngc import *
 from .engc import *
-from .adaptive_ngc import NGC_sender as AdaptiveNGC_sender, NGC_receiver as AdaptiveNGC_receiver
+from .adaptive_ngc import Adaptive_NGC_sender, Adaptive_NGC_receiver
 from .murmura import MURMURA_sender, MURMURA_receiver
