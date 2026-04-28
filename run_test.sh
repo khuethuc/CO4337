@@ -1,13 +1,19 @@
 python trainer.py \
   --data-dir ../data/ham10000 --dataset ham10000 --classes 7 \
-  --lr 0.01 --batch-size 160 \ 
+  --lr 0.01 --batch-size 160 \
   --world_size 5 --skew 1 \
   --gamma 0.1 --normtype evonorm \
-  --epochs 50 \ 
+  --epochs 50 \
+  --optimizer engc \
   --arch cganet \
-  --momentum 0.9 \ 
+  --momentum 0.9 \
   --graph ring \
   --neighbors 2 \
   --nesterov \
-  --quality-mode tiered --noise-rate 0.15 \
-  --use-edl --edl-main --edl-lambda 1.0
+  --quality-mode tiered \
+  --noise-agents 2,3,4 \
+  --noise-rate 0.2 \
+  --weight_decay 1e-4 \
+  --steplr \
+  --edl-main --edl-lambda 1.0 \
+  --use-edl

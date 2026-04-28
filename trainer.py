@@ -105,6 +105,8 @@ parser.add_argument('--edl-main', dest='edl_main', action='store_true',
                     help='use EDL loss for main local training (not just cross-gradients)')
 parser.add_argument('--edl-lambda', dest='edl_lambda', default=1.0, type=float,
                     help='KL weight lambda in EDL loss (applies to both main and cross-gradient loss)')
+parser.add_argument('--edl-aux-weight', dest='edl_aux_weight', default=0.0, type=float,
+                    help='weight for auxiliary EDL loss added to CE: loss = CE + w * EDL')
 
 # --- MURMURA args ---
 parser.add_argument('--murmura-self-weight', dest='murmura_self_weight', default=0.5, type=float,
@@ -183,12 +185,8 @@ def run(rank, size):
     comm_pkgs_list   = []   # total comm packages per epoch
 
     # ENGC per-epoch diagnostic tracking (empty for non-ENGC optimizers)
-    # engc_trust_list[ep][r]   = mean weight assigned to neighbor r in epoch ep
-    # engc_vac_c_list[ep][r]   = mean vacuity of peer r's model when it predicts CORRECTLY
-    # engc_vac_w_list[ep][r]   = mean vacuity of peer r's model when it predicts WRONGLY
-    engc_trust_list  = []
-    engc_vac_c_list  = []
-    engc_vac_w_list  = []
+    # engc_trust_list[ep][r] = mean weight assigned to neighbor r in epoch ep
+    engc_trust_list = []
 
     # --- Build base model ---
     if args.arch.lower() == 'resnet':
@@ -413,9 +411,7 @@ def run(rank, size):
         )
 
         # ENGC per-epoch diagnostics
-        engc_trust_list.append(m.get("engc_trust",       {}))
-        engc_vac_c_list.append(m.get("engc_vac_correct", {}))
-        engc_vac_w_list.append(m.get("engc_vac_wrong",   {}))
+        engc_trust_list.append(m.get("engc_trust", {}))
 
         lr_scheduler.step()
 
@@ -478,21 +474,32 @@ def run(rank, size):
             print(row)
         print("=" * W)
 
-        # --- Table 2: epoch-mean vacuity correct vs wrong per neighbor ---
-        print(f"\n  Vacuity correct (↓) vs wrong (↑) — confirms uncertainty signal quality")
-        hdr2 = f"  {'Epoch':>5}"
+        print("=" * W)
+
+        # --- Table 3: per-epoch trust scores with checklist ---
+        # PASS: noisy peers [N] have lower final weight than clean peers [c]
+        # FAIL: weights flat / noisy peers not downweighted
+        print(f"\n  Trust score evolution — noisy peers [N] should trend lower than [c]")
+        hdr3 = f"  {'Epoch':>5}  {'self':>6}"
         for r in all_nbr_ranks:
             tag = '[N]' if r in noise_ranks else '[c]'
-            hdr2 += f"  p{r}{tag}vac_ok  p{r}{tag}vac_err"
-        print(hdr2)
+            hdr3 += f"  peer{r}{tag}"
+        print(hdr3)
         print("  " + "-" * (W - 2))
-        for ep, (ep_vc, ep_vw) in enumerate(zip(engc_vac_c_list, engc_vac_w_list)):
-            row = f"  {ep+1:>5}"
+        for ep, ep_trust in enumerate(engc_trust_list):
+            row = f"  {ep+1:>5}  {ep_trust.get('self', float('nan')):>6.3f}"
             for r in all_nbr_ranks:
-                vc = ep_vc.get(r, float('nan'))
-                vw = ep_vw.get(r, float('nan'))
-                row += f"  {vc:>12.3f}  {vw:>11.3f}"
+                row += f"  {ep_trust.get(r, float('nan')):>8.3f}"
             print(row)
+
+        # Summary: compare mean weight of noisy vs clean peers over last 10 epochs
+        if noise_ranks and len(engc_trust_list) >= 2:
+            window = engc_trust_list[-10:]
+            clean_ranks = [r for r in all_nbr_ranks if r not in noise_ranks]
+            for r in all_nbr_ranks:
+                mean_w = sum(ep.get(r, 0.0) for ep in window) / len(window)
+                tag = '[N]' if r in noise_ranks else '[c]'
+                print(f"  Mean weight last {len(window)} ep — peer{r}{tag}: {mean_w:.4f}")
         print("=" * W + "\n")
 
     total_comm_gb   = data_transferred / 1.0e9
@@ -587,9 +594,7 @@ def train(
 
     # ENGC per-batch diagnostic accumulators (empty for non-ENGC)
     # Keys are neighbor ranks (int); 'self' for own weight
-    _engc_vac_correct = {}   # {rank -> [float]}  vacuity when peer predicts correctly
-    _engc_vac_wrong   = {}   # {rank -> [float]}  vacuity when peer predicts wrongly
-    _engc_trust       = {}   # {rank/'self' -> [float]}  weight assigned each step
+    _engc_trust = {}   # {rank/'self' -> [float]}  weight assigned each step
 
     end   = time.time()
     step  = len(train_loader) * batch_size * epoch
@@ -617,11 +622,28 @@ def train(
         # ----------------------------------------------------------------
         if args.optimizer.lower() == 'engc':
             output = model(input_var)
-            cross_grad, ref_buf = sender(cross_weights, input_var, target_var)
+
+            # Per-sample loss of local model B on D_B.
+            # Passed to sender so it can compute epistemic gap
+            # U_epi(x_i) = max(0, loss_A(x_i) - loss_B(x_i)) per sample.
+            with torch.no_grad():
+                loss_b_per_sample = edl_loss(
+                    output.detach(), target_var, args.classes,
+                    lambda_kl=args.edl_lambda, return_per_sample=True,
+                )
+
+            cross_grad, ref_buf = sender(
+                cross_weights, input_var, target_var,
+                loss_b_per_sample=loss_b_per_sample,
+            )
 
             if args.edl_main:
                 loss = edl_loss(output, target_var, args.classes,
                                 lambda_kl=args.edl_lambda)
+            elif args.edl_aux_weight > 0.0:
+                loss = criterion(output, target_var) + args.edl_aux_weight * edl_loss(
+                    output, target_var, args.classes, lambda_kl=args.edl_lambda
+                )
             else:
                 loss = criterion(output, target_var)
 
@@ -636,48 +658,70 @@ def train(
             payload_bytes_from_calls       += amt_data_transfer
             data_transferred               += amt_data_transfer
 
-            # Vacuity-adaptive aggregation (use_edl=True) vs uniform (False)
-            vacuity_scores = sender.vacuity_scores if args.use_edl else None
+            # U_epi_scores: per-neighbor epistemic gap computed in sender.
+            # aleatoric_scores: extracted from received gradient scalars inside receiver.
+            U_epi_scores   = sender.U_epi_scores   if args.use_edl else None
+            vacuity_scores = sender.vacuity_scores  if args.use_edl else None
+            loss_scores    = sender.loss_scores     if args.use_edl else None
+            acc_scores     = sender.acc_scores      if args.use_edl else None
+
             if vacuity_scores and i % args.print_freq == 0:
                 from optimizers.engc import log_vacuity_stats
                 log_vacuity_stats(dist.get_rank(), global_steps, vacuity_scores)
 
             receiver(received_cross_grad, cross_grad_copy, ref_buf,
-                     vacuity_scores=vacuity_scores)
+                     U_epi_scores=U_epi_scores,
+                     vacuity_scores=vacuity_scores, loss_scores=loss_scores,
+                     acc_scores=acc_scores)
             receiver.project_gradients(lr)
 
             # --- Accumulate ENGC diagnostics ---
-            for r, s in sender.vacuity_by_pred.items():
-                vc = s['vac_correct']
-                vw = s['vac_wrong']
-                if vc == vc:   # not NaN
-                    _engc_vac_correct.setdefault(r, []).append(vc)
-                if vw == vw:   # not NaN
-                    _engc_vac_wrong.setdefault(r, []).append(vw)
             for r, w in receiver.last_neighbor_weights.items():
                 _engc_trust.setdefault(r, []).append(w)
 
             # --- Periodic diagnostic print ---
-            if i % args.print_freq == 0 and sender.vacuity_by_pred:
+            if i % args.print_freq == 0 and sender.U_epi_scores:
                 noise_ranks = set(
                     int(x) for x in args.noise_agents.split(',') if x.strip()
                 ) if args.noise_agents else set()
-                parts = []
-                for r in sorted(sender.vacuity_by_pred):
-                    s   = sender.vacuity_by_pred[r]
-                    tag = '[N]' if r in noise_ranks else '[c]'
-                    tw  = receiver.last_neighbor_weights.get(r, float('nan'))
-                    parts.append(
-                        f"peer{r}{tag} "
-                        f"vac_ok={s['vac_correct']:.3f} "
-                        f"vac_err={s['vac_wrong']:.3f} "
-                        f"trust={tw:.3f}"
-                    )
-                print(
+
+                header = (
                     f"[ENGC-Diag][Rank {dist.get_rank()}]"
-                    f"[Ep {epoch}][{i}/{len(train_loader)}] "
-                    + " | ".join(parts)
+                    f"[Ep {epoch}][{i}/{len(train_loader)}]"
                 )
+
+                # ── Per-neighbor table ──────────────────────────────────────
+                # Columns: U_epi | U_ale | raw_trust | final_weight
+                #          sw_mean | sw_frac_low | vac_ok | vac_err
+                # Red flags:
+                #   U_epi ≈ 0 for all  → loss comparison not firing
+                #   U_ale same for all → aleatoric scalar not varying
+                #   vac_err ≤ vac_ok   → EDL not calibrated
+                #   sw_frac_low ≈ 0   → no samples being downweighted
+                print(header)
+                # Columns: U_epi | U_ale | raw_trust | final_weight | sw_mean | sw_frac_low
+                # Red flags:
+                #   U_epi ≈ 0 for all   → loss comparison not firing (models too similar?)
+                #   U_ale same for all  → aleatoric scalar not varying across neighbors
+                #   sw_frac_low ≈ 0    → per-sample filter not downweighting anything
+                #   noisy [N] w ≈ [c] w → trust not discriminating
+                fmt = (
+                    "  {tag:<8} U_epi={uepi:>6.3f}  U_ale={ale:>6.3f}"
+                    "  trust={tr:>6.3f}  w={tw:>6.3f}"
+                    "  sw_mean={swm:>5.3f}  sw_frac_low={swf:>5.3f}"
+                )
+                for r in sorted(sender.U_epi_scores):
+                    tag = f"peer{r}{'[N]' if r in noise_ranks else '[c]'}"
+                    sw  = sender.sample_weight_stats.get(r, {})
+                    print(fmt.format(
+                        tag  = tag,
+                        uepi = sender.U_epi_scores.get(r, float('nan')),
+                        ale  = receiver.last_aleatoric_scores.get(r, float('nan')),
+                        tr   = receiver.last_trust_scores.get(r, float('nan')),
+                        tw   = receiver.last_neighbor_weights.get(r, float('nan')),
+                        swm  = sw.get('mean',     float('nan')),
+                        swf  = sw.get('frac_low', float('nan')),
+                    ))
 
             global_steps += 1
 
@@ -817,10 +861,8 @@ def train(
         "comm_calls_transfer_params":     comm_calls_transfer_params,
         "comm_calls_transfer_additional": comm_calls_transfer_additional,
         "payload_bytes_from_calls":       int(payload_bytes_from_calls),
-        # ENGC diagnostics (empty dicts for non-ENGC optimizers)
-        "engc_trust":       _emean(_engc_trust),
-        "engc_vac_correct": _emean(_engc_vac_correct),
-        "engc_vac_wrong":   _emean(_engc_vac_wrong),
+        # ENGC diagnostics (empty dict for non-ENGC optimizers)
+        "engc_trust": _emean(_engc_trust),
     }
     return data_transferred, top1.avg, losses.avg, metrics
 

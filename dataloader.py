@@ -571,7 +571,9 @@ def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size,
         train_tf = transforms.Compose([
             transforms.Resize((32, 32)),
             transforms.RandomHorizontalFlip(),
-            transforms.RandomRotation(10),
+            transforms.RandomVerticalFlip(),
+            transforms.RandomRotation(15),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
             transforms.ToTensor(),
             normalize,
         ])
