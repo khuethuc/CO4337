@@ -7,13 +7,14 @@ python trainer.py \
   --optimizer engc \
   --arch cganet \
   --momentum 0.9 \
+  --alpha 1.0 \
   --graph ring \
   --neighbors 2 \
   --nesterov \
   --quality-mode tiered \
   --noise-agents 2,3,4 \
-  --noise-rate 0.2 \
+  --noise-rate 0.15 \
   --weight_decay 1e-4 \
   --steplr \
-  --edl-main --edl-lambda 1.0 \
+  --edl-lambda 1.0 \
   --use-edl

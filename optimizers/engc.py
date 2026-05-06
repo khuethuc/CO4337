@@ -33,7 +33,6 @@ def compute_edl_vacuity(logits: torch.Tensor) -> torch.Tensor:
     _, _, S = _edl_params(logits)
     return (K / S).clamp(0.0, 1.0)            # [B]
 
-
 def edl_loss(logits: torch.Tensor, targets: torch.Tensor,
              num_classes: int, lambda_kl: float = 1.0,
              sample_weights: torch.Tensor = None,
@@ -87,6 +86,30 @@ def edl_loss(logits: torch.Tensor, targets: torch.Tensor,
     return per_sample.mean()
 
 
+# ---------------------------------------------------------------------------
+# Vacuity logging helper (used by trainer)
+# ---------------------------------------------------------------------------
+
+def log_vacuity_stats(rank: int, step: int, vacuity_scores: dict):
+    N = len(vacuity_scores)
+    if N == 0:
+        return
+    MIN_TRUST  = 0.1
+    pi_self    = 1.0 / (N + 1)
+    pi_nbr_tot = N   / (N + 1)
+
+    trusts  = {r: max(MIN_TRUST, 1.0 - v) for r, v in vacuity_scores.items()}
+    total   = sum(trusts.values()) or 1.0
+    weights = {r: (trusts[r] / total) * pi_nbr_tot for r in trusts}
+
+    parts = [f"pi_self={pi_self:.3f}"]
+    for r in sorted(vacuity_scores):
+        parts.append(
+            f"peer{r}: vac={vacuity_scores[r]:.3f} w={weights.get(r, 0):.3f}"
+        )
+    print(f"[ENGC-Adaptive][Rank {rank}][Step {step}] " + " | ".join(parts))
+
+
 class ENGC_sender():
 
     def __init__(self, true_model, device, num_classes: int = 10,
@@ -131,6 +154,7 @@ class ENGC_sender():
                           low  → both struggle equally (aleatoric) or A knows it
 
             w_i = 1 / (1 + U_epi(x_i))
+            
 
         Falls back to uniform weights when loss_b_per_sample is None.
 
@@ -222,7 +246,6 @@ class ENGC_sender():
             output[rank]                   = self._flatten_(g, mean_aleatoric_b)
         return output, g
 
-
 class ENGC_receiver():
 
     def __init__(
@@ -237,13 +260,15 @@ class ENGC_receiver():
         weight_decay = 0,
         neighbors    = 2,
         alpha        = 1.0,
+        beta         = 0.1,
     ):
         self.model        = model
         self.rank         = rank
         self.device       = device
         self.proj_grads   = {}
         self.pi           = 1.0 / float(neighbors + 1)
-        self.alpha        = alpha
+        self.alpha        = alpha   # kept for backward compat, unused when beta active
+        self.beta         = beta    # blend: beta*p_comp + (1-beta)*p_comm
         self.momentum     = momentum
         self.lr           = lr
         self.nesterov     = nesterov
@@ -256,42 +281,58 @@ class ENGC_receiver():
             self.momentum_buff.append(torch.zeros_like(param.data))
             self.prev_params.append(copy.deepcopy(param.data))
 
-        # Diagnostic: weights assigned to self and each neighbor in the last step.
-        self.last_neighbor_weights  = {}
-        # Aleatoric scalars received from each neighbor (piggybacked on gradient).
+        # Diagnostics
+        self.last_weights_comp      = {}   # weights used for model-variant
+        self.last_weights_comm      = {}   # weights used for data-variant
+        self.last_neighbor_weights  = {}   # legacy: mean of comp+comm weights
         self.last_aleatoric_scores  = {}
-        # Raw trust scores before normalization — useful to see absolute trust levels.
         self.last_trust_scores      = {}
 
-    def _compute_weights(self, neighbor_ranks,
-                          U_epi_scores=None, aleatoric_scores=None,
-                          vacuity_scores=None, loss_scores=None, acc_scores=None):
-        """
-        Compute pi_self and per-neighbor weights.
-
-        Trust signals (priority order):
-          1. U_epi + aleatoric (epistemic/aleatoric decomposition via cross-gradients)
-               trust_r = U_epi_r / (1 + U_ale_r)
-               U_epi_r  = mean epistemic gap of neighbor r on local data  (sender)
-               U_ale_r  = mean aleatoric of neighbor r on its own data    (received scalar)
-          2. U_epi only  (if aleatoric not available)
-          3. cross-accuracy acc_scores                                     (legacy)
-          4. vacuity-based                                                 (legacy)
-          5. uniform
-        """
+    def _normalize(self, neighbor_ranks, trusts):
+        """Normalize trust scores to sum to pi_neighbor_total."""
         N                 = len(neighbor_ranks)
         pi_self           = 1.0 / (N + 1)
         pi_neighbor_total = N   / (N + 1)
-        MIN_TRUST         = 0.1
+        total   = sum(trusts.values()) or 1.0
+        weights = {r: (trusts[r] / total) * pi_neighbor_total for r in trusts}
+        return pi_self, weights
 
-        if U_epi_scores and aleatoric_scores:
-            trusts = {
-                r: max(MIN_TRUST,
-                       U_epi_scores.get(r, 0.0) / (1.0 + aleatoric_scores.get(r, 0.0)))
-                for r in neighbor_ranks
-            }
-        elif U_epi_scores:
-            trusts = {r: max(MIN_TRUST, U_epi_scores.get(r, MIN_TRUST))
+    def _weights_for_comp(self, neighbor_ranks, U_epi_scores):
+        """
+        Weights for model-variant gradients ∇L(θ_A, D_B).
+
+        Signal: U_epi_A = mean(max(0, loss_A - loss_B)) trên D_B
+                HIGH → A kém trên D_B → model-variant gradient kém → weight thấp
+        """
+        MIN_TRUST = 0.1
+        N         = len(neighbor_ranks)
+        pi_self   = 1.0 / (N + 1)
+
+        if U_epi_scores:
+            trusts = {r: max(MIN_TRUST, 1.0 / (1.0 + U_epi_scores.get(r, 0.0)))
+                      for r in neighbor_ranks}
+        else:
+            pi_nbr  = N / (N + 1)
+            weights = {r: pi_nbr / N for r in neighbor_ranks}
+            return pi_self, weights
+
+        return self._normalize(neighbor_ranks, trusts)
+
+    def _weights_for_comm(self, neighbor_ranks, aleatoric_scores, vacuity_scores=None,
+                           loss_scores=None, acc_scores=None):
+        """
+        Weights for data-variant gradients ∇L(θ_B, D_A).
+
+        Primary signal: U_ale_A = mean(loss_A trên D_A)
+                        HIGH → A's data noisy → data-variant gradient kém → weight thấp
+        Fallback: acc_scores, vacuity-based, uniform.
+        """
+        MIN_TRUST = 0.1
+        N         = len(neighbor_ranks)
+        pi_self   = 1.0 / (N + 1)
+
+        if aleatoric_scores:
+            trusts = {r: max(MIN_TRUST, 1.0 / (1.0 + aleatoric_scores.get(r, 0.0)))
                       for r in neighbor_ranks}
         elif acc_scores:
             trusts = {r: max(MIN_TRUST, acc_scores.get(r, 0.5))
@@ -304,16 +345,11 @@ class ENGC_receiver():
                 for r in neighbor_ranks
             }
         else:
-            w_uniform = pi_neighbor_total / N
-            weights   = {r: w_uniform for r in neighbor_ranks}
-            self.last_neighbor_weights = {'self': pi_self, **weights}
+            pi_nbr  = N / (N + 1)
+            weights = {r: pi_nbr / N for r in neighbor_ranks}
             return pi_self, weights
 
-        total   = sum(trusts.values()) or 1.0
-        weights = {r: (trusts[r] / total) * pi_neighbor_total for r in trusts}
-        self.last_trust_scores     = dict(trusts)     # raw, before normalization
-        self.last_neighbor_weights = {'self': pi_self, **weights}
-        return pi_self, weights
+        return self._normalize(neighbor_ranks, trusts)
 
     def _weighted_average(self, self_grad, neighbor_grads_dict, pi_self, weights):
         result = pi_self * self_grad
@@ -332,8 +368,6 @@ class ENGC_receiver():
                  vacuity_scores=None, loss_scores=None, acc_scores=None):
         # ------------------------------------------------------------------
         # Step 1: extract trailing aleatoric scalar appended by each sender.
-        #   neighbor_grads_comm[r] = flat_gradient || mean_aleatoric_r
-        #   neighbor_grads_comp[r] = flat_gradient || mean_aleatoric_b  (our own, discard)
         # ------------------------------------------------------------------
         aleatoric_scores = {}
         for rank in list(neighbor_grads_comm.keys()):
@@ -354,20 +388,31 @@ class ENGC_receiver():
         for rank, ft in neighbor_grads_comp.items():
             neighbor_grads_comp[rank] = self._unflatten_(ft, ref_buf)
 
+        neighbor_ranks = list(neighbor_grads_comm.keys())
+
         # ------------------------------------------------------------------
-        # Step 3: per-neighbor trust weights
+        # Step 3: two separate weight sets — each aligned with its gradient type
+        #   weights_comp: model-variant ∇L(θ_A, D_B)  ← trust via U_epi_A
+        #   weights_comm: data-variant  ∇L(θ_B, D_A)  ← trust via U_ale_A
         # ------------------------------------------------------------------
-        pi_self, weights = self._compute_weights(
-            list(neighbor_grads_comm.keys()),
-            U_epi_scores     = U_epi_scores,
-            aleatoric_scores = aleatoric_scores,
-            vacuity_scores   = vacuity_scores,
-            loss_scores      = loss_scores,
-            acc_scores       = acc_scores,
+        pi_self, weights_comp = self._weights_for_comp(neighbor_ranks, U_epi_scores)
+        _,       weights_comm = self._weights_for_comm(
+            neighbor_ranks, aleatoric_scores,
+            vacuity_scores=vacuity_scores, loss_scores=loss_scores, acc_scores=acc_scores,
         )
+
+        self.last_weights_comp     = {'self': pi_self, **weights_comp}
+        self.last_weights_comm     = {'self': pi_self, **weights_comm}
+        self.last_neighbor_weights = {
+            r: self.beta * weights_comp.get(r, 0.0)
+               + (1.0 - self.beta) * weights_comm.get(r, 0.0)
+            for r in neighbor_ranks
+        }
+        self.last_neighbor_weights['self'] = pi_self
 
         # ------------------------------------------------------------------
         # Step 4: weighted gradient blend
+        #   proj = beta * p_comp + (1-beta) * p_comm
         # ------------------------------------------------------------------
         for name, self_params in self.model.module.named_parameters():
             if not self_params.requires_grad:
@@ -376,9 +421,9 @@ class ENGC_receiver():
             comm_neighbor = {r: g[name] for r, g in neighbor_grads_comm.items()}
             comp_neighbor = {r: g[name] for r, g in neighbor_grads_comp.items()}
 
-            p_comm = self._weighted_average(self_grad, comm_neighbor, pi_self, weights)
-            p_comp = self._weighted_average(self_grad, comp_neighbor, pi_self, weights)
-            self.proj_grads[name] = (1.0 - self.alpha) * p_comp + self.alpha * p_comm
+            p_comp = self._weighted_average(self_grad, comp_neighbor, pi_self, weights_comp)
+            p_comm = self._weighted_average(self_grad, comm_neighbor, pi_self, weights_comm)
+            self.proj_grads[name] = self.beta * p_comp + (1.0 - self.beta) * p_comm
 
     def project_gradients(self, lr):
         for name, p in self.model.module.named_parameters():
@@ -421,26 +466,3 @@ class ENGC_receiver():
 
         self.lr = lr
 
-
-# ---------------------------------------------------------------------------
-# Vacuity logging helper (used by trainer)
-# ---------------------------------------------------------------------------
-
-def log_vacuity_stats(rank: int, step: int, vacuity_scores: dict):
-    N = len(vacuity_scores)
-    if N == 0:
-        return
-    MIN_TRUST  = 0.1
-    pi_self    = 1.0 / (N + 1)
-    pi_nbr_tot = N   / (N + 1)
-
-    trusts  = {r: max(MIN_TRUST, 1.0 - v) for r, v in vacuity_scores.items()}
-    total   = sum(trusts.values()) or 1.0
-    weights = {r: (trusts[r] / total) * pi_nbr_tot for r in trusts}
-
-    parts = [f"pi_self={pi_self:.3f}"]
-    for r in sorted(vacuity_scores):
-        parts.append(
-            f"peer{r}: vac={vacuity_scores[r]:.3f} w={weights.get(r, 0):.3f}"
-        )
-    print(f"[ENGC-Adaptive][Rank {rank}][Step {step}] " + " | ".join(parts))

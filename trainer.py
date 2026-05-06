@@ -105,6 +105,9 @@ parser.add_argument('--edl-main', dest='edl_main', action='store_true',
                     help='use EDL loss for main local training (not just cross-gradients)')
 parser.add_argument('--edl-lambda', dest='edl_lambda', default=1.0, type=float,
                     help='KL weight lambda in EDL loss (applies to both main and cross-gradient loss)')
+parser.add_argument('--engc-beta', dest='engc_beta', default=0.1, type=float,
+                    help='ENGC blend: beta*p_comp(model-variant) + (1-beta)*p_comm(data-variant). '
+                         '0=data-variant only, 1=model-variant only, default 0.1')
 parser.add_argument('--edl-aux-weight', dest='edl_aux_weight', default=0.0, type=float,
                     help='weight for auxiliary EDL loss added to CE: loss = CE + w * EDL')
 
@@ -218,6 +221,7 @@ def run(rank, size):
         args.classes,
         quality_mode=args.quality_mode,
         noise_rate=args.noise_rate,
+        noise_agents={int(x) for x in args.noise_agents.split(',') if x.strip()} if args.noise_agents else set(),
         noise_type=args.noise_type,
         noise_alpha=args.noise_alpha,
     )
@@ -319,7 +323,6 @@ def run(rank, size):
     elif args.optimizer.lower() == 'topkngc':
         receiver = Topk_NGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors, alpha=args.alpha)
     elif args.optimizer.lower() == 'engc':
-        # ENGC Hướng 3: receiver uniform averaging giống NGC, không cần trust score
         receiver = ENGC_receiver(
             model,
             device,
@@ -331,6 +334,7 @@ def run(rank, size):
             weight_decay=args.weight_decay,
             neighbors=args.neighbors,
             alpha=args.alpha,
+            beta=args.engc_beta,
         )
     elif args.optimizer.lower() == 'adaptive_ngc':
         receiver = Adaptive_NGC_receiver(
@@ -623,9 +627,9 @@ def train(
         if args.optimizer.lower() == 'engc':
             output = model(input_var)
 
-            # Per-sample loss of local model B on D_B.
-            # Passed to sender so it can compute epistemic gap
-            # U_epi(x_i) = max(0, loss_A(x_i) - loss_B(x_i)) per sample.
+            # Per-sample loss của model B trên D_B — dùng để tính U_epi.
+            # Dùng cùng EDL formula với loss_a bên trong _accumulate_gradients
+            # để hai giá trị có cùng scale khi so sánh.
             with torch.no_grad():
                 loss_b_per_sample = edl_loss(
                     output.detach(), target_var, args.classes,
@@ -658,12 +662,10 @@ def train(
             payload_bytes_from_calls       += amt_data_transfer
             data_transferred               += amt_data_transfer
 
-            # U_epi_scores: per-neighbor epistemic gap computed in sender.
-            # aleatoric_scores: extracted from received gradient scalars inside receiver.
             U_epi_scores   = sender.U_epi_scores   if args.use_edl else None
-            vacuity_scores = sender.vacuity_scores  if args.use_edl else None
-            loss_scores    = sender.loss_scores     if args.use_edl else None
-            acc_scores     = sender.acc_scores      if args.use_edl else None
+            acc_scores     = sender.acc_scores     if args.use_edl else None
+            vacuity_scores = sender.vacuity_scores if args.use_edl else None
+            loss_scores    = sender.loss_scores    if args.use_edl else None
 
             if vacuity_scores and i % args.print_freq == 0:
                 from optimizers.engc import log_vacuity_stats
@@ -671,8 +673,8 @@ def train(
 
             receiver(received_cross_grad, cross_grad_copy, ref_buf,
                      U_epi_scores=U_epi_scores,
-                     vacuity_scores=vacuity_scores, loss_scores=loss_scores,
-                     acc_scores=acc_scores)
+                     acc_scores=acc_scores,
+                     vacuity_scores=vacuity_scores, loss_scores=loss_scores)
             receiver.project_gradients(lr)
 
             # --- Accumulate ENGC diagnostics ---
@@ -685,31 +687,21 @@ def train(
                     int(x) for x in args.noise_agents.split(',') if x.strip()
                 ) if args.noise_agents else set()
 
-                header = (
-                    f"[ENGC-Diag][Rank {dist.get_rank()}]"
-                    f"[Ep {epoch}][{i}/{len(train_loader)}]"
-                )
-
-                # ── Per-neighbor table ──────────────────────────────────────
-                # Columns: U_epi | U_ale | raw_trust | final_weight
-                #          sw_mean | sw_frac_low | vac_ok | vac_err
+                header = (f"[ENGC-Diag][Rank {dist.get_rank()}]"
+                          f"[Ep {epoch}][{i}/{len(train_loader)}]")
                 # Red flags:
-                #   U_epi ≈ 0 for all  → loss comparison not firing
-                #   U_ale same for all → aleatoric scalar not varying
-                #   vac_err ≤ vac_ok   → EDL not calibrated
-                #   sw_frac_low ≈ 0   → no samples being downweighted
+                #   U_epi[N] ≈ U_epi[c] → U_epi không discriminative
+                #   sw_frac_low ≈ 0      → không sample nào bị downweight
+                #   w[N] ≈ w[c]          → trust không phân biệt được
                 print(header)
-                # Columns: U_epi | U_ale | raw_trust | final_weight | sw_mean | sw_frac_low
+                # w_comp = weight for model-variant (U_epi based)
+                # w_comm = weight for data-variant  (U_ale based)
                 # Red flags:
-                #   U_epi ≈ 0 for all   → loss comparison not firing (models too similar?)
-                #   U_ale same for all  → aleatoric scalar not varying across neighbors
-                #   sw_frac_low ≈ 0    → per-sample filter not downweighting anything
-                #   noisy [N] w ≈ [c] w → trust not discriminating
-                fmt = (
-                    "  {tag:<8} U_epi={uepi:>6.3f}  U_ale={ale:>6.3f}"
-                    "  trust={tr:>6.3f}  w={tw:>6.3f}"
-                    "  sw_mean={swm:>5.3f}  sw_frac_low={swf:>5.3f}"
-                )
+                #   w_comp[N] ≈ w_comp[c] → U_epi không phân biệt được
+                #   w_comm[N] ≈ w_comm[c] → U_ale không phân biệt được
+                fmt = ("  {tag:<8} U_epi={uepi:>5.3f}  U_ale={ale:>5.3f}"
+                       "  w_comp={wc:>5.3f}  w_comm={wm:>5.3f}"
+                       "  sw_mean={swm:>5.3f}  sw_frac_low={swf:>5.3f}")
                 for r in sorted(sender.U_epi_scores):
                     tag = f"peer{r}{'[N]' if r in noise_ranks else '[c]'}"
                     sw  = sender.sample_weight_stats.get(r, {})
@@ -717,8 +709,8 @@ def train(
                         tag  = tag,
                         uepi = sender.U_epi_scores.get(r, float('nan')),
                         ale  = receiver.last_aleatoric_scores.get(r, float('nan')),
-                        tr   = receiver.last_trust_scores.get(r, float('nan')),
-                        tw   = receiver.last_neighbor_weights.get(r, float('nan')),
+                        wc   = receiver.last_weights_comp.get(r, float('nan')),
+                        wm   = receiver.last_weights_comm.get(r, float('nan')),
                         swm  = sw.get('mean',     float('nan')),
                         swf  = sw.get('frac_low', float('nan')),
                     ))
