@@ -89,8 +89,8 @@ class ENGC_sender():
             n_wrong      = int((~correct_mask).sum().item())
             n_total      = len(targets)
             self._last_vacuity_by_pred = {
-                'vac_correct': vacuity[correct_mask].mean().item()  if correct_mask.any() else float('nan'),
-                'vac_wrong':   vacuity[~correct_mask].mean().item() if n_wrong > 0        else float('nan'),
+                'vacuity_on_correct_prediction': vacuity[correct_mask].mean().item()  if correct_mask.any() else float('nan'),
+                'vacuity_on_wrong_prediction':   vacuity[~correct_mask].mean().item() if n_wrong > 0        else float('nan'),
                 'frac_wrong':  n_wrong / max(n_total, 1),
             }
 
@@ -172,26 +172,16 @@ class ENGC_receiver():
         # Use this to verify: noisy neighbors get lower weights than clean ones.
         self.last_neighbor_weights = {}
 
-    def _compute_weights(self, neighbor_ranks, vacuity_scores=None):
+    def _compute_weights(self, neighbor_ranks):
         """
-        Compute pi_self and per-neighbor weights in one place.
-        Stores result in self.last_neighbor_weights for external logging.
+        Uniform per-neighbor weights (same as NGC baseline).
+        Per-sample vacuity weighting in ENGC_sender handles gradient quality.
         Returns (pi_self, {rank: weight}).
         """
         N                 = len(neighbor_ranks)
         pi_self           = 1.0 / (N + 1)
-        pi_neighbor_total = N   / (N + 1)
-
-        if vacuity_scores:
-            MIN_TRUST = 0.1
-            trusts    = {r: max(MIN_TRUST, 1.0 - vacuity_scores.get(r, 0.5))
-                         for r in neighbor_ranks}
-            total     = sum(trusts.values()) or 1.0
-            weights   = {r: (trusts[r] / total) * pi_neighbor_total for r in trusts}
-        else:
-            w_uniform = pi_neighbor_total / N
-            weights   = {r: w_uniform for r in neighbor_ranks}
-
+        w_uniform         = (N / (N + 1)) / N
+        weights           = {r: w_uniform for r in neighbor_ranks}
         self.last_neighbor_weights = {'self': pi_self, **weights}
         return pi_self, weights
 
@@ -209,17 +199,13 @@ class ENGC_receiver():
         unflat = unflatten_tensors(flat_tensor, ref)
         return {k: v for k, v in zip(keys, unflat)}
 
-    def __call__(self, neighbor_grads_comm, neighbor_grads_comp, ref_buf,
-                 vacuity_scores=None):
+    def __call__(self, neighbor_grads_comm, neighbor_grads_comp, ref_buf):
         for rank, ft in neighbor_grads_comm.items():
             neighbor_grads_comm[rank] = self._unflatten_(ft, ref_buf)
         for rank, ft in neighbor_grads_comp.items():
             neighbor_grads_comp[rank] = self._unflatten_(ft, ref_buf)
 
-        # Compute weights ONCE per step (stored in self.last_neighbor_weights)
-        pi_self, weights = self._compute_weights(
-            list(neighbor_grads_comm.keys()), vacuity_scores
-        )
+        pi_self, weights = self._compute_weights(list(neighbor_grads_comm.keys()))
 
         for name, self_params in self.model.module.named_parameters():
             if not self_params.requires_grad:

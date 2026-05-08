@@ -1,3 +1,8 @@
+import os
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
 
@@ -193,9 +198,7 @@ def run(rank, size):
     comm_bytes_list  = []   # bytes transferred per epoch
     comm_pkgs_list   = []   # total comm packages per epoch
 
-    # ENGC per-epoch diagnostic tracking (empty for non-ENGC optimizers)
-    # engc_trust_list[ep][r] = mean weight assigned to neighbor r in epoch ep
-    engc_trust_list = []
+    engc_trust_list = []  # unused placeholder — kept for backward compat
 
     # --- Build base model ---
     if args.arch.lower() == 'resnet':
@@ -450,65 +453,7 @@ def run(rank, size):
     print('Final test accuracy')
     prec1_final, _ = validate(val_loader, model, criterion, bsz_val, device, epoch)
 
-    # --- ENGC: print per-epoch trust score evolution (rank 0 only) ---
-    if args.optimizer.lower() == 'engc' and rank == 0 and engc_trust_list:
-        noise_ranks = set(
-            int(x) for x in args.noise_agents.split(',') if x.strip()
-        ) if args.noise_agents else set()
-
-        # Collect all neighbor ranks that appeared
-        all_nbr_ranks = sorted({
-            r for ep_d in engc_trust_list for r in ep_d if r != 'self'
-        })
-
-        W = 72
-        print("\n" + "=" * W)
-        print(f"  ENGC DIAGNOSTIC SUMMARY  [Rank {rank} | {args.graph} | skew={args.skew}]")
-        print(f"  Noisy agents: {sorted(noise_ranks) if noise_ranks else 'none'}")
-        print("=" * W)
-
-        # --- Table 1: per-epoch trust score per neighbor ---
-        hdr = f"  {'Epoch':>5}"
-        hdr += f"  {'self':>6}"
-        for r in all_nbr_ranks:
-            tag = '[N]' if r in noise_ranks else '[c]'
-            hdr += f"  peer{r}{tag:>3}"
-        print(hdr)
-        print("  " + "-" * (W - 2))
-        for ep, ep_trust in enumerate(engc_trust_list):
-            row = f"  {ep+1:>5}  {ep_trust.get('self', float('nan')):>6.3f}"
-            for r in all_nbr_ranks:
-                row += f"  {ep_trust.get(r, float('nan')):>9.3f}"
-            print(row)
-        print("=" * W)
-
-        print("=" * W)
-
-        # --- Table 3: per-epoch trust scores with checklist ---
-        # PASS: noisy peers [N] have lower final weight than clean peers [c]
-        # FAIL: weights flat / noisy peers not downweighted
-        print(f"\n  Trust score evolution — noisy peers [N] should trend lower than [c]")
-        hdr3 = f"  {'Epoch':>5}  {'self':>6}"
-        for r in all_nbr_ranks:
-            tag = '[N]' if r in noise_ranks else '[c]'
-            hdr3 += f"  peer{r}{tag}"
-        print(hdr3)
-        print("  " + "-" * (W - 2))
-        for ep, ep_trust in enumerate(engc_trust_list):
-            row = f"  {ep+1:>5}  {ep_trust.get('self', float('nan')):>6.3f}"
-            for r in all_nbr_ranks:
-                row += f"  {ep_trust.get(r, float('nan')):>8.3f}"
-            print(row)
-
-        # Summary: compare mean weight of noisy vs clean peers over last 10 epochs
-        if noise_ranks and len(engc_trust_list) >= 2:
-            window = engc_trust_list[-10:]
-            clean_ranks = [r for r in all_nbr_ranks if r not in noise_ranks]
-            for r in all_nbr_ranks:
-                mean_w = sum(ep.get(r, 0.0) for ep in window) / len(window)
-                tag = '[N]' if r in noise_ranks else '[c]'
-                print(f"  Mean weight last {len(window)} ep — peer{r}{tag}: {mean_w:.4f}")
-        print("=" * W + "\n")
+    # (ENGC uses uniform per-neighbor weights; no trust table to print)
 
     total_comm_gb   = data_transferred / 1.0e9
     total_time_s    = sum(train_time_list)
@@ -601,9 +546,7 @@ def train(
     comm_calls_transfer_additional  = 0
     payload_bytes_from_calls        = 0
 
-    # ENGC per-batch diagnostic accumulators (empty for non-ENGC)
-    # Keys are neighbor ranks (int); 'self' for own weight
-    _engc_trust = {}   # {rank/'self' -> [float]}  weight assigned each step
+    _engc_trust = {}   # unused placeholder — kept for metrics dict compatibility
 
     end   = time.time()
     step  = len(train_loader) * batch_size * epoch
@@ -657,33 +600,27 @@ def train(
             payload_bytes_from_calls       += amt_data_transfer
             data_transferred               += amt_data_transfer
 
-            # ④ Blend: g̃ = (1-α)*p_comp + α*p_comm, weighted by trust(vacuity)
-            receiver(received_cross_grad, cross_grad_copy, ref_buf,
-                     vacuity_scores=sender.vacuity_scores)
+            # ④ Blend: g̃ = (1-α)*p_comp + α*p_comm, uniform neighbor weights
+            receiver(received_cross_grad, cross_grad_copy, ref_buf)
             receiver.project_gradients(lr)
 
-            # --- Diagnostics ---
-            for r, w in receiver.last_neighbor_weights.items():
-                _engc_trust.setdefault(r, []).append(w)
-
+            # --- Diagnostics: per-sample vacuity only ---
             if i % args.print_freq == 0:
                 noise_ranks = set(
                     int(x) for x in args.noise_agents.split(',') if x.strip()
                 ) if args.noise_agents else set()
                 print(f"[ENGC-Diag][Rank {dist.get_rank()}]"
                       f"[Ep {epoch}][{i}/{len(train_loader)}]")
-                fmt = "  {tag:<10} vac={vac:>5.3f}  trust={trust:>5.3f}  w={w:>5.3f}  sw_low%={sw:>4.2f}"
+                fmt = "  {tag:<10} vac={vac:>5.3f}  sw_mean={sw_mean:>4.2f}  sw_low%={sw_low:>4.2f}"
                 for r in sorted(sender.vacuity_scores):
                     tag   = f"peer{r}{'[N]' if r in noise_ranks else '[c]'}"
                     vac_r = sender.vacuity_scores.get(r, float('nan'))
-                    trust = max(0.1, 1.0 - vac_r)
                     sw    = sender.sample_weight_stats.get(r, {})
                     print(fmt.format(
-                        tag   = tag,
-                        vac   = vac_r,
-                        trust = trust,
-                        w     = receiver.last_neighbor_weights.get(r, float('nan')),
-                        sw    = sw.get('frac_low', float('nan')),
+                        tag    = tag,
+                        vac    = vac_r,
+                        sw_mean= sw.get('mean',     float('nan')),
+                        sw_low = sw.get('frac_low', float('nan')),
                     ))
 
             global_steps += 1
