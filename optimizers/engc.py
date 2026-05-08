@@ -36,27 +36,24 @@ def compute_edl_vacuity(logits: torch.Tensor) -> torch.Tensor:
 
 class ENGC_sender():
 
-    def __init__(self, true_model, device, num_classes: int = 10):
+    def __init__(self, true_model, device, num_classes: int = 10, temperature: float = 0.5):
         self.model           = copy.deepcopy(true_model)
         self.model.train()
         self.model           = self.model.to(device)
         self.gradient_buffer = {}
         self.device          = device
         self.num_classes     = num_classes
-
-        # Per-neighbor EDL vacuity on MY local data (no gradient)
-        self.vacuity_scores       = {}   # rank -> float in [0, 1]
-        # Per-neighbor sample weight stats (logged for diagnostics)
-        self.sample_weight_stats  = {}   # rank -> {mean, frac_low}
+        # Per-neighbor mean vacuity on local batch (cross-evaluation signal)
+        self.vacuity_scores       = {}   # rank -> mean vacuity float
+        # Per-neighbor sample weight stats for diagnostics
+        self.sample_weight_stats  = {}   # rank -> {vac_mean, vac_std, w_std, frac_low}
         self._last_sample_weights = None
+        self._last_vacuity        = None
 
-        # Diagnostic: per-neighbor vacuity split by prediction correctness
-        # vacuity_by_pred[r] = {vac_correct, vac_wrong, frac_wrong}
-        # vac_correct: mean vacuity of neighbor r's model on samples it predicts correctly
-        # vac_wrong:   mean vacuity of neighbor r's model on samples it predicts wrongly
-        # Expected: vac_wrong > vac_correct  (uncertain when wrong)
-        self.vacuity_by_pred      = {}
-        self._last_vacuity_by_pred = {}
+        # Diagnostic: vacuity and weight split by correct vs wrong predictions.
+        # Expected: vac_wrong > vac_correct, w_wrong < w_correct
+        self.vac_by_pred          = {}
+        self._last_vac_by_pred    = {}
 
     def _update_model(self, state_dict):
         for w, p in zip(state_dict, self.model.parameters()):
@@ -64,33 +61,42 @@ class ENGC_sender():
 
     def _accumulate_gradients(self, x, targets):
         """
-        Cross-gradient with per-sample vacuity weighting.
+        Cross-gradient with per-sample entropy-based uncertainty weighting.
 
-        ENGC: down-weight samples where neighbor model is uncertain (high vacuity):
-            w_i = (1 - vacuity_i).clamp(min=0.05)
-            loss = mean(CE_i * w_i)
+        Flow: neighbor j's model runs on local data (cross-evaluation)
+              → softmax(logits) → Shannon entropy H = -Σ p_k log p_k
+              → normalized uncertainty u_i = H_i / log(K)  ∈ [0, 1]
+              → w_i = (1 - u_i).clamp(0.05)  [high uncertainty → low weight]
+              → loss = mean(CE_i * w_norm_i)
 
-        Also tracks vacuity_by_pred: split vacuity by correct vs wrong predictions
-        to verify that the uncertainty signal is meaningful.
+        Structurally identical to EDL vacuity weighting but uses softmax entropy
+        instead of Dirichlet vacuity — compatible with CE-trained models.
+        Expected: uncertainty_wrong > uncertainty_correct, w_wrong < w_correct.
         """
         self.model.zero_grad()
-        output = self.model(x)
+        output = self.model(x)   # neighbor j's model on local data
 
         with torch.no_grad():
-            vacuity = compute_edl_vacuity(output.detach())   # [B]
-            w_raw   = (1.0 - vacuity).clamp(min=0.05)        # [B], floor 0.05
-            # Normalize so mean(w_norm) = 1 → gradient magnitude ≈ NGC baseline
-            w_norm  = w_raw / (w_raw.mean() + 1e-8)          # [B], mean ≈ 1.0
+            K     = output.size(1)
+            probs = F.softmax(output.detach(), dim=1)                   # [B, K]
+            # Shannon entropy, normalized to [0, 1]
+            entropy     = -(probs * (probs + 1e-8).log()).sum(dim=1)    # [B]
+            uncertainty = (entropy / math.log(K)).clamp(0.0, 1.0)      # [B]
+            w_raw  = (1.0 - uncertainty).clamp(min=0.05)                # [B]
+            w_norm = w_raw / (w_raw.mean() + 1e-8)                      # [B], mean ≈ 1.0
             self._last_sample_weights = w_raw.cpu()
+            self._last_vacuity        = uncertainty.cpu()
 
-            # --- Diagnostic: vacuity split by prediction correctness ---
+            # --- Diagnostic: split uncertainty and weight by correct vs wrong ---
             preds        = output.detach().argmax(dim=1)
             correct_mask = (preds == targets)
             n_wrong      = int((~correct_mask).sum().item())
             n_total      = len(targets)
-            self._last_vacuity_by_pred = {
-                'vacuity_on_correct_prediction': vacuity[correct_mask].mean().item()  if correct_mask.any() else float('nan'),
-                'vacuity_on_wrong_prediction':   vacuity[~correct_mask].mean().item() if n_wrong > 0        else float('nan'),
+            self._last_vac_by_pred = {
+                'vac_correct': uncertainty[correct_mask].mean().item()  if correct_mask.any() else float('nan'),
+                'vac_wrong':   uncertainty[~correct_mask].mean().item() if n_wrong > 0        else float('nan'),
+                'w_correct':   w_norm[correct_mask].mean().item()       if correct_mask.any() else float('nan'),
+                'w_wrong':     w_norm[~correct_mask].mean().item()      if n_wrong > 0        else float('nan'),
                 'frac_wrong':  n_wrong / max(n_total, 1),
             }
 
@@ -114,22 +120,29 @@ class ENGC_sender():
     def __call__(self, neighbor_weight, batch_x, targets):
         self.vacuity_scores      = {}
         self.sample_weight_stats = {}
-        self.vacuity_by_pred     = {}
+        self.vac_by_pred         = {}
         output = {}
         g      = None
         for rank, w in neighbor_weight.items():
             self._update_model(w)
             with torch.no_grad():
                 logits = self.model(batch_x)
-                self.vacuity_scores[rank] = compute_edl_vacuity(logits).mean().item()
+                K      = logits.size(1)
+                probs  = F.softmax(logits, dim=1)
+                entropy = -(probs * (probs + 1e-8).log()).sum(dim=1)
+                self.vacuity_scores[rank] = (entropy / math.log(K)).mean().item()
             g = self._accumulate_gradients(batch_x, targets)
-            if self._last_sample_weights is not None:
-                sw = self._last_sample_weights
+            if self._last_vacuity is not None:
+                unc = self._last_vacuity           # [B] normalized entropy, cpu
+                sw  = self._last_sample_weights    # w_raw [B] cpu
+                w_n = sw / (sw.mean() + 1e-8)     # w_norm [B] cpu
                 self.sample_weight_stats[rank] = {
-                    'mean':     float(sw.mean()),
-                    'frac_low': float((sw < 0.2).float().mean()),
+                    'unc_mean': float(unc.mean()),
+                    'unc_std':  float(unc.std()),
+                    'w_std':    float(w_n.std()),
+                    'frac_low': float((w_n < 0.5).float().mean()),
                 }
-            self.vacuity_by_pred[rank] = self._last_vacuity_by_pred
+            self.vac_by_pred[rank] = self._last_vac_by_pred
             output[rank] = self._flatten_(g)
         return output, g
 

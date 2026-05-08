@@ -104,6 +104,10 @@ parser.add_argument('--ngc-min-peer-weight', dest='ngc_min_peer_weight', default
                     help='minimum peer weight floor after normalization')
 
 # --- EDL / vacuity args (ENGC) ---
+parser.add_argument('--engc-temperature', dest='engc_temperature', default=0.5, type=float,
+                    help='ENGC: temperature for CE-based per-sample weighting. '
+                         'Lower = sharper (high-CE samples downweighted more aggressively). '
+                         'Typical range: 0.1 (sharp) – 1.0 (soft). Default 0.5.')
 parser.add_argument('--use-edl', dest='use_edl', action='store_true',
                     help='enable vacuity-adaptive cross-gradient weighting (ENGC)')
 parser.add_argument('--edl-main', dest='edl_main', action='store_true',
@@ -272,6 +276,7 @@ def run(rank, size):
             base_model,
             device,
             num_classes=args.classes,
+            temperature=args.engc_temperature,
         )
     elif args.optimizer.lower() == 'adaptive_ngc':
         sender = Adaptive_NGC_sender(base_model, device)
@@ -604,24 +609,36 @@ def train(
             receiver(received_cross_grad, cross_grad_copy, ref_buf)
             receiver.project_gradients(lr)
 
-            # --- Diagnostics: per-sample vacuity only ---
+            # --- Diagnostics: entropy-based per-sample weighting (cross-evaluation) ---
+            # Proof weighting is meaningful:
+            #   uncertainty_on_wrong > uncertainty_on_correct
+            #   weight_on_wrong      < weight_on_correct
+            #   weight_std > 0  →  weights NOT uniform
             if i % args.print_freq == 0:
                 noise_ranks = set(
                     int(x) for x in args.noise_agents.split(',') if x.strip()
                 ) if args.noise_agents else set()
                 print(f"[ENGC-Diag][Rank {dist.get_rank()}]"
                       f"[Ep {epoch}][{i}/{len(train_loader)}]")
-                fmt = "  {tag:<10} vac={vac:>5.3f}  sw_mean={sw_mean:>4.2f}  sw_low%={sw_low:>4.2f}"
                 for r in sorted(sender.vacuity_scores):
-                    tag   = f"peer{r}{'[N]' if r in noise_ranks else '[c]'}"
-                    vac_r = sender.vacuity_scores.get(r, float('nan'))
-                    sw    = sender.sample_weight_stats.get(r, {})
-                    print(fmt.format(
-                        tag    = tag,
-                        vac    = vac_r,
-                        sw_mean= sw.get('mean',     float('nan')),
-                        sw_low = sw.get('frac_low', float('nan')),
-                    ))
+                    tag     = f"peer{r}{'[N]' if r in noise_ranks else '[c]'}"
+                    stats   = sender.sample_weight_stats.get(r, {})
+                    by_pred = sender.vac_by_pred.get(r, {})
+                    print(
+                        f"  {tag:<14}"
+                        f"  mean_uncertainty={sender.vacuity_scores[r]:.3f}"
+                        f"  uncertainty_std={stats.get('unc_std', float('nan')):.3f}"
+                        f"  weight_std={stats.get('w_std', float('nan')):.3f}"
+                        f"  frac_downweighted={stats.get('frac_low', float('nan')):.2f}"
+                    )
+                    print(
+                        f"  {'':14}"
+                        f"  uncertainty_on_correct={by_pred.get('vac_correct', float('nan')):.3f}"
+                        f"  uncertainty_on_wrong={by_pred.get('vac_wrong',   float('nan')):.3f}"
+                        f"  weight_on_correct={by_pred.get('w_correct',      float('nan')):.3f}"
+                        f"  weight_on_wrong={by_pred.get('w_wrong',          float('nan')):.3f}"
+                        f"  frac_wrong_pred={by_pred.get('frac_wrong',       float('nan')):.2f}"
+                    )
 
             global_steps += 1
 
