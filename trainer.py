@@ -61,7 +61,7 @@ parser.add_argument('--arch', '-a', metavar='ARCH', default='cganet', help='resn
 parser.add_argument('-depth', '--depth', default=20, type=int, help='depth of the resnet model')
 parser.add_argument('--normtype', default='evonorm', help='none or batchnorm or groupnorm or evonorm')
 parser.add_argument('--data-dir', dest='data_dir', help='The directory used to save the trained models', default='../../data', type=str)
-parser.add_argument('--dataset', dest='dataset', help='available datasets: cifar10, cifar100, imagenette, ham10000', default='cifar10', type=str)
+parser.add_argument('--dataset', dest='dataset', help='available datasets: cifar10, cifar100, imagenette, ham10000, camelyon17', default='cifar10', type=str)
 parser.add_argument('--skew', default=1.0, type=float, help='belongs to [0,1] where 0=completely iid and 1=completely non-iid')
 parser.add_argument('--classes', default=10, type=int, help='number of classes in the dataset')
 parser.add_argument('-b', '--batch-size', default=160, type=int, help='mini-batch size (default: 128)')
@@ -150,6 +150,11 @@ parser.add_argument('--noise-type', dest='noise_type', default='uniform', type=s
 parser.add_argument('--noise-alpha', dest='noise_alpha', default=0.1, type=float,
                     help='Dirichlet concentration for label noise: '
                          'small (0.01) = near pair-flip; large (10) = near uniform')
+parser.add_argument('--camelyon-partition', dest='camelyon_partition',
+                    default='site', type=str,
+                    help='Camelyon17 partition strategy: '
+                         'site (hospital-based feature skew, recommended) | '
+                         'label (label-skew via --skew, not recommended for binary)')
 
 args = parser.parse_args()
 args.devices = torch.cuda.device_count()
@@ -203,6 +208,8 @@ def run(rank, size):
     comm_pkgs_list   = []   # total comm packages per epoch
 
     engc_trust_list = []  # unused placeholder — kept for backward compat
+    # Per-epoch weighting stats: {rank: {unc_cor, unc_wr, w_cor, w_wr}}
+    engc_ws_history = []
 
     # --- Build base model ---
     if args.arch.lower() == 'resnet':
@@ -237,6 +244,7 @@ def run(rank, size):
         noise_agents={int(x) for x in args.noise_agents.split(',') if x.strip()} if args.noise_agents else set(),
         noise_type=args.noise_type,
         noise_alpha=args.noise_alpha,
+        camelyon_partition=args.camelyon_partition,
     )
 
     if rank == 0:
@@ -426,8 +434,8 @@ def run(rank, size):
             int(m["comm_calls_transfer_additional"])
         )
 
-        # ENGC per-epoch diagnostics
         engc_trust_list.append(m.get("engc_trust", {}))
+        engc_ws_history.append(m.get("engc_weight_stats", {}))
 
         lr_scheduler.step()
 
@@ -458,7 +466,43 @@ def run(rank, size):
     print('Final test accuracy')
     prec1_final, _ = validate(val_loader, model, criterion, bsz_val, device, epoch)
 
-    # (ENGC uses uniform per-neighbor weights; no trust table to print)
+    # --- ENGC: weighting validation summary table (rank 0 only) ---
+    if args.optimizer.lower() == 'engc' and rank == 0 and engc_ws_history:
+        noise_ranks = {int(x) for x in args.noise_agents.split(',') if x.strip()} \
+                      if args.noise_agents else set()
+        window = engc_ws_history[-10:]   # average over last 10 epochs
+        all_peer_ranks = sorted({r for ep in window for r in ep})
+
+        W = 90
+        print("\n" + "=" * W)
+        print(f"  ENGC WEIGHTING VALIDATION SUMMARY  [Rank {rank} — last {len(window)} epochs]")
+        print(f"  Criterion: uncertainty_on_wrong > uncertainty_on_correct  AND  weight_on_wrong < weight_on_correct")
+        print("=" * W)
+        hdr = (f"  {'Peer':<14}  {'unc_correct':>12}  {'unc_wrong':>10}  "
+               f"{'Δunc':>7}  {'w_correct':>10}  {'w_wrong':>9}  {'Δw':>7}  {'PASS?':>6}")
+        print(hdr)
+        print("  " + "-" * (W - 2))
+        all_pass = True
+        for r in all_peer_ranks:
+            tag = f"peer{r}{'[N]' if r in noise_ranks else '[c]'}"
+            vals = [ep[r] for ep in window if r in ep]
+            if not vals:
+                continue
+            unc_cor = sum(v['unc_cor'] for v in vals) / len(vals)
+            unc_wr  = sum(v['unc_wr']  for v in vals) / len(vals)
+            w_cor   = sum(v['w_cor']   for v in vals) / len(vals)
+            w_wr    = sum(v['w_wr']    for v in vals) / len(vals)
+            d_unc   = unc_wr - unc_cor
+            d_w     = w_wr   - w_cor
+            passed  = (d_unc > 0) and (d_w < 0)
+            all_pass = all_pass and passed
+            mark = "✓" if passed else "✗"
+            print(f"  {tag:<14}  {unc_cor:>12.3f}  {unc_wr:>10.3f}  "
+                  f"{d_unc:>+7.3f}  {w_cor:>10.3f}  {w_wr:>9.3f}  {d_w:>+7.3f}  {mark:>6}")
+        print("=" * W)
+        result_str = "✓ VALIDATED" if all_pass else "✗ NOT VALIDATED"
+        print(f"  Overall weighting mechanism: {result_str}")
+        print("=" * W + "\n")
 
     total_comm_gb   = data_transferred / 1.0e9
     total_time_s    = sum(train_time_list)
@@ -552,6 +596,9 @@ def train(
     payload_bytes_from_calls        = 0
 
     _engc_trust = {}   # unused placeholder — kept for metrics dict compatibility
+    # Per-rank accumulator for weighting validation stats (ENGC only)
+    # _engc_ws[rank] = {'unc_cor': [...], 'unc_wr': [...], 'w_cor': [...], 'w_wr': [...]}
+    _engc_ws = {}
 
     end   = time.time()
     step  = len(train_loader) * batch_size * epoch
@@ -608,6 +655,15 @@ def train(
             # ④ Blend: g̃ = (1-α)*p_comp + α*p_comm, uniform neighbor weights
             receiver(received_cross_grad, cross_grad_copy, ref_buf)
             receiver.project_gradients(lr)
+
+            # --- Accumulate per-batch weighting stats for end-of-training summary ---
+            for r, bp in sender.vac_by_pred.items():
+                d = _engc_ws.setdefault(r, {'unc_cor': [], 'unc_wr': [], 'w_cor': [], 'w_wr': []})
+                for key, field in [('unc_cor','vac_correct'),('unc_wr','vac_wrong'),
+                                   ('w_cor','w_correct'),('w_wr','w_wrong')]:
+                    v = bp.get(field, float('nan'))
+                    if not math.isnan(v):
+                        d[key].append(v)
 
             # --- Diagnostics: entropy-based per-sample weighting (cross-evaluation) ---
             # Proof weighting is meaningful:
@@ -781,6 +837,11 @@ def train(
         "payload_bytes_from_calls":       int(payload_bytes_from_calls),
         # ENGC diagnostics (empty dict for non-ENGC optimizers)
         "engc_trust": _emean(_engc_trust),
+        "engc_weight_stats": {
+            r: {k: float(sum(v) / len(v)) if v else float('nan')
+                for k, v in d.items()}
+            for r, d in _engc_ws.items()
+        },
     }
     return data_transferred, top1.avg, losses.avg, metrics
 
