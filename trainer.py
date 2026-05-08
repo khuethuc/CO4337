@@ -161,14 +161,20 @@ torch.save(args, os.path.join(args.save_dir, "training_args.bin"))
 def run(rank, size):
     global args, best_prec1, global_steps
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(rank)
+    num_gpus = torch.cuda.device_count()
+    if num_gpus > 0:
+        gpu_id = rank % num_gpus
+        torch.cuda.manual_seed(args.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        device = torch.device(f"cuda:{gpu_id}")
+        torch.cuda.set_device(gpu_id)
+    else:
+        gpu_id = None
+        device = torch.device("cpu")
 
     best_prec1 = 0
     data_transferred = 0
@@ -263,7 +269,6 @@ def run(rank, size):
             base_model,
             device,
             num_classes=args.classes,
-            edl_lambda=args.edl_lambda,
         )
     elif args.optimizer.lower() == 'adaptive_ngc':
         sender = Adaptive_NGC_sender(base_model, device)
@@ -294,7 +299,7 @@ def run(rank, size):
     mixing = UniformMixing(graph, device)
     model = GossipDataParallel(
         base_model,
-        device_ids=[rank],
+        device_ids=[gpu_id] if gpu_id is not None else [],
         rank=rank,
         world_size=size,
         graph=graph,
@@ -334,7 +339,6 @@ def run(rank, size):
             weight_decay=args.weight_decay,
             neighbors=args.neighbors,
             alpha=args.alpha,
-            beta=args.engc_beta,
         )
     elif args.optimizer.lower() == 'adaptive_ngc':
         receiver = Adaptive_NGC_receiver(
@@ -584,7 +588,8 @@ def train(
 
     model.train()
 
-    torch.cuda.synchronize(device)
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
     t_epoch_start = time.perf_counter()
 
     last_wall = time.perf_counter()
@@ -625,22 +630,11 @@ def train(
         # ENGC
         # ----------------------------------------------------------------
         if args.optimizer.lower() == 'engc':
+            # ① Cross-gradients g_k^{ji}: vacuity-weighted CE on neighbor j's model
+            cross_grad, ref_buf = sender(cross_weights, input_var, target_var)
+
+            # ② Self-gradient g_k^{ii}: standard local loss
             output = model(input_var)
-
-            # Per-sample loss của model B trên D_B — dùng để tính U_epi.
-            # Dùng cùng EDL formula với loss_a bên trong _accumulate_gradients
-            # để hai giá trị có cùng scale khi so sánh.
-            with torch.no_grad():
-                loss_b_per_sample = edl_loss(
-                    output.detach(), target_var, args.classes,
-                    lambda_kl=args.edl_lambda, return_per_sample=True,
-                )
-
-            cross_grad, ref_buf = sender(
-                cross_weights, input_var, target_var,
-                loss_b_per_sample=loss_b_per_sample,
-            )
-
             if args.edl_main:
                 loss = edl_loss(output, target_var, args.classes,
                                 lambda_kl=args.edl_lambda)
@@ -656,63 +650,40 @@ def train(
 
             loss.backward()
 
+            # ③ SendReceive(g_k^{ji}) — exchange cross-gradients
             cross_grad_copy = copy.deepcopy(cross_grad)
             _, amt_data_transfer, received_cross_grad = model.transfer_additional(cross_grad)
             comm_calls_transfer_additional += 1
             payload_bytes_from_calls       += amt_data_transfer
             data_transferred               += amt_data_transfer
 
-            U_epi_scores   = sender.U_epi_scores   if args.use_edl else None
-            acc_scores     = sender.acc_scores     if args.use_edl else None
-            vacuity_scores = sender.vacuity_scores if args.use_edl else None
-            loss_scores    = sender.loss_scores    if args.use_edl else None
-
-            if vacuity_scores and i % args.print_freq == 0:
-                from optimizers.engc import log_vacuity_stats
-                log_vacuity_stats(dist.get_rank(), global_steps, vacuity_scores)
-
+            # ④ Blend: g̃ = (1-α)*p_comp + α*p_comm, weighted by trust(vacuity)
             receiver(received_cross_grad, cross_grad_copy, ref_buf,
-                     U_epi_scores=U_epi_scores,
-                     acc_scores=acc_scores,
-                     vacuity_scores=vacuity_scores, loss_scores=loss_scores)
+                     vacuity_scores=sender.vacuity_scores)
             receiver.project_gradients(lr)
 
-            # --- Accumulate ENGC diagnostics ---
+            # --- Diagnostics ---
             for r, w in receiver.last_neighbor_weights.items():
                 _engc_trust.setdefault(r, []).append(w)
 
-            # --- Periodic diagnostic print ---
-            if i % args.print_freq == 0 and sender.U_epi_scores:
+            if i % args.print_freq == 0:
                 noise_ranks = set(
                     int(x) for x in args.noise_agents.split(',') if x.strip()
                 ) if args.noise_agents else set()
-
-                header = (f"[ENGC-Diag][Rank {dist.get_rank()}]"
-                          f"[Ep {epoch}][{i}/{len(train_loader)}]")
-                # Red flags:
-                #   U_epi[N] ≈ U_epi[c] → U_epi không discriminative
-                #   sw_frac_low ≈ 0      → không sample nào bị downweight
-                #   w[N] ≈ w[c]          → trust không phân biệt được
-                print(header)
-                # w_comp = weight for model-variant (U_epi based)
-                # w_comm = weight for data-variant  (U_ale based)
-                # Red flags:
-                #   w_comp[N] ≈ w_comp[c] → U_epi không phân biệt được
-                #   w_comm[N] ≈ w_comm[c] → U_ale không phân biệt được
-                fmt = ("  {tag:<8} U_epi={uepi:>5.3f}  U_ale={ale:>5.3f}"
-                       "  w_comp={wc:>5.3f}  w_comm={wm:>5.3f}"
-                       "  sw_mean={swm:>5.3f}  sw_frac_low={swf:>5.3f}")
-                for r in sorted(sender.U_epi_scores):
-                    tag = f"peer{r}{'[N]' if r in noise_ranks else '[c]'}"
-                    sw  = sender.sample_weight_stats.get(r, {})
+                print(f"[ENGC-Diag][Rank {dist.get_rank()}]"
+                      f"[Ep {epoch}][{i}/{len(train_loader)}]")
+                fmt = "  {tag:<10} vac={vac:>5.3f}  trust={trust:>5.3f}  w={w:>5.3f}  sw_low%={sw:>4.2f}"
+                for r in sorted(sender.vacuity_scores):
+                    tag   = f"peer{r}{'[N]' if r in noise_ranks else '[c]'}"
+                    vac_r = sender.vacuity_scores.get(r, float('nan'))
+                    trust = max(0.1, 1.0 - vac_r)
+                    sw    = sender.sample_weight_stats.get(r, {})
                     print(fmt.format(
-                        tag  = tag,
-                        uepi = sender.U_epi_scores.get(r, float('nan')),
-                        ale  = receiver.last_aleatoric_scores.get(r, float('nan')),
-                        wc   = receiver.last_weights_comp.get(r, float('nan')),
-                        wm   = receiver.last_weights_comm.get(r, float('nan')),
-                        swm  = sw.get('mean',     float('nan')),
-                        swf  = sw.get('frac_low', float('nan')),
+                        tag   = tag,
+                        vac   = vac_r,
+                        trust = trust,
+                        w     = receiver.last_neighbor_weights.get(r, float('nan')),
+                        sw    = sw.get('frac_low', float('nan')),
                     ))
 
             global_steps += 1
@@ -837,7 +808,8 @@ def train(
             f"F1 = {f1:.2f}"
         )
 
-    torch.cuda.synchronize(device)
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
     train_time_s = time.perf_counter() - t_epoch_start
 
     cpu_avg = float(sum(cpu_samples) / max(len(cpu_samples), 1)) if cpu_samples else 0.0
@@ -1039,8 +1011,13 @@ def flatten_tensors(tensors):
     return flat
 
 
-def init_process(rank, size, fn, backend='nccl'):
-    torch.cuda.set_device(rank)
+def init_process(rank, size, fn, backend=None):
+    num_gpus = torch.cuda.device_count()
+    if backend is None:
+        # nccl requires one dedicated GPU per rank; gloo works with shared GPUs or CPU
+        backend = 'nccl' if num_gpus >= size else 'gloo'
+    if num_gpus > 0:
+        torch.cuda.set_device(rank % num_gpus)
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = args.port
     dist.init_process_group(backend, rank=rank, world_size=size)
