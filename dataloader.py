@@ -13,6 +13,77 @@ from sklearn.model_selection import train_test_split
 import torchvision.transforms.functional as TF
 
 
+# ---------------------------------------------------------------------------
+# Fed-ISIC2019 (flwrlabs/fed-isic2019) — 8 skin-lesion classes
+# Saved to disk by dataset/download_fedisic2019.py
+# ---------------------------------------------------------------------------
+_FEDISIC2019_CLASSES = ["MEL", "NV", "BCC", "AK", "BKL", "DF", "VASC", "SCC"]
+_FEDISIC2019_NUM_CLASSES = len(_FEDISIC2019_CLASSES)  # 8
+
+# ISIC 2019 channel statistics (computed on training set at native resolution)
+_FEDISIC2019_MEAN = [0.6681, 0.5301, 0.5247]
+_FEDISIC2019_STD  = [0.1337, 0.1480, 0.1595]
+
+
+class FedISIC2019Dataset(torch.utils.data.Dataset):
+    """
+    Loads Fed-ISIC2019 from images saved by download_fedisic2019.py.
+
+    Exposes .y and .indices so DataPartitioner can extract per-sample labels
+    without iterating the whole dataset (same contract as HAM10000ImageDataset).
+    """
+
+    def __init__(self, images_dir: str, meta_path: str, transform=None):
+        self.images_dir = images_dir
+        self.transform  = transform
+
+        df = pd.read_csv(meta_path)
+        ids    = df["isic_id"].astype(str).str.strip().tolist()
+        labels = df["label"].to_numpy(dtype=np.int64)
+
+        # Keep only images that actually exist on disk
+        keep = [i for i, id_ in enumerate(ids)
+                if os.path.exists(os.path.join(images_dir, f"{id_}.jpg"))]
+        if len(keep) < len(ids):
+            print(f"[FedISIC2019] {len(ids) - len(keep)} images missing on disk — skipped")
+
+        self.ids     = [ids[i]    for i in keep]
+        self.y       = labels[keep]                   # global label array  [N]
+        self.indices = np.arange(len(self.y))         # full range          [N]
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, i):
+        idx      = int(self.indices[i])
+        img_path = os.path.join(self.images_dir, f"{self.ids[idx]}.jpg")
+        img      = Image.open(img_path).convert("RGB")
+        target   = int(self.y[idx])
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, target
+
+
+def _load_fedisic2019_images(data_dir: str, train: bool, transform) -> FedISIC2019Dataset:
+    images_dir = os.path.join(data_dir, "images")
+    if not os.path.isdir(images_dir):
+        raise FileNotFoundError(
+            f"images/ not found in {data_dir}\n"
+            "Run: python dataset/download_fedisic2019.py --out-dir <data_dir>"
+        )
+    meta_fname = "metadata_train.csv" if train else "metadata_test.csv"
+    meta_path  = os.path.join(data_dir, meta_fname)
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(
+            f"Metadata not found: {meta_path}\n"
+            "Run: python dataset/download_fedisic2019.py --out-dir <data_dir>"
+        )
+    return FedISIC2019Dataset(images_dir, meta_path, transform=transform)
+
+
+# ---------------------------------------------------------------------------
+# HAM10000 label map
+# ---------------------------------------------------------------------------
 _HAM10000_DX_TO_LABEL = {
     # canonical HAM10000 short codes
     "akiec": 0,
@@ -156,170 +227,6 @@ class HAM10000ImageDataset(torch.utils.data.Dataset):
         if self.transform is not None:
             img = self.transform(img)
         return img, target
-
-# ------------------------------------------------------------------
-# Camelyon17 — binary patch classification (tumor / no tumor)
-# Supported structures:
-#   (A) images/ dir + metadata.csv  (columns: image_id, label)
-#   (B) ImageFolder layout  (0/ and 1/ subdirs, or train/ val/ splits)
-# ------------------------------------------------------------------
-
-_CAMELYON17_IMG_EXTS = ('.png', '.jpg', '.jpeg', '.tif', '.tiff')
-
-
-class Camelyon17Dataset(torch.utils.data.Dataset):
-    """Image dataset backed by a flat directory + id/label/site arrays."""
-
-    def __init__(self, images_dir: str, ids, y, indices=None,
-                 transform=None, sites=None):
-        self.images_dir = images_dir
-        self.ids        = list(ids)
-        self.y          = np.asarray(y, dtype=np.int64)
-        self.indices    = np.asarray(indices) if indices is not None else np.arange(len(self.y))
-        self.transform  = transform
-        # site/center metadata for site-based partitioning (optional)
-        self.sites      = np.asarray(sites) if sites is not None else None
-
-    def __len__(self):
-        return len(self.indices)
-
-    def __getitem__(self, i):
-        idx    = int(self.indices[i])
-        img_id = self.ids[idx]
-        # try each extension
-        img_path = None
-        for ext in _CAMELYON17_IMG_EXTS:
-            p = os.path.join(self.images_dir, f"{img_id}{ext}")
-            if os.path.exists(p):
-                img_path = p
-                break
-        if img_path is None:
-            # bare path (extension already included in id)
-            img_path = os.path.join(self.images_dir, img_id)
-        img    = Image.open(img_path).convert("RGB")
-        target = int(self.y[idx])
-        if self.transform is not None:
-            img = self.transform(img)
-        return img, target
-
-
-def _find_camelyon17_metadata(data_dir: str):
-    """Return (metadata_path, images_dir) or raise FileNotFoundError."""
-    candidates = [
-        os.path.join(data_dir, "metadata.csv"),
-        os.path.join(data_dir, "labels.csv"),
-        os.path.join(data_dir, "train_labels.csv"),
-    ]
-    for p in candidates:
-        if os.path.exists(p):
-            img_dir = os.path.join(data_dir, "images")
-            if not os.path.isdir(img_dir):
-                img_dir = data_dir        # images sit directly in data_dir
-            return p, img_dir
-    return None, None
-
-
-def _load_camelyon17_images(data_dir: str, seed: int, train: bool, transform):
-    """
-    Flexible loader for Camelyon17 binary classification.
-    Also loads 'center'/'hospital' column when available for site-based partitioning.
-
-    Tries in order:
-      1. metadata.csv + images/ directory
-      2. ImageFolder layout (train/ val/ or 0/ 1/ subdirs)
-    """
-    meta_path, images_dir = _find_camelyon17_metadata(data_dir)
-
-    # ---- Option A: flat directory + CSV ----
-    if meta_path is not None:
-        df = pd.read_csv(meta_path)
-
-        # find image id column
-        id_col = next(
-            (c for c in ["image_id", "isic_id", "id", "name", "filename", "file", "patch_id"]
-             if c in df.columns),
-            df.columns[0],
-        )
-
-        # find binary label column (0 = no tumor, 1 = tumor)
-        label_col = next(
-            (c for c in ["label", "tumor", "target", "class", "y", "is_tumor"]
-             if c in df.columns),
-            None,
-        )
-        if label_col is None:
-            raise ValueError(
-                f"Cannot find label column in Camelyon17 metadata. "
-                f"Columns: {list(df.columns)}"
-            )
-
-        # find site/center column (optional — used for site-based partitioning)
-        site_col = next(
-            (c for c in ["center", "hospital", "site", "scanner", "slide_center"]
-             if c in df.columns),
-            None,
-        )
-
-        ids_raw   = df[id_col].astype(str).str.strip().tolist()
-        y_raw     = df[label_col].to_numpy(dtype=np.int64)
-        sites_raw = df[site_col].to_numpy(dtype=np.int64) if site_col else None
-
-        # keep only rows whose image file actually exists
-        keep_ids, keep_y, keep_sites = [], [], []
-        for i, (_id, _lab) in enumerate(zip(ids_raw, y_raw)):
-            found = False
-            for ext in _CAMELYON17_IMG_EXTS:
-                if os.path.exists(os.path.join(images_dir, f"{_id}{ext}")):
-                    keep_ids.append(_id)
-                    keep_y.append(int(_lab))
-                    if sites_raw is not None:
-                        keep_sites.append(int(sites_raw[i]))
-                    found = True
-                    break
-            if not found and os.path.exists(os.path.join(images_dir, _id)):
-                keep_ids.append(_id)
-                keep_y.append(int(_lab))
-                if sites_raw is not None:
-                    keep_sites.append(int(sites_raw[i]))
-
-        if len(keep_ids) == 0:
-            raise FileNotFoundError(
-                f"No Camelyon17 images matched metadata entries in {images_dir}"
-            )
-
-        y2     = np.array(keep_y, dtype=np.int64)
-        sites2 = np.array(keep_sites, dtype=np.int64) if keep_sites else None
-        all_idx = np.arange(len(y2))
-        tr_idx, va_idx = train_test_split(
-            all_idx, test_size=0.2, random_state=seed, stratify=y2
-        )
-        indices = tr_idx if train else va_idx
-        return Camelyon17Dataset(images_dir, keep_ids, y2,
-                                 indices=indices, transform=transform, sites=sites2)
-
-    # ---- Option B: ImageFolder layout ----
-    split_dir = os.path.join(data_dir, "train" if train else "val")
-    if os.path.isdir(split_dir):
-        return datasets.ImageFolder(split_dir, transform=transform)
-
-    # no pre-split: build from 0/ and 1/ class dirs and split manually
-    if os.path.isdir(os.path.join(data_dir, "0")) or os.path.isdir(os.path.join(data_dir, "1")):
-        full_ds = datasets.ImageFolder(data_dir, transform=transform)
-        y_all   = np.array([s[1] for s in full_ds.samples])
-        all_idx = np.arange(len(full_ds))
-        tr_idx, va_idx = train_test_split(
-            all_idx, test_size=0.2, random_state=seed, stratify=y_all
-        )
-        indices = tr_idx if train else va_idx
-        full_ds.samples = [full_ds.samples[i] for i in indices]
-        full_ds.targets = [full_ds.targets[i] for i in indices]
-        return full_ds
-
-    raise FileNotFoundError(
-        f"Cannot find Camelyon17 data in {data_dir}. "
-        f"Expected metadata.csv + images/ OR ImageFolder layout (0/, 1/ or train/, val/)."
-    )
-
 
 def _load_ham10000_images(data_dir: str, seed: int, train: bool, transform):
     images_dir = os.path.join(data_dir, "images")
@@ -585,71 +492,6 @@ def make_quality_profiles(
     raise ValueError(f"Unknown mode: {mode}")
 
 
-# ------------------------------------------------------------------
-# Site-based partitioner for Camelyon17
-# Each node gets data from specific hospital sites → true feature skew
-# ------------------------------------------------------------------
-
-class SiteBasedPartitioner:
-    """
-    Partition Camelyon17 by hospital site (center column).
-
-    Strategy:
-      - If world_size <= n_sites: each node gets 1-2 hospitals exclusively
-        → maximum feature skew (covariate shift between nodes)
-      - If world_size > n_sites: cycle-assign sites to nodes, then split
-        evenly within each node's site pool
-
-    Each node still gets BOTH labels (tumor + no tumor) from its assigned
-    hospital(s), which is the realistic federated setup for binary medical
-    classification.
-    """
-
-    def __init__(self, dataset: Camelyon17Dataset, world_size: int, seed: int):
-        if dataset.sites is None:
-            raise ValueError(
-                "SiteBasedPartitioner requires site metadata. "
-                "Ensure metadata.csv has a 'center' or 'hospital' column."
-            )
-
-        self.world_size  = world_size
-        self.partitions  = [[] for _ in range(world_size)]
-
-        # build site → indices map (global indices into dataset.indices)
-        site_to_pos = {}
-        for pos in range(len(dataset)):
-            global_idx = int(dataset.indices[pos])
-            site = int(dataset.sites[global_idx])
-            site_to_pos.setdefault(site, []).append(pos)
-
-        all_sites = sorted(site_to_pos.keys())
-        n_sites   = len(all_sites)
-        rng       = np.random.RandomState(seed)
-
-        # assign sites to nodes (round-robin when world_size > n_sites)
-        node_sites = {i: [] for i in range(world_size)}
-        for s_idx, site in enumerate(all_sites):
-            node_sites[s_idx % world_size].append(site)
-
-        for node in range(world_size):
-            pool = []
-            for site in node_sites[node]:
-                pool.extend(site_to_pos[site])
-            rng.shuffle(pool)
-            self.partitions[node] = pool
-
-    def use(self, rank: int) -> "Partition":
-        # wrap as a Partition-compatible object
-        return _IndexedPartition(self.partitions[rank])
-
-
-class _IndexedPartition:
-    """Minimal Partition-like wrapper holding a list of positional indices."""
-    def __init__(self, pos_indices: list):
-        self.index = pos_indices
-        self.data  = None   # not used; SiteBasedPartitioner passes dataset directly
-
-
 class Partition(object):
     def __init__(self, data, index):
         self.data = data
@@ -737,8 +579,7 @@ class DataPartitioner(object):
 def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size,
                         num_classes, noise_rate=0.0, noise_agents=None,
                         quality_mode: str = "uniform", quality_profiles: list = None,
-                        noise_type: str = "uniform", noise_alpha: float = 0.1,
-                        camelyon_partition: str = "site"):
+                        noise_type: str = "uniform", noise_alpha: float = 0.1):
     """Partitioning dataset""" 
     if dataset_name== 'cifar10':
         normalize   = transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
@@ -810,53 +651,32 @@ def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size,
         ])
         dataset = _load_ham10000_images(data_dir=data_dir, seed=seed, train=True, transform=train_tf)
 
-    elif dataset_name == "camelyon17":
-        # ImageNet stats work well for histopathology transfer learning
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                         std=[0.229, 0.224, 0.225])
+    elif dataset_name == "fedisic2019":
+        # Fed-ISIC2019: 8 classes, images pre-downloaded by download_fedisic2019.py
+        # skew=1 → label-sorted non-IID partition (each agent holds mostly 1-2 classes)
+        # skew=0 → IID random partition
+        # 0<skew<1 → mixed
+        normalize = transforms.Normalize(
+            mean=_FEDISIC2019_MEAN, std=_FEDISIC2019_STD
+        )
         train_tf = transforms.Compose([
             transforms.Resize((32, 32)),
             transforms.RandomHorizontalFlip(),
             transforms.RandomVerticalFlip(),
             transforms.RandomRotation(15),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2,
-                                   saturation=0.2, hue=0.05),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
             transforms.ToTensor(),
             normalize,
         ])
-        dataset = _load_camelyon17_images(data_dir=data_dir, seed=seed,
-                                          train=True, transform=train_tf)
+        dataset = _load_fedisic2019_images(data_dir=data_dir, train=True, transform=train_tf)
 
     rank = dist.get_rank()
     size = dist.get_world_size()
 
-    # --- Camelyon17: site-based partitioning (feature skew) ---
-    if dataset_name == "camelyon17" and camelyon_partition == "site" \
-            and isinstance(dataset, Camelyon17Dataset) and dataset.sites is not None:
-        sp = SiteBasedPartitioner(dataset, world_size=size, seed=seed)
-        site_part = sp.use(rank)
-        # wrap into QualityPartition-compatible form
-        raw_partition = type("_P", (), {"data": dataset, "index": site_part.index})()
-        n_sites = len(np.unique(dataset.sites[dataset.indices]))
-        if rank == 0:
-            print(f"[Camelyon17] Site-based partitioning: "
-                  f"{n_sites} hospitals → {size} nodes")
-            for node in range(size):
-                p = sp.use(node)
-                node_sites = sorted({
-                    int(dataset.sites[int(dataset.indices[i])]) for i in p.index
-                })
-                print(f"  Node {node}: hospitals {node_sites} ({len(p.index)} samples)")
-    else:
-        # Label-skew partitioning (fallback / non-Camelyon datasets)
-        if dataset_name == "camelyon17" and camelyon_partition == "label":
-            if rank == 0:
-                print("[Camelyon17] Using label-skew partitioning "
-                      f"(skew={skew}). Recommended: use --camelyon-partition site")
-        partition_sizes = [1.0 / size for _ in range(size)]
-        dp = DataPartitioner(dataset, partition_sizes, skew=skew,
-                             seed=seed, dataset_name=dataset_name)
-        raw_partition = dp.use(rank)
+    partition_sizes = [1.0 / size for _ in range(size)]
+    dp = DataPartitioner(dataset, partition_sizes, skew=skew,
+                         seed=seed, dataset_name=dataset_name)
+    raw_partition = dp.use(rank)
 
     # --- Build quality profile ---
     if quality_profiles is None:
@@ -957,16 +777,16 @@ def test_Dataset(dataset_name, data_dir, seed=321):
         ])
         dataset = _load_ham10000_images(data_dir=data_dir, seed=seed, train=False, transform=val_tf)
 
-    elif dataset_name == "camelyon17":
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                         std=[0.229, 0.224, 0.225])
+    elif dataset_name == "fedisic2019":
+        normalize = transforms.Normalize(
+            mean=_FEDISIC2019_MEAN, std=_FEDISIC2019_STD
+        )
         val_tf = transforms.Compose([
             transforms.Resize((32, 32)),
             transforms.ToTensor(),
             normalize,
         ])
-        dataset = _load_camelyon17_images(data_dir=data_dir, seed=seed,
-                                          train=False, transform=val_tf)
+        dataset = _load_fedisic2019_images(data_dir=data_dir, train=False, transform=val_tf)
 
     val_bsz = 128
     val_set = torch.utils.data.DataLoader(dataset, batch_size=val_bsz, shuffle=False, num_workers=0)
