@@ -3,7 +3,7 @@ Download Fed-ISIC2019 from HuggingFace (flwrlabs/fed-isic2019) and cache
 images + metadata to disk for use with dataloader.py.
 
 Usage:
-    python dataset/download_fedisic2019.py --out-dir ../../data/fedisic2019
+    python dataset/download_fedisic2019.py --out-dir ../data/fedisic2019
 
 Output layout:
     ../../data/fedisic2019/

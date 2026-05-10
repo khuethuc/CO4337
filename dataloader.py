@@ -716,14 +716,10 @@ def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size,
     rank = dist.get_rank()
     size = dist.get_world_size()
 
-    if dataset_name == "fedisic2019":
-        my_indices    = _fedisic2019_center_split(dataset, rank, size, seed)
-        raw_partition = Partition(dataset, my_indices)
-    else:
-        partition_sizes = [1.0 / size for _ in range(size)]
-        dp = DataPartitioner(dataset, partition_sizes, skew=skew,
-                             seed=seed, dataset_name=dataset_name)
-        raw_partition = dp.use(rank)
+    partition_sizes = [1.0 / size for _ in range(size)]
+    dp = DataPartitioner(dataset, partition_sizes, skew=skew,
+                         seed=seed, dataset_name=dataset_name)
+    raw_partition = dp.use(rank)
 
     # --- Build quality profile ---
     if quality_profiles is None:
