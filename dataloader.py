@@ -11,6 +11,7 @@ import pandas as pd
 from PIL import Image
 from sklearn.model_selection import train_test_split
 import torchvision.transforms.functional as TF
+import math
 
 
 # ---------------------------------------------------------------------------
@@ -38,8 +39,9 @@ class FedISIC2019Dataset(torch.utils.data.Dataset):
         self.transform  = transform
 
         df = pd.read_csv(meta_path)
-        ids    = df["isic_id"].astype(str).str.strip().tolist()
-        labels = df["label"].to_numpy(dtype=np.int64)
+        ids     = df["isic_id"].astype(str).str.strip().tolist()
+        labels  = df["label"].to_numpy(dtype=np.int64)
+        centers = df["center_id"].tolist() if "center_id" in df.columns else [-1] * len(ids)
 
         # Keep only images that actually exist on disk
         keep = [i for i, id_ in enumerate(ids)
@@ -47,9 +49,10 @@ class FedISIC2019Dataset(torch.utils.data.Dataset):
         if len(keep) < len(ids):
             print(f"[FedISIC2019] {len(ids) - len(keep)} images missing on disk — skipped")
 
-        self.ids     = [ids[i]    for i in keep]
-        self.y       = labels[keep]                   # global label array  [N]
-        self.indices = np.arange(len(self.y))         # full range          [N]
+        self.ids     = [ids[i]     for i in keep]
+        self.y       = labels[keep]
+        self.centers = [centers[i] for i in keep]
+        self.indices = np.arange(len(self.y))
 
     def __len__(self):
         return len(self.indices)
@@ -79,6 +82,46 @@ def _load_fedisic2019_images(data_dir: str, train: bool, transform) -> FedISIC20
             "Run: python dataset/download_fedisic2019.py --out-dir <data_dir>"
         )
     return FedISIC2019Dataset(images_dir, meta_path, transform=transform)
+
+
+def _fedisic2019_center_split(dataset: FedISIC2019Dataset, rank: int, world_size: int, seed: int) -> list:
+    """
+    Partition Fed-ISIC-2019 by pre-assigned center_id.
+
+    Scaling rule (num_centers = 6 for fed-isic2019):
+      - world_size <= num_centers : agent `rank` → center `rank % num_centers`
+      - world_size >  num_centers : centers are reused round-robin; each center's
+        data is further split evenly among the agents assigned to it.
+
+    Assignment: agent rank → center index  (rank % num_centers)
+                           → sub-partition (rank // num_centers)
+
+    Example with 10 agents, 6 centers:
+      rank 0,6 → center 0 (split into 2)   rank 4 → center 4 (not split)
+      rank 1,7 → center 1 (split into 2)   rank 5 → center 5 (not split)
+      rank 2,8 → center 2 (split into 2)
+      rank 3,9 → center 3 (split into 2)
+    """
+    unique_centers = sorted(set(dataset.centers))
+    num_centers    = len(unique_centers)
+    center_idx     = rank % num_centers
+    sub_rank       = rank // num_centers
+    my_center      = unique_centers[center_idx]
+
+    center_flat = [i for i, c in enumerate(dataset.centers) if c == my_center]
+
+    # Number of agents sharing this center
+    agents_this_center = math.ceil((world_size - center_idx) / num_centers)
+
+    rng = np.random.RandomState(seed + center_idx)
+    arr = np.array(center_flat)
+    rng.shuffle(arr)
+    splits = np.array_split(arr, agents_this_center)
+
+    my_indices = splits[sub_rank].tolist()
+    print(f"[FedISIC2019][Rank {rank}] center={my_center} "
+          f"sub={sub_rank}/{agents_this_center} samples={len(my_indices)}")
+    return my_indices
 
 
 # ---------------------------------------------------------------------------
@@ -673,10 +716,14 @@ def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size,
     rank = dist.get_rank()
     size = dist.get_world_size()
 
-    partition_sizes = [1.0 / size for _ in range(size)]
-    dp = DataPartitioner(dataset, partition_sizes, skew=skew,
-                         seed=seed, dataset_name=dataset_name)
-    raw_partition = dp.use(rank)
+    if dataset_name == "fedisic2019":
+        my_indices    = _fedisic2019_center_split(dataset, rank, size, seed)
+        raw_partition = Partition(dataset, my_indices)
+    else:
+        partition_sizes = [1.0 / size for _ in range(size)]
+        dp = DataPartitioner(dataset, partition_sizes, skew=skew,
+                             seed=seed, dataset_name=dataset_name)
+        raw_partition = dp.use(rank)
 
     # --- Build quality profile ---
     if quality_profiles is None:

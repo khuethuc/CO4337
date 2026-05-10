@@ -259,7 +259,7 @@ def run(rank, size):
     if rank == 0:
         print(f"[Info] local_class_weights rank {rank}: {local_class_weights.detach().cpu().tolist()}")
 
-    criterion = nn.CrossEntropyLoss().to(device)
+    criterion = nn.CrossEntropyLoss(weight=local_class_weights).to(device)
 
     # --- Build sender ---
     if args.optimizer.lower() == 'cga':

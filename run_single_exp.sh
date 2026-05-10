@@ -3,7 +3,7 @@ python trainer.py \
   --lr 0.01 --batch-size 160 \
   --world_size 5 --skew 1 \
   --gamma 0.1 --normtype evonorm \
-  --epochs 5 \
+  --epochs 50 \
   --optimizer engc \
   --arch cganet \
   --momentum 0.9 \
