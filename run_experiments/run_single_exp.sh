@@ -1,3 +1,7 @@
+#!/bin/bash
+LOG_DIR="outputs/engc_cganet_nodes_5_evonorm_lr_0.01_gamma_0.1_alpha_1.0_skew_1.0_ring"
+mkdir -p "${LOG_DIR}/excel_data"
+
 python trainer.py \
   --data-dir ../data/ham10000 --dataset ham10000 --classes 7 \
   --lr 0.01 --batch-size 160 \
@@ -17,4 +21,5 @@ python trainer.py \
   --weight_decay 1e-4 \
   --steplr \
   --edl-lambda 1.0 \
-  --use-edl
+  --use-edl \
+  2>&1 | tee "${LOG_DIR}/training_log.txt"

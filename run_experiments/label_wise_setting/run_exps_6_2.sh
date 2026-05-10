@@ -117,9 +117,6 @@ run_exp murmura      10 full "${HAM[@]}" "${FULL10[@]}" "${OPT_MURMURA[@]}"
 # ==============================================================================
 
 printf '\n\n### FED-ISIC-2019 | 5 nodes | Full ###\n'
-run_exp engc         5 full "${ISIC[@]}" "${FULL5[@]}" "${OPT_ENGC[@]}"
-run_exp ngc          5 full "${ISIC[@]}" "${FULL5[@]}" "${OPT_NGC[@]}"
-run_exp cga          5 full "${ISIC[@]}" "${FULL5[@]}" "${OPT_CGA[@]}"
 run_exp adaptive_ngc 5 full "${ISIC[@]}" "${FULL5[@]}" "${OPT_ALPHA[@]}"
 run_exp topkngc      5 full "${ISIC[@]}" "${FULL5[@]}" "${OPT_TOPK[@]}"
 run_exp murmura      5 full "${ISIC[@]}" "${FULL5[@]}" "${OPT_MURMURA[@]}"
