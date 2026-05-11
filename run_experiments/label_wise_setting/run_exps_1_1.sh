@@ -80,9 +80,6 @@ printf '\n\n### HAM10000 | 5 nodes | Ring ###\n'
 run_exp engc         5 ring "${HAM[@]}" "${RING[@]}"  "${OPT_ENGC[@]}"
 run_exp ngc          5 ring "${HAM[@]}" "${RING[@]}"  "${OPT_NGC[@]}"
 run_exp cga          5 ring "${HAM[@]}" "${RING[@]}"  "${OPT_CGA[@]}"
-run_exp adaptive_ngc 5 ring "${HAM[@]}" "${RING[@]}"  "${OPT_ALPHA[@]}"
-run_exp topkngc      5 ring "${HAM[@]}" "${RING[@]}"  "${OPT_TOPK[@]}"
-run_exp murmura      5 ring "${HAM[@]}" "${RING[@]}"  "${OPT_MURMURA[@]}"
 
 
 printf '\n\nAll experiments finished: %s\n' "$(date)"

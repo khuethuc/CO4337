@@ -73,16 +73,12 @@ run_exp() {
 }
 
 # ==============================================================================
-#  HAM10000  —  10 nodes - ring
+#  HAM10000  —  5 nodes - full
 # ==============================================================================
 
-printf '\n\n### HAM10000 | 10 nodes | Ring ###\n'
-run_exp engc         10 ring "${HAM[@]}" "${RING[@]}"  "${OPT_ENGC[@]}"
-run_exp ngc          10 ring "${HAM[@]}" "${RING[@]}"  "${OPT_NGC[@]}"
-run_exp cga          10 ring "${HAM[@]}" "${RING[@]}"  "${OPT_CGA[@]}"
-run_exp adaptive_ngc 10 ring "${HAM[@]}" "${RING[@]}"  "${OPT_ALPHA[@]}"
-run_exp topkngc      10 ring "${HAM[@]}" "${RING[@]}"  "${OPT_TOPK[@]}"
-run_exp murmura      10 ring "${HAM[@]}" "${RING[@]}"  "${OPT_MURMURA[@]}"
-
+printf '\n\n### HAM10000 | 5 nodes | Full ###\n'
+run_exp engc         5 full "${HAM[@]}" "${FULL5[@]}" "${OPT_ENGC[@]}"
+run_exp ngc          5 full "${HAM[@]}" "${FULL5[@]}" "${OPT_NGC[@]}"
+run_exp cga          5 full "${HAM[@]}" "${FULL5[@]}" "${OPT_CGA[@]}"
 
 printf '\n\nAll experiments finished: %s\n' "$(date)"

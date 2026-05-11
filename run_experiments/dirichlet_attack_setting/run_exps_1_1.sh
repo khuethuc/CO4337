@@ -47,7 +47,7 @@ OPT_TOPK=(--optimizer topkngc)
 OPT_MURMURA=(--optimizer murmura)
 
 # Dirichlet attack args (20% of nodes)
-NOISE5=(--noise-rate 0.2 --noise-type dirichlet --noise-agents "4")
+NOISE5=(--noise-rate 0.2 --noise-type dirichlet --noise-agents "2,3,4")
 NOISE10=(--noise-rate 0.2 --noise-type dirichlet --noise-agents "8,9")
 
 # run_exp <optimizer_name> <world_size> <graph_name> [extra trainer args...] —

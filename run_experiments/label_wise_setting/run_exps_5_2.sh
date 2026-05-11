@@ -80,7 +80,6 @@ run_exp() {
 printf '\n\n### FED-ISIC-2019 | 5 nodes | Ring ###\n'
 run_exp adaptive_ngc 5 ring "${ISIC[@]}" "${RING[@]}"  "${OPT_ALPHA[@]}"
 run_exp topkngc      5 ring "${ISIC[@]}" "${RING[@]}"  "${OPT_TOPK[@]}"
-run_exp murmura      5 ring "${ISIC[@]}" "${RING[@]}"  "${OPT_MURMURA[@]}"
 
 
 printf '\n\nAll experiments finished: %s\n' "$(date)"

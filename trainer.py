@@ -251,15 +251,7 @@ def run(rank, size):
 
     check_noniid(train_loader, rank, args.world_size)
 
-    local_class_weights = compute_local_class_weights(
-        train_loader=train_loader,
-        num_classes=args.classes,
-        device=device,
-    )
-    if rank == 0:
-        print(f"[Info] local_class_weights rank {rank}: {local_class_weights.detach().cpu().tolist()}")
-
-    criterion = nn.CrossEntropyLoss(weight=local_class_weights).to(device)
+    criterion = nn.CrossEntropyLoss().to(device)
 
     # --- Build sender ---
     if args.optimizer.lower() == 'cga':

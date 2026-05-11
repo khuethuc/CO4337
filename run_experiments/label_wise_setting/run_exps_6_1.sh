@@ -73,46 +73,6 @@ run_exp() {
 }
 
 # ==============================================================================
-#  HAM10000  —  5 nodes
-# ==============================================================================
-
-printf '\n\n### HAM10000 | 5 nodes | Ring ###\n'
-run_exp engc         5 ring "${HAM[@]}" "${RING[@]}"  "${OPT_ENGC[@]}"
-run_exp ngc          5 ring "${HAM[@]}" "${RING[@]}"  "${OPT_NGC[@]}"
-run_exp cga          5 ring "${HAM[@]}" "${RING[@]}"  "${OPT_CGA[@]}"
-run_exp adaptive_ngc 5 ring "${HAM[@]}" "${RING[@]}"  "${OPT_ALPHA[@]}"
-run_exp topkngc      5 ring "${HAM[@]}" "${RING[@]}"  "${OPT_TOPK[@]}"
-run_exp murmura      5 ring "${HAM[@]}" "${RING[@]}"  "${OPT_MURMURA[@]}"
-
-printf '\n\n### HAM10000 | 5 nodes | Full ###\n'
-run_exp engc         5 full "${HAM[@]}" "${FULL5[@]}" "${OPT_ENGC[@]}"
-run_exp ngc          5 full "${HAM[@]}" "${FULL5[@]}" "${OPT_NGC[@]}"
-run_exp cga          5 full "${HAM[@]}" "${FULL5[@]}" "${OPT_CGA[@]}"
-run_exp adaptive_ngc 5 full "${HAM[@]}" "${FULL5[@]}" "${OPT_ALPHA[@]}"
-run_exp topkngc      5 full "${HAM[@]}" "${FULL5[@]}" "${OPT_TOPK[@]}"
-run_exp murmura      5 full "${HAM[@]}" "${FULL5[@]}" "${OPT_MURMURA[@]}"
-
-# ==============================================================================
-#  HAM10000  —  10 nodes
-# ==============================================================================
-
-printf '\n\n### HAM10000 | 10 nodes | Ring ###\n'
-run_exp engc         10 ring "${HAM[@]}" "${RING[@]}"  "${OPT_ENGC[@]}"
-run_exp ngc          10 ring "${HAM[@]}" "${RING[@]}"  "${OPT_NGC[@]}"
-run_exp cga          10 ring "${HAM[@]}" "${RING[@]}"  "${OPT_CGA[@]}"
-run_exp adaptive_ngc 10 ring "${HAM[@]}" "${RING[@]}"  "${OPT_ALPHA[@]}"
-run_exp topkngc      10 ring "${HAM[@]}" "${RING[@]}"  "${OPT_TOPK[@]}"
-run_exp murmura      10 ring "${HAM[@]}" "${RING[@]}"  "${OPT_MURMURA[@]}"
-
-printf '\n\n### HAM10000 | 10 nodes | Full ###\n'
-run_exp engc         10 full "${HAM[@]}" "${FULL10[@]}" "${OPT_ENGC[@]}"
-run_exp ngc          10 full "${HAM[@]}" "${FULL10[@]}" "${OPT_NGC[@]}"
-run_exp cga          10 full "${HAM[@]}" "${FULL10[@]}" "${OPT_CGA[@]}"
-run_exp adaptive_ngc 10 full "${HAM[@]}" "${FULL10[@]}" "${OPT_ALPHA[@]}"
-run_exp topkngc      10 full "${HAM[@]}" "${FULL10[@]}" "${OPT_TOPK[@]}"
-run_exp murmura      10 full "${HAM[@]}" "${FULL10[@]}" "${OPT_MURMURA[@]}"
-
-# ==============================================================================
 #  FED-ISIC-2019  —  5 nodes - full
 # ==============================================================================
 

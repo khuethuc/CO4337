@@ -47,7 +47,7 @@ OPT_TOPK=(--optimizer topkngc)
 OPT_MURMURA=(--optimizer murmura)
 
 # Dirichlet attack args (20% of nodes)
-NOISE5=(--noise-rate 0.2 --noise-type dirichlet --noise-agents "4")
+NOISE5=(--noise-rate 0.2 --noise-type dirichlet --noise-agents "2,3,4")
 NOISE10=(--noise-rate 0.2 --noise-type dirichlet --noise-agents "8,9")
 
 # run_exp <optimizer_name> <world_size> <graph_name> [extra trainer args...] —
@@ -88,7 +88,6 @@ run_exp() {
 printf '\n\n### HAM10000 | 5 nodes | Ring | Dirichlet attack 20%% ###\n'
 run_exp adaptive_ngc 5 ring "${HAM[@]}" "${RING[@]}"  "${OPT_ALPHA[@]}"   "${NOISE5[@]}"
 run_exp topkngc      5 ring "${HAM[@]}" "${RING[@]}"  "${OPT_TOPK[@]}"    "${NOISE5[@]}"
-run_exp murmura      5 ring "${HAM[@]}" "${RING[@]}"  "${OPT_MURMURA[@]}" "${NOISE5[@]}"
 
 
 printf '\n\nAll experiments finished: %s\n' "$(date)"
