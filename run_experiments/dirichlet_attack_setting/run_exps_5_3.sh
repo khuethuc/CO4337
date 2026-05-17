@@ -87,7 +87,8 @@ run_exp() {
 # ==============================================================================
 
 printf '\n\n### FED-ISIC-2019 | 5 nodes | Ring | Dirichlet attack 20%% ###\n'
-run_exp engc         5 ring "${ISIC[@]}" "${RING[@]}"  "${OPT_ENGC[@]}" "${NOISE5[@]}"
-run_exp ngc          5 ring "${ISIC[@]}" "${RING[@]}"  "${OPT_NGC[@]}"  "${NOISE5[@]}"
+run_exp topkngc      5 ring "${ISIC[@]}" "${RING[@]}"  "${OPT_TOPK[@]}"    "${NOISE5[@]}"
+run_exp murmura      5 ring "${ISIC[@]}" "${RING[@]}"  "${OPT_MURMURA[@]}" "${NOISE5[@]}"
+
 
 printf '\n\nAll experiments finished: %s\n' "$(date)"
