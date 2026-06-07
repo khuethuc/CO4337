@@ -46,7 +46,6 @@ from torch.multiprocessing import Process
 from torch.autograd import Variable
 from torch.multiprocessing import spawn
 
-# # # Import custom modules # # #
 from gossip import GossipDataParallel
 from gossip import RingGraph, GridGraph, FullGraph
 from gossip import UniformMixing
@@ -84,43 +83,7 @@ parser.add_argument('--port', dest='port', help='between 3000 to 65000', default
 parser.add_argument("--steplr", action="store_true", help="Uses step lr scheduler for training.")
 parser.add_argument('--nesterov', action='store_true')
 parser.add_argument('--qgm', action='store_true', help='quasi global momentum')
-
-# --- NGC legacy args (kept for backward compat, unused in ENGC H3) ---
-parser.add_argument('--engc-tau-u', dest='engc_tau_u', default=0.5, type=float,
-                    help='[legacy] uncertainty threshold for old trust score')
-parser.add_argument('--engc-wa', dest='engc_wa', default=0.5, type=float,
-                    help='[legacy] accuracy weight for old trust score')
-parser.add_argument('--ngc-self-weight', dest='ngc_self_weight', default=0.60, type=float,
-                    help='reserved weight for local self-gradient inside each NGC branch')
-parser.add_argument('--ngc-score-momentum', dest='ngc_score_momentum', default=0.90, type=float,
-                    help='EMA momentum for branch-wise neighbor compatibility scores')
-parser.add_argument('--ngc-temperature', dest='ngc_temperature', default=0.20, type=float,
-                    help='softmax temperature for neighbor weighting')
-parser.add_argument('--ngc-align-weight', dest='ngc_align_weight', default=0.75, type=float,
-                    help='weight of cosine-alignment score in soft weighting')
-parser.add_argument('--ngc-norm-weight', dest='ngc_norm_weight', default=0.25, type=float,
-                    help='weight of norm-agreement score in soft weighting')
-parser.add_argument('--ngc-min-peer-weight', dest='ngc_min_peer_weight', default=0.00, type=float,
-                    help='minimum peer weight floor after normalization')
-
-# --- EDL / vacuity args (ENGC) ---
-parser.add_argument('--engc-temperature', dest='engc_temperature', default=0.5, type=float,
-                    help='ENGC: temperature for CE-based per-sample weighting. '
-                         'Lower = sharper (high-CE samples downweighted more aggressively). '
-                         'Typical range: 0.1 (sharp) – 1.0 (soft). Default 0.5.')
-parser.add_argument('--use-edl', dest='use_edl', action='store_true',
-                    help='enable vacuity-adaptive cross-gradient weighting (ENGC)')
-parser.add_argument('--edl-main', dest='edl_main', action='store_true',
-                    help='use EDL loss for main local training (not just cross-gradients)')
-parser.add_argument('--edl-lambda', dest='edl_lambda', default=1.0, type=float,
-                    help='KL weight lambda in EDL loss (applies to both main and cross-gradient loss)')
-parser.add_argument('--engc-beta', dest='engc_beta', default=0.1, type=float,
-                    help='ENGC blend: beta*p_comp(model-variant) + (1-beta)*p_comm(data-variant). '
-                         '0=data-variant only, 1=model-variant only, default 0.1')
-parser.add_argument('--edl-aux-weight', dest='edl_aux_weight', default=0.0, type=float,
-                    help='weight for auxiliary EDL loss added to CE: loss = CE + w * EDL')
-
-# --- MURMURA args ---
+# # # MURMURA arguments # # #
 parser.add_argument('--murmura-self-weight', dest='murmura_self_weight', default=0.5, type=float,
                     help='MURMURA: weight for own model in aggregation (0=full neighbor, 1=no aggregation)')
 parser.add_argument('--murmura-vacuity-threshold', dest='murmura_vacuity_threshold', default=0.5, type=float,
@@ -138,7 +101,7 @@ parser.add_argument('--murmura-tightening-kappa', dest='murmura_tightening_kappa
 parser.add_argument('--murmura-max-eval', dest='murmura_max_eval', default=100, type=int,
                     help='MURMURA: max samples per neighbor for trust evaluation')
 
-# --- Data quality / noise args ---
+# # # Data quality arguments # # #
 parser.add_argument('--noise-rate', dest='noise_rate', default=0.0, type=float,
                     help='label noise rate for designated agents (0.0 = no noise)')
 parser.add_argument('--noise-agents', dest='noise_agents', default='', type=str,
@@ -200,12 +163,10 @@ def run(rank, size):
     gpu_pct_list     = []   # %GPU per epoch
     comm_bytes_list  = []   # bytes transferred per epoch
     comm_pkgs_list   = []   # total comm packages per epoch
-
-    engc_trust_list = []  # unused placeholder — kept for backward compat
-    # Per-epoch weighting stats: {rank: {unc_cor, unc_wr, w_cor, w_wr}}
+    engc_trust_list = []    # for backward compat
+    # Per-epoch weighting stats
     engc_ws_history = []
 
-    # --- Build base model ---
     if args.arch.lower() == 'resnet':
         base_model = resnet(num_classes=args.classes, depth=args.depth, dataset=args.dataset, norm_type=args.normtype, groups=2)
     elif args.arch.lower() == 'vgg11':
@@ -229,7 +190,7 @@ def run(rank, size):
         else:
             print(summary(base_model, (3, 32, 32), batch_size=int(args.batch_size / size), device='cpu'))
 
-    # --- Data loading ---
+    # Data loading
     train_loader, bsz_train = partition_trainDataset(
         args.dataset, args.data_dir, args.skew, args.seed, args.batch_size,
         args.classes,
@@ -253,7 +214,6 @@ def run(rank, size):
 
     criterion = nn.CrossEntropyLoss().to(device)
 
-    # --- Build sender ---
     if args.optimizer.lower() == 'cga':
         sender = CGA_sender(base_model, device)
     elif args.optimizer.lower() == 'ngc':
@@ -269,7 +229,6 @@ def run(rank, size):
             base_model,
             device,
             num_classes=args.classes,
-            temperature=args.engc_temperature,
         )
     elif args.optimizer.lower() == 'adaptive_ngc':
         sender = Adaptive_NGC_sender(base_model, device)
@@ -285,7 +244,6 @@ def run(rank, size):
     else:
         sender = None
 
-    # --- Build graph and gossip model ---
     if args.graph.lower() == 'ring':
         graph = RingGraph(rank, size, args.devices, peers_per_itr=args.neighbors)
     elif args.graph.lower() == 'torus':
@@ -317,7 +275,6 @@ def run(rank, size):
     )
     model.to(device)
 
-    # --- Build receiver ---
     if args.optimizer.lower() == 'cga':
         receiver = CGA_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors)
     elif args.optimizer.lower() == 'compcga':
@@ -385,7 +342,7 @@ def run(rank, size):
                 milestones=[int(args.epochs * 0.5), int(args.epochs * 0.75)]
             )
 
-    # --- Training loop ---
+    # Training loop
     for epoch in range(0, args.epochs):
         print('current lr {:.5e}'.format(optimizer.param_groups[0]['lr']))
         model.block()
@@ -451,11 +408,10 @@ def run(rank, size):
     print('Final test accuracy')
     prec1_final, _ = validate(val_loader, model, criterion, bsz_val, device, epoch)
 
-    # --- ENGC: weighting validation summary table (rank 0 only) ---
+    # ENGC: weighting validation summary table (rank 0 only)
     if args.optimizer.lower() == 'engc' and rank == 0 and engc_ws_history:
         noise_ranks = {int(x) for x in args.noise_agents.split(',') if x.strip()} \
                       if args.noise_agents else set()
-        # Skip epoch 0 (untrained — signal is inverted/meaningless)
         # Use last min(10, epochs-1) epochs so validation reflects trained behavior
         history_skip_first = engc_ws_history[1:] if len(engc_ws_history) > 1 else engc_ws_history
         window = history_skip_first[-10:]
@@ -464,10 +420,9 @@ def run(rank, size):
         W = 90
         print("\n" + "=" * W)
         print(f"  ENGC WEIGHTING VALIDATION SUMMARY  [Rank {rank} — epochs 1-{len(engc_ws_history)-1}, last {len(window)} averaged]")
-        print(f"  Criterion: uncertainty_on_wrong > uncertainty_on_correct  AND  weight_on_wrong < weight_on_correct")
         print("=" * W)
-        hdr = (f"  {'Peer':<14}  {'unc_correct':>12}  {'unc_wrong':>10}  "
-               f"{'Δunc':>7}  {'w_correct':>10}  {'w_wrong':>9}  {'Δw':>7}  {'PASS?':>6}")
+        hdr = (f"  {'Peer':<14}  {'uncertainty_correct':>12}  {'uncertainty_wrong':>10}  "
+               f"{'delta uncertainty':>7}  {'weight_correct':>10}  {'weight_wrong':>9}  {'delta w':>7}  {'Pass?':>6}")
         print(hdr)
         print("  " + "-" * (W - 2))
         all_pass = True
@@ -476,19 +431,19 @@ def run(rank, size):
             vals = [ep[r] for ep in window if r in ep]
             if not vals:
                 continue
-            unc_cor = sum(v['unc_cor'] for v in vals) / len(vals)
-            unc_wr  = sum(v['unc_wr']  for v in vals) / len(vals)
-            w_cor   = sum(v['w_cor']   for v in vals) / len(vals)
-            w_wr    = sum(v['w_wr']    for v in vals) / len(vals)
+            unc_cor = sum(v['uncertainty_correct'] for v in vals) / len(vals)
+            unc_wr  = sum(v['uncertainty_wrong']  for v in vals) / len(vals)
+            w_cor   = sum(v['weight_corect']   for v in vals) / len(vals)
+            w_wr    = sum(v['weight_wrong']    for v in vals) / len(vals)
             d_unc   = unc_wr - unc_cor
             d_w     = w_wr   - w_cor
             passed  = (d_unc > 0) and (d_w < 0)
             all_pass = all_pass and passed
-            mark = "✓" if passed else "✗"
+            mark = "ok" if passed else "failed"
             print(f"  {tag:<14}  {unc_cor:>12.3f}  {unc_wr:>10.3f}  "
                   f"{d_unc:>+7.3f}  {w_cor:>10.3f}  {w_wr:>9.3f}  {d_w:>+7.3f}  {mark:>6}")
         print("=" * W)
-        result_str = "✓ VALIDATED" if all_pass else "✗ NOT VALIDATED"
+        result_str = "VALIDATED" if all_pass else "NOT VALIDATED"
         print(f"  Overall weighting mechanism: {result_str}")
         print("=" * W + "\n")
 
@@ -540,7 +495,6 @@ def run(rank, size):
     }
     torch.save(result, os.path.join(args.save_dir, "excel_data", f"rank_{rank}.sp"))
 
-
 # # # Train function # # #
 def train(
     train_loader,
@@ -583,9 +537,7 @@ def train(
     comm_calls_transfer_additional  = 0
     payload_bytes_from_calls        = 0
 
-    _engc_trust = {}   # unused placeholder — kept for metrics dict compatibility
-    # Per-rank accumulator for weighting validation stats (ENGC only)
-    # _engc_ws[rank] = {'unc_cor': [...], 'unc_wr': [...], 'w_cor': [...], 'w_wr': [...]}
+    _engc_trust = {}
     _engc_ws = {}
 
     end   = time.time()
@@ -599,7 +551,6 @@ def train(
         input_var  = Variable(input).to(device)
         target_var = Variable(target).to(device)
 
-        # val batch vẫn load để backward compat với các optimizer khác
         (val_input, val_target), val_iter = get_next_batch(val_iter, val_loader)
         val_input_var  = Variable(val_input).to(device)
         val_target_var = Variable(val_target).to(device)
@@ -609,55 +560,40 @@ def train(
         payload_bytes_from_calls   += amt_data_transfer
         data_transferred           += amt_data_transfer
 
-        # ----------------------------------------------------------------
-        # ENGC
-        # ----------------------------------------------------------------
         if args.optimizer.lower() == 'engc':
-            # ① Cross-gradients g_k^{ji}: vacuity-weighted CE on neighbor j's model
+            # Cross-gradients
             cross_grad, ref_buf = sender(cross_weights, input_var, target_var)
 
-            # ② Self-gradient g_k^{ii}: standard local loss
+            # Self-gradient
             output = model(input_var)
-            if args.edl_main:
-                loss = edl_loss(output, target_var, args.classes,
-                                lambda_kl=args.edl_lambda)
-            elif args.edl_aux_weight > 0.0:
-                loss = criterion(output, target_var) + args.edl_aux_weight * edl_loss(
-                    output, target_var, args.classes, lambda_kl=args.edl_lambda
-                )
-            else:
-                loss = criterion(output, target_var)
+            loss = criterion(output, target_var)
 
             all_outputs.append(output.detach().cpu())
             all_targets.append(target.detach().cpu())
-
             loss.backward()
 
-            # ③ SendReceive(g_k^{ji}) — exchange cross-gradients
+            # Broadcast cross-gradients
             cross_grad_copy = copy.deepcopy(cross_grad)
             _, amt_data_transfer, received_cross_grad = model.transfer_additional(cross_grad)
             comm_calls_transfer_additional += 1
-            payload_bytes_from_calls       += amt_data_transfer
-            data_transferred               += amt_data_transfer
+            payload_bytes_from_calls += amt_data_transfer
+            data_transferred += amt_data_transfer
 
-            # ④ Blend: g̃ = (1-α)*p_comp + α*p_comm, uniform neighbor weights
+            # Gradients aggregation
             receiver(received_cross_grad, cross_grad_copy, ref_buf)
             receiver.project_gradients(lr)
 
-            # --- Accumulate per-batch weighting stats for end-of-training summary ---
+            # Stats
             for r, bp in sender.vac_by_pred.items():
-                d = _engc_ws.setdefault(r, {'unc_cor': [], 'unc_wr': [], 'w_cor': [], 'w_wr': []})
-                for key, field in [('unc_cor','vac_correct'),('unc_wr','vac_wrong'),
-                                   ('w_cor','w_correct'),('w_wr','w_wrong')]:
+                d = _engc_ws.setdefault(r, {'uncertainty_correct_pred': [], 'uncertainty_wrong_pred': [], 'weight_correct_pred': [], 'weight_wrong_pred': []})
+                for key, field in [('uncertainty_correct_pred','uncertainty_correct'),('uncertainty_wrong_pred','uncertainty_wrong'),
+                                   ('weight_correct_pred','weight_correct'),('weight_wrong_pred','weight_wrong')]:
                     v = bp.get(field, float('nan'))
                     if not math.isnan(v):
                         d[key].append(v)
 
-            # --- Diagnostics: entropy-based per-sample weighting (cross-evaluation) ---
-            # Proof weighting is meaningful:
-            #   uncertainty_on_wrong > uncertainty_on_correct
-            #   weight_on_wrong      < weight_on_correct
-            #   weight_std > 0  →  weights NOT uniform
+            # Diagnostics: entropy-based per-sample weighting
+            # uncertainty_on_wrong_pred > uncertainty_on_correct_pred => weight_on_wrong_pred < weight_on_correct_pred
             if i % args.print_freq == 0:
                 noise_ranks = set(
                     int(x) for x in args.noise_agents.split(',') if x.strip()
@@ -669,26 +605,23 @@ def train(
                     stats   = sender.sample_weight_stats.get(r, {})
                     by_pred = sender.vac_by_pred.get(r, {})
                     print(
-                        f"  {tag:<14}"
-                        f"  mean_uncertainty={sender.vacuity_scores[r]:.3f}"
-                        f"  uncertainty_std={stats.get('unc_std', float('nan')):.3f}"
-                        f"  weight_std={stats.get('w_std', float('nan')):.3f}"
-                        f"  frac_downweighted={stats.get('frac_low', float('nan')):.2f}"
+                        f" {tag:<14}"
+                        f" mean_uncertainty={sender.vacuity_scores[r]:.3f}"
+                        f" uncertainty_std={stats.get('unc_std', float('nan')):.3f}"
+                        f" weight_std={stats.get('w_std', float('nan')):.3f}"
+                        f" frac_downweighted={stats.get('frac_low', float('nan')):.2f}"
                     )
                     print(
-                        f"  {'':14}"
-                        f"  uncertainty_on_correct={by_pred.get('vac_correct', float('nan')):.3f}"
-                        f"  uncertainty_on_wrong={by_pred.get('vac_wrong',   float('nan')):.3f}"
-                        f"  weight_on_correct={by_pred.get('w_correct',      float('nan')):.3f}"
-                        f"  weight_on_wrong={by_pred.get('w_wrong',          float('nan')):.3f}"
-                        f"  frac_wrong_pred={by_pred.get('frac_wrong',       float('nan')):.2f}"
+                        f" {'':14}"
+                        f" uncertainty_on_correct={by_pred.get('uncertainty_correct', float('nan')):.3f}"
+                        f" uncertainty_on_wrong={by_pred.get('uncertainty_wrong', float('nan')):.3f}"
+                        f" weight_on_correct={by_pred.get('weight_correct', float('nan')):.3f}"
+                        f" weight_on_wrong={by_pred.get('weight_wrong', float('nan')):.3f}"
+                        f" frac_wrong_pred={by_pred.get('frac_wrong', float('nan')):.2f}"
                     )
 
             global_steps += 1
 
-        # ----------------------------------------------------------------
-        # MURMURA — model averaging, no cross-gradient transfer
-        # ----------------------------------------------------------------
         elif args.optimizer.lower() == 'murmura':
             output = model(input_var)
             loss   = criterion(output, target_var)
@@ -698,11 +631,10 @@ def train(
 
             loss.backward()
 
-            # Trust scores from neighbor model eval (no 2nd comm round)
             trust_scores = sender(cross_weights, input_var, target_var)
             receiver.prepare(cross_weights, trust_scores,
                              step=epoch + 1e-3 * i)
-            receiver.project_gradients(lr)   # no-op
+            receiver.project_gradients(lr)
 
             if i % args.print_freq == 0:
                 noise_ranks = set(
@@ -725,9 +657,6 @@ def train(
 
             global_steps += 1
 
-        # ----------------------------------------------------------------
-        # NGC, CGA, và các optimizer khác — giữ nguyên hoàn toàn
-        # ----------------------------------------------------------------
         else:
             output = model(input_var)
             loss   = criterion(output, target_var)
@@ -750,14 +679,10 @@ def train(
             elif args.optimizer.lower() == 'd-psgd':
                 receiver.update_gradients(lr)
 
-        # ----------------------------------------------------------------
-        # Optimizer step — chung cho tất cả
-        # ----------------------------------------------------------------
         optimizer.step()
         optimizer.zero_grad()
 
-        # MURMURA: model averaging happens AFTER local gradient update
-        if args.optimizer.lower() == 'murmura':
+        if args.optimizer.lower() == 'murmura': # model averaging happens after local gradient update
             receiver.post_step_aggregate()
 
         output = output.float()
@@ -823,7 +748,6 @@ def train(
         "comm_calls_transfer_params":     comm_calls_transfer_params,
         "comm_calls_transfer_additional": comm_calls_transfer_additional,
         "payload_bytes_from_calls":       int(payload_bytes_from_calls),
-        # ENGC diagnostics (empty dict for non-ENGC optimizers)
         "engc_trust": _emean(_engc_trust),
         "engc_weight_stats": {
             r: {k: float(sum(v) / len(v)) if v else float('nan')
@@ -832,7 +756,6 @@ def train(
         },
     }
     return data_transferred, top1.avg, losses.avg, metrics
-
 
 # # # Validation function # # #
 def validate(val_loader, model, criterion, batch_size, device, epoch=0):
@@ -886,28 +809,23 @@ def validate(val_loader, model, criterion, batch_size, device, epoch=0):
 
     ece = compute_ece(all_outputs, all_targets)
 
-    mean_vacuity = float('nan')
-    if args.optimizer.lower() == 'engc':
-        mean_vacuity = compute_edl_vacuity(all_outputs).mean().item()
-
     if dist.get_rank() == 0:
-        vac_str = f"  Vacuity = {mean_vacuity:.4f}" if not math.isnan(mean_vacuity) else ""
         print(
             f"[Val][Epoch {epoch}] "
             f"Precision = {prec:.2f}  "
             f"Recall = {rec:.2f}  "
             f"F1 = {f1:.2f}  "
             f"ECE = {ece:.4f}"
-            f"{vac_str}"
         )
 
     return top1.avg, losses.avg
 
-
 # # # Helper functions # # #
 def compute_ece(logits: torch.Tensor, labels: torch.Tensor, n_bins: int = 15) -> float:
-    """Expected Calibration Error — measures gap between confidence and accuracy.
-    Lower is better. Perfect calibration = 0."""
+    """ 
+    - Expected Calibration Error: measures gap between confidence and accuracy.
+    - Lower is better. Perfect calibration = 0.
+    """
     probs = torch.softmax(logits, dim=1)
     confidences, predictions = probs.max(dim=1)
     correct = predictions.eq(labels).float()
@@ -922,7 +840,6 @@ def compute_ece(logits: torch.Tensor, labels: torch.Tensor, n_bins: int = 15) ->
             conf = confidences[in_bin].mean().item()
             ece += prop * abs(conf - acc)
     return ece
-
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -941,7 +858,6 @@ class AverageMeter(object):
         self.count += n
         self.avg    = self.sum / self.count
 
-
 def get_gpu_util_percent(gpu_index: int):
     try:
         out = subprocess.check_output(
@@ -953,17 +869,14 @@ def get_gpu_util_percent(gpu_index: int):
     except Exception:
         return None
 
-
 def average_parameters(model):
     size = float(dist.get_world_size())
     for param in model.parameters():
         dist.all_reduce(param.data, op=dist.ReduceOp.SUM)
         param.data /= size
 
-
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
     torch.save(state, filename)
-
 
 def accuracy(output, target, topk=(1,)):
     """Computes the precision@k for the specified values of k"""
@@ -979,7 +892,6 @@ def accuracy(output, target, topk=(1,)):
         correct_k = correct[:k].view(-1).float().sum(0)
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
-
 
 def precision_recall_f1(output, target, num_classes):
     pred           = output.argmax(dim=1)
@@ -1006,14 +918,6 @@ def precision_recall_f1(output, target, num_classes):
         sum(f1_list)        / num_classes * 100,
     )
 
-
-def flatten_tensors(tensors):
-    if len(tensors) == 1:
-        return tensors[0].view(-1).clone()
-    flat = torch.cat([t.contiguous().view(-1) for t in tensors], dim=0)
-    return flat
-
-
 def init_process(rank, size, fn, backend=None):
     num_gpus = torch.cuda.device_count()
     if backend is None:
@@ -1030,7 +934,6 @@ def init_process(rank, size, fn, backend=None):
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
-
 
 def check_noniid(train_loader, rank, world_size):
     local_counter = Counter()
@@ -1057,20 +960,6 @@ def check_noniid(train_loader, rank, world_size):
         for r, value in enumerate(l1_distance):
             print(f"Rank {r}: {value:.3f}")
 
-
-def compute_local_class_weights(train_loader, num_classes, device, eps=1e-8):
-    counts = torch.zeros(num_classes, dtype=torch.float32)
-    for _, targets in train_loader:
-        if isinstance(targets, torch.Tensor):
-            t = targets.view(-1).cpu()
-            counts += torch.bincount(t, minlength=num_classes).float()
-    counts  = torch.clamp(counts, min=1.0)
-    weights = 1.0 / torch.sqrt(counts)
-    weights = weights / weights.mean()
-    weights = torch.clamp(weights, max=3.0)
-    return weights.to(device)
-
-
 def get_next_batch(loader_iter, loader):
     try:
         batch = next(loader_iter)
@@ -1079,11 +968,9 @@ def get_next_batch(loader_iter, loader):
         batch       = next(loader_iter)
     return batch, loader_iter
 
-
 # # # Main # # #
 if __name__ == '__main__':
     size = args.world_size
-
     spawn(init_process, args=(size, run), nprocs=size, join=True)
 
     # Read stored data
@@ -1221,7 +1108,7 @@ if __name__ == '__main__':
               f"{excel_data['comm_pkgs_total'][i]:>7}")
     print("=" * 72 + "\n")
 
-    # --- Loss curve (rank 0 only) ---
+    # Loss curve (rank 0 only)
     r0_train = excel_data["train_loss_list"][0]
     r0_val   = excel_data["val_loss_list"][0]
     if r0_train and r0_val:
