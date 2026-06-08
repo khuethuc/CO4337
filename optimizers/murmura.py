@@ -1,0 +1,255 @@
+"""
+MURMURA — Evidential Trust-Aware Model Aggregation
+Reference: Rangwala et al., 2025 (https://arxiv.org/abs/2512.19131)
+
+Key differences from NGC/ENGC:
+  - Aggregates MODEL WEIGHTS directly, not gradients
+  - Trust score = f(EDL vacuity, local accuracy) of each neighbor's model
+  - Tightening threshold τ(t) starts lenient and tightens over training
+  - Does NOT require a second communication round (no cross-gradient transfer)
+    → lower communication cost than NGC/ENGC
+
+Per-step flow:
+  1. [Shared] Round 1: exchange model params via transfer_params()
+  2. Evaluate each neighbor model on local batch → trust score
+  3. Local loss.backward() + optimizer.step()
+  4. post_step_aggregate(): trust-weighted blend of accepted neighbor models
+"""
+
+import copy
+import math
+import torch
+import torch.nn.functional as F
+
+from .engc import compute_edl_vacuity   # reuse EDL vacuity
+
+
+# ---------------------------------------------------------------------------
+# Sender: evaluates neighbor models, returns trust scores
+# ---------------------------------------------------------------------------
+
+class MURMURA_sender:
+    """
+    For each neighbor r, load r's model weights and evaluate on local batch:
+
+        vacuity_r  = mean(K / S)               EDL epistemic uncertainty
+        accuracy_r = fraction of correct preds
+        base_r     = (1 - vacuity_r) * (w_a * accuracy_r + (1 - w_a))
+        trust_r    = base_r * exp(-(vacuity_r - tau_u))  if vacuity_r > tau_u
+                   = base_r                               otherwise
+
+    Optional EMA smoothing across steps:
+        trust_r ← gamma_ema * trust_r + (1 - gamma_ema) * trust_r_prev
+    """
+
+    def __init__(
+        self,
+        true_model,
+        device,
+        num_classes: int       = 10,
+        vacuity_threshold: float = 0.5,
+        accuracy_weight: float   = 0.5,
+        use_adaptive_trust: bool = True,
+        trust_momentum: float    = 0.7,
+        max_eval_samples: int    = 100,
+    ):
+        self.model            = copy.deepcopy(true_model)
+        self.model.eval()
+        self.model            = self.model.to(device)
+        self.device           = device
+        self.num_classes      = num_classes
+        self.tau_u            = vacuity_threshold
+        self.w_a              = accuracy_weight
+        self.use_ema          = use_adaptive_trust
+        self.gamma_ema        = trust_momentum
+        self.max_eval_samples = max_eval_samples
+
+        self._trust_ema: dict        = {}   # rank -> EMA trust
+        self.last_trust_scores: dict = {}
+        self.last_vacuities: dict    = {}
+        self.last_accuracies: dict   = {}
+
+    def _update_model(self, state_dict):
+        for w, p in zip(state_dict, self.model.parameters()):
+            p.data.copy_(w.data)
+
+    def _compute_trust(self, batch_x: torch.Tensor, batch_y: torch.Tensor):
+        """Evaluate model on batch. Returns (trust, vacuity, accuracy)."""
+        self.model.eval()
+        with torch.no_grad():
+            if len(batch_x) > self.max_eval_samples:
+                idx = torch.randperm(len(batch_x), device=self.device)[:self.max_eval_samples]
+                x, y = batch_x[idx], batch_y[idx]
+            else:
+                x, y = batch_x, batch_y
+
+            logits   = self.model(x)
+            vacuity  = compute_edl_vacuity(logits).mean().item()
+            accuracy = (logits.argmax(dim=1) == y).float().mean().item()
+
+            base_trust = (1.0 - vacuity) * (self.w_a * accuracy + (1.0 - self.w_a))
+            if vacuity > self.tau_u:
+                trust = base_trust * math.exp(-(vacuity - self.tau_u))
+            else:
+                trust = base_trust
+
+        return float(trust), float(vacuity), float(accuracy)
+
+    def __call__(
+        self,
+        neighbor_weights: dict,
+        batch_x: torch.Tensor,
+        batch_y: torch.Tensor,
+    ) -> dict:
+        """
+        Returns {rank: trust_score} for all neighbors.
+        Does NOT produce cross-gradients — MURMURA skips transfer_additional.
+        """
+        trust_scores = {}
+
+        for rank, weights in neighbor_weights.items():
+            self._update_model(weights)
+            trust, vacuity, accuracy = self._compute_trust(batch_x, batch_y)
+
+            if self.use_ema and rank in self._trust_ema:
+                trust = (self.gamma_ema * trust
+                         + (1.0 - self.gamma_ema) * self._trust_ema[rank])
+            self._trust_ema[rank] = trust
+
+            trust_scores[rank]         = trust
+            self.last_vacuities[rank]  = vacuity
+            self.last_accuracies[rank] = accuracy
+
+        self.last_trust_scores = trust_scores
+        return trust_scores
+
+
+# ---------------------------------------------------------------------------
+# Receiver: trust-weighted model averaging (post optimizer.step)
+# ---------------------------------------------------------------------------
+
+class MURMURA_receiver:
+    """
+    After the local gradient update (optimizer.step()), blend own model
+    with trusted neighbors' models:
+
+        τ(t) = tau_min * (1 - gamma * exp(-kappa * t / T))   [tightening threshold]
+
+        accepted   = {r : trust_r >= τ(t)}
+        w_r        = trust_r / Σ trust_r   for r in accepted
+
+        param_i ← self_weight * param_i
+                 + (1 - self_weight) * Σ_r w_r * neighbor_r_param_i
+
+    Call order per step:
+        1. receiver.prepare(cross_weights, trust_scores, step)   -- before optimizer.step
+        2. optimizer.step() / optimizer.zero_grad()
+        3. receiver.post_step_aggregate()                         -- after optimizer.step
+    """
+
+    def __init__(
+        self,
+        model,
+        device,
+        rank: int,
+        lr: float,
+        momentum: float,
+        qgm: bool,
+        nesterov: bool         = True,
+        weight_decay: float    = 0.0,
+        neighbors: int         = 2,
+        self_weight: float     = 0.5,
+        trust_threshold: float = 0.1,
+        use_tightening: bool   = True,
+        tightening_gamma: float = 0.5,
+        tightening_kappa: float = 1.0,
+        total_rounds: int      = 50,
+    ):
+        self.model            = model
+        self.rank             = rank
+        self.device           = device
+        self.lr               = lr
+        self.self_weight      = self_weight
+        self.trust_threshold  = trust_threshold
+        self.use_tightening   = use_tightening
+        self.t_gamma          = tightening_gamma
+        self.t_kappa          = tightening_kappa
+        self.total_rounds     = total_rounds
+
+        # Pending state (set by prepare, consumed by post_step_aggregate)
+        self._pending_weights: dict = None
+        self._pending_trust: dict   = None
+        self._pending_step: float   = 0.0
+
+        # Diagnostics
+        self.last_accepted: dict    = {}
+        self.last_eff_weights: dict = {}
+        self.last_threshold: float  = trust_threshold
+
+    def _threshold(self, step: float) -> float:
+        """
+        τ(t) = tau_min * (1 - gamma * exp(-kappa * t / T))
+        At t=0:   τ = tau_min * (1 - gamma)   [lenient — accept most neighbors]
+        At t→∞:   τ = tau_min                  [strict]
+        """
+        if not self.use_tightening:
+            return self.trust_threshold
+        return float(
+            self.trust_threshold * (
+                1.0 - self.t_gamma *
+                math.exp(-self.t_kappa * step / max(self.total_rounds, 1))
+            )
+        )
+
+    def prepare(self, neighbor_weights: dict, trust_scores: dict, step: float = 0.0):
+        """Store aggregation inputs. Call BEFORE optimizer.step()."""
+        self._pending_weights = neighbor_weights
+        self._pending_trust   = trust_scores
+        self._pending_step    = step
+
+    def post_step_aggregate(self):
+        """
+        Apply trust-weighted model averaging.
+        Call AFTER optimizer.step() and optimizer.zero_grad().
+        Modifies model.module.parameters() in-place.
+        """
+        if self._pending_weights is None:
+            return
+
+        tau_t = self._threshold(self._pending_step)
+        self.last_threshold = tau_t
+
+        accepted = {r: t for r, t in self._pending_trust.items() if t >= tau_t}
+        self.last_accepted = accepted
+
+        if not accepted:
+            # No trusted neighbors — keep own model unchanged
+            self.last_eff_weights  = {}
+            self._pending_weights  = None
+            return
+
+        total  = sum(accepted.values()) or 1.0
+        norm_w = {r: t / total for r, t in accepted.items()}
+        self.last_eff_weights = norm_w
+
+        # Materialise neighbor param lists (generator-safe)
+        nbr_params = {r: list(self._pending_weights[r]) for r in accepted}
+
+        with torch.no_grad():
+            for i, p_self in enumerate(self.model.module.parameters()):
+                if not p_self.requires_grad:
+                    continue
+                neighbor_avg = torch.zeros_like(p_self.data)
+                for r, w in norm_w.items():
+                    neighbor_avg.add_(nbr_params[r][i].data, alpha=w)
+                # Blend: self_weight * own  +  (1 - self_weight) * neighbor_avg
+                p_self.data.mul_(self.self_weight).add_(
+                    neighbor_avg, alpha=(1.0 - self.self_weight)
+                )
+
+        self._pending_weights = None
+        self._pending_trust   = None
+
+    def project_gradients(self, lr):
+        """No-op. MURMURA does model averaging post-step, not gradient projection."""
+        self.lr = lr

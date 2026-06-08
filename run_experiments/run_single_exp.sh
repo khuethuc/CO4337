@@ -1,0 +1,25 @@
+#!/bin/bash
+LOG_DIR="outputs/engc_cganet_nodes_5_evonorm_lr_0.01_gamma_0.1_alpha_1.0_skew_1.0_ring"
+mkdir -p "${LOG_DIR}/excel_data"
+
+python trainer.py \
+  --data-dir ../data/ham10000 --dataset ham10000 --classes 7 \
+  --lr 0.01 --batch-size 160 \
+  --world_size 5 --skew 1 \
+  --gamma 0.1 --normtype evonorm \
+  --epochs 50 \
+  --optimizer engc \
+  --arch cganet \
+  --momentum 0.9 \
+  --alpha 1.0 \
+  --graph ring \
+  --neighbors 2 \
+  --nesterov \
+  --quality-mode tiered \
+  --noise-agents 2,3,4 \
+  --noise-rate 0.15 \
+  --weight_decay 1e-4 \
+  --steplr \
+  --edl-lambda 1.0 \
+  --use-edl \
+  2>&1 | tee "${LOG_DIR}/training_log.txt"

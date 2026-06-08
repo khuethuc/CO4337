@@ -1,13 +1,18 @@
+import os
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
+
 import argparse
 import os
 import shutil
 import time
 import numpy as np
-import statistics 
+import statistics
 import copy
-import matplotlib.pyplot  as plt
-#from models.cganet import cganet5
-
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
@@ -18,18 +23,27 @@ import torch.utils.data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 from torchsummary import summary
-import torch.nn.functional as F
 from math import ceil
 import random
+import subprocess
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
+from collections import Counter
+from sklearn.metrics import (
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    average_precision_score,
+)
 
-# Importing modules related to distributed processing
 import torch.distributed as dist
 from torch.multiprocessing import Process
 from torch.autograd import Variable
 from torch.multiprocessing import spawn
 
-###########
 from gossip import GossipDataParallel
 from gossip import RingGraph, GridGraph, FullGraph
 from gossip import UniformMixing
@@ -38,282 +52,820 @@ from models import *
 from optimizers import *
 from dataloader import *
 
+# # # Add arguments # # #
 parser = argparse.ArgumentParser(description='Propert ResNets for CIFAR10 in pytorch')
-parser.add_argument('--arch', '-a', metavar='ARCH', default='cganet', help = 'resnet or vgg or resquant' )
+parser.add_argument('--arch', '-a', metavar='ARCH', default='cganet', help='resnet or vgg or resquant')
 parser.add_argument('-depth', '--depth', default=20, type=int, help='depth of the resnet model')
-parser.add_argument('--normtype',   default='evonorm', help = 'none or batchnorm or groupnorm or evonorm' )
-parser.add_argument('--data-dir', dest='data_dir',    help='The directory used to save the trained models',   default='../../data', type=str)
-parser.add_argument('--dataset', dest='dataset',     help='available datasets: cifar10, cifar100, imagenette', default='cifar10', type=str)
-parser.add_argument('--skew', default=1.0, type=float,     help='obelongs to [0,1] where 0= completely iid and 1=completely non-iid')
-parser.add_argument('--classes', default=10, type=int,     help='number of classes in the dataset')
-parser.add_argument('-b', '--batch-size', default=160, type=int,  help='mini-batch size (default: 128)')
-parser.add_argument('--lr', '--learning-rate', default=0.01, type=float,     metavar='LR', help='initial learning rate')
-parser.add_argument('--gamma',  default=0.1, type=float,  metavar='AR', help='averaging rate')
-parser.add_argument('--alpha',  default=1.0, type=float, help='NGC mixing weight')
-parser.add_argument('--momentum', default=0.9, type=float, metavar='M',     help='momentum')
-parser.add_argument('--weight_decay', default=0.0, type=float,     help='weight_decay')
+parser.add_argument('--normtype', default='evonorm', help='none or batchnorm or groupnorm or evonorm')
+parser.add_argument('--data-dir', dest='data_dir', help='The directory used to save the trained models', default='../../data', type=str)
+parser.add_argument('--dataset', dest='dataset', help='available datasets: cifar10, cifar100, imagenette, ham10000, fedisic2019', default='cifar10', type=str)
+parser.add_argument('--skew', default=1.0, type=float, help='belongs to [0,1] where 0=completely iid and 1=completely non-iid')
+parser.add_argument('--classes', default=10, type=int, help='number of classes in the dataset')
+parser.add_argument('-b', '--batch-size', default=160, type=int, help='mini-batch size (default: 128)')
+parser.add_argument('--lr', '--learning-rate', default=0.01, type=float, metavar='LR', help='initial learning rate')
+parser.add_argument('--gamma', default=0.1, type=float, metavar='AR', help='averaging rate')
+parser.add_argument('--alpha', default=1.0, type=float, help='NGC mixing weight')
+parser.add_argument('--momentum', default=0.9, type=float, metavar='M', help='momentum')
+parser.add_argument('--weight_decay', default=0.0, type=float, help='weight_decay')
 parser.add_argument('-world_size', '--world_size', default=10, type=int, help='total number of nodes')
-parser.add_argument('--epochs', default=100, type=int, metavar='N',   help='number of total epochs to run')
-parser.add_argument('--optimizer', default='ngc', type=str,  help='global optimizer = [d-psgd, cga, ngc, compcga, compngc]')
-parser.add_argument('--graph', '-g',  default='ring', help = 'graph structure - [ring, torus]' )
-parser.add_argument('--neighbors', default=2, type=int,     help='number of neighbors per node')
+parser.add_argument('--epochs', default=100, type=int, metavar='N', help='number of total epochs to run')
+parser.add_argument('--optimizer', default='ngc', type=str, help='global optimizer = [d-psgd, cga, ngc, compcga, compngc, topkngc, engc, adaptive_ngc]')
+parser.add_argument('--graph', '-g', default='ring', help='graph structure - [ring, torus, full, chain]')
+parser.add_argument('--neighbors', default=2, type=int, help='number of neighbors per node')
 parser.add_argument('-d', '--devices', default=4, type=int, help='number of gpus/devices on the card')
-parser.add_argument('-j', '--workers', default=4, type=int,  help='number of data loading workers (default: 4)')
-parser.add_argument('--seed', default=321, type=int,   help='set seed')
-parser.add_argument('--print-freq', '-p', default=100, type=int,  help='print frequency (default: 50)')
-parser.add_argument('--save-dir', dest='save_dir',    help='The directory used to save the trained models',   default='outputs', type=str)
-parser.add_argument('--port', dest='port',   help='between 3000 to 65000',default='25500' , type=str)
-parser.add_argument("--steplr", action="store_true", help="Uses step lr schedular for training.")
-parser.add_argument('--nesterov', action='store_true', )
+parser.add_argument('-j', '--workers', default=4, type=int, help='number of data loading workers (default: 4)')
+parser.add_argument('--seed', default=321, type=int, help='set seed')
+parser.add_argument('--print-freq', '-p', default=100, type=int, help='print frequency (default: 50)')
+parser.add_argument('--save-dir', dest='save_dir', help='The directory used to save the trained models', default='outputs', type=str)
+parser.add_argument('--port', dest='port', help='between 3000 to 65000', default='25500', type=str)
+parser.add_argument("--steplr", action="store_true", help="Uses step lr scheduler for training.")
+parser.add_argument('--nesterov', action='store_true')
 parser.add_argument('--qgm', action='store_true', help='quasi global momentum')
+# # # MURMURA arguments # # #
+parser.add_argument('--murmura-self-weight', dest='murmura_self_weight', default=0.5, type=float,
+                    help='MURMURA: weight for own model in aggregation (0=full neighbor, 1=no aggregation)')
+parser.add_argument('--murmura-vacuity-threshold', dest='murmura_vacuity_threshold', default=0.5, type=float,
+                    help='MURMURA: vacuity above this incurs exponential trust penalty')
+parser.add_argument('--murmura-accuracy-weight', dest='murmura_accuracy_weight', default=0.5, type=float,
+                    help='MURMURA: weight of accuracy vs baseline in trust score')
+parser.add_argument('--murmura-trust-threshold', dest='murmura_trust_threshold', default=0.1, type=float,
+                    help='MURMURA: minimum trust to accept a neighbor')
+parser.add_argument('--murmura-trust-momentum', dest='murmura_trust_momentum', default=0.7, type=float,
+                    help='MURMURA: EMA momentum for trust score smoothing')
+parser.add_argument('--murmura-tightening-gamma', dest='murmura_tightening_gamma', default=0.5, type=float,
+                    help='MURMURA: initial leniency factor for threshold tightening')
+parser.add_argument('--murmura-tightening-kappa', dest='murmura_tightening_kappa', default=1.0, type=float,
+                    help='MURMURA: tightening rate (higher = faster tightening)')
+parser.add_argument('--murmura-max-eval', dest='murmura_max_eval', default=100, type=int,
+                    help='MURMURA: max samples per neighbor for trust evaluation')
+
+# # # Data quality arguments # # #
+parser.add_argument('--noise-rate', dest='noise_rate', default=0.0, type=float,
+                    help='label noise rate for designated agents (0.0 = no noise)')
+parser.add_argument('--noise-agents', dest='noise_agents', default='', type=str,
+                    help='comma-separated ranks to inject noise, e.g. "0,1"')
+parser.add_argument('--quality-mode', dest='quality_mode', default='uniform', type=str,
+                    help='heterogeneous data quality: uniform | tiered | random')
+parser.add_argument('--noise-type', dest='noise_type', default='uniform', type=str,
+                    help='label noise distribution: uniform (USN) | dirichlet')
+parser.add_argument('--noise-alpha', dest='noise_alpha', default=0.1, type=float,
+                    help='Dirichlet concentration for label noise: '
+                         'small (0.01) = near pair-flip; large (10) = near uniform')
 args = parser.parse_args()
+args.devices = torch.cuda.device_count()
 
-# Check the save_dir exists or not
-args.save_dir = os.path.join(args.save_dir, args.optimizer+"_"+args.arch+"_nodes_"+str(args.world_size)+"_"+ args.normtype+"_lr_"+ str(args.lr)+"_gamma_"+str(args.gamma)+"_alpha_"+str(args.alpha)+"_skew_"+str(args.skew)+"_"+args.graph )
-if not os.path.exists(os.path.join(args.save_dir, "excel_data") ):
-    os.makedirs(os.path.join(args.save_dir, "excel_data") )
-torch.save(args, os.path.join(args.save_dir, "training_args.bin"))    
+# # # Check the save_dir exists or not # # #
+args.save_dir = os.path.join(
+    args.save_dir,
+    args.optimizer + "_" + args.arch + "_nodes_" + str(args.world_size) + "_"
+    + args.normtype + "_lr_" + str(args.lr) + "_gamma_" + str(args.gamma)
+    + "_alpha_" + str(args.alpha) + "_skew_" + str(args.skew) + "_" + args.graph
+)
+if not os.path.exists(os.path.join(args.save_dir, "excel_data")):
+    os.makedirs(os.path.join(args.save_dir, "excel_data"))
+torch.save(args, os.path.join(args.save_dir, "training_args.bin"))
 
+
+# # # Run training # # #
 def run(rank, size):
     global args, best_prec1, global_steps
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    #torch.use_deterministic_algorithms(True)
-    device = torch.device("cuda:{}".format(rank%args.devices))
-	##############
+
+    num_gpus = torch.cuda.device_count()
+    if num_gpus > 0:
+        gpu_id = rank % num_gpus
+        torch.cuda.manual_seed(args.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        device = torch.device(f"cuda:{gpu_id}")
+        torch.cuda.set_device(gpu_id)
+    else:
+        gpu_id = None
+        device = torch.device("cpu")
+
     best_prec1 = 0
     data_transferred = 0
     global_steps = 0
-    
-    
-    if args.arch.lower()=='resnet':
-        model = resnet(num_classes=args.classes, depth=args.depth, dataset=args.dataset, norm_type=args.normtype, groups=2)
+
+    # Accuracy and loss lists
+    train_acc_list  = []
+    train_loss_list = []
+    val_acc_list    = []
+    val_loss_list   = []
+
+    # Per-epoch resource / communication tracking
+    train_time_list  = []   # seconds per epoch
+    cpu_pct_list     = []   # %CPU per epoch
+    gpu_pct_list     = []   # %GPU per epoch
+    comm_bytes_list  = []   # bytes transferred per epoch
+    comm_pkgs_list   = []   # total comm packages per epoch
+    engc_trust_list = []    # for backward compat
+    # Per-epoch weighting stats
+    engc_ws_history = []
+
+    if args.arch.lower() == 'resnet':
+        base_model = resnet(num_classes=args.classes, depth=args.depth, dataset=args.dataset, norm_type=args.normtype, groups=2)
     elif args.arch.lower() == 'vgg11':
-        model = vgg11(num_classes=args.classes, dataset=args.dataset, norm_type=args.normtype, groups=2)
+        base_model = vgg11(num_classes=args.classes, dataset=args.dataset, norm_type=args.normtype, groups=2)
     elif args.arch.lower() == 'mobilenet':
-        model = MobileNetV2(num_classes=args.classes, norm_type=args.normtype, groups=2)
+        base_model = MobileNetV2(num_classes=args.classes, norm_type=args.normtype, groups=2)
     elif args.arch.lower() == 'cganet':
-        model = cganet5(num_classes=args.classes, dataset=args.dataset, norm_type=args.normtype, groups=2)
+        base_model = cganet5(num_classes=args.classes, dataset=args.dataset, norm_type=args.normtype, groups=2)
     elif args.arch.lower() == 'lenet5':
-        model = LeNet5()
+        base_model = LeNet5()
     else:
         raise NotImplementedError
-    
-    if rank==0: 
+
+    if rank == 0:
         print(args)
         print('Printing model summary...')
-        if args.dataset=="fmnist":
-            print(summary(model, (1,28,28), batch_size=int(args.batch_size/size), device='cpu'))
-        elif args.dataset=="imagenette_full":
-            print(summary(model, (3, 224, 224), batch_size=int(args.batch_size/size), device='cpu'))
-        elif args.dataset=="imagenet":
-            print(summary(model, (3, 224, 224), batch_size=int(args.batch_size/size), device='cpu'))
-        else: 
-            print(summary(model, (3, 32, 32), batch_size=int(args.batch_size/size), device='cpu'))
-        
-    if args.optimizer.lower()=='cga':
-        sender = CGA_sender(model, device)
-    elif args.optimizer.lower()=="ngc":
-        sender = NGC_sender(model, device)
-    elif args.optimizer.lower()=='compcga':
-        sender = CompCGA_sender(model, device)
-    elif args.optimizer.lower()=="compngc":
-        sender = CompNGC_sender(model, device)
+        if args.dataset == "fmnist":
+            print(summary(base_model, (1, 28, 28), batch_size=int(args.batch_size / size), device='cpu'))
+        elif args.dataset in ["imagenette_full", "imagenet"]:
+            print(summary(base_model, (3, 224, 224), batch_size=int(args.batch_size / size), device='cpu'))
+        else:
+            print(summary(base_model, (3, 32, 32), batch_size=int(args.batch_size / size), device='cpu'))
+
+    # Data loading
+    train_loader, bsz_train = partition_trainDataset(
+        args.dataset, args.data_dir, args.skew, args.seed, args.batch_size,
+        args.classes,
+        quality_mode=args.quality_mode,
+        noise_rate=args.noise_rate,
+        noise_agents={int(x) for x in args.noise_agents.split(',') if x.strip()} if args.noise_agents else set(),
+        noise_type=args.noise_type,
+        noise_alpha=args.noise_alpha,
+    )
+
+    if rank == 0:
+        from dataloader import make_quality_profiles
+        profiles = make_quality_profiles(size, mode=args.quality_mode, seed=args.seed)
+        print(f"\n[QualityMode={args.quality_mode}] Data quality profiles:")
+        for r, p in enumerate(profiles):
+            print(f"  Rank {r}: {p}")
+
+    val_loader, bsz_val = test_Dataset(args.dataset, args.data_dir, seed=args.seed)
+
+    check_noniid(train_loader, rank, args.world_size)
+
+    criterion = nn.CrossEntropyLoss().to(device)
+
+    if args.optimizer.lower() == 'cga':
+        sender = CGA_sender(base_model, device)
+    elif args.optimizer.lower() == 'ngc':
+        sender = NGC_sender(base_model, device)
+    elif args.optimizer.lower() == 'compcga':
+        sender = CompCGA_sender(base_model, device)
+    elif args.optimizer.lower() == 'compngc':
+        sender = CompNGC_sender(base_model, device)
+    elif args.optimizer.lower() == 'topkngc':
+        sender = Topk_NGC_sender(base_model, device)
+    elif args.optimizer.lower() == 'engc':
+        sender = ENGC_sender(
+            base_model,
+            device,
+            num_classes=args.classes,
+        )
+    elif args.optimizer.lower() == 'adaptive_ngc':
+        sender = Adaptive_NGC_sender(base_model, device)
+    elif args.optimizer.lower() == 'murmura':
+        sender = MURMURA_sender(
+            base_model, device,
+            num_classes=args.classes,
+            vacuity_threshold=args.murmura_vacuity_threshold,
+            accuracy_weight=args.murmura_accuracy_weight,
+            trust_momentum=args.murmura_trust_momentum,
+            max_eval_samples=args.murmura_max_eval,
+        )
     else:
-        sender=None
+        sender = None
 
     if args.graph.lower() == 'ring':
-        graph = RingGraph(rank, size, args.devices, peers_per_itr=args.neighbors) #undirected ring structure => neighbors = 2 ; directed ring => neighbors=1
-    elif args.graph.lower() == 'torus':   
-        graph = GridGraph(rank, size, args.devices, peers_per_itr=args.neighbors) # torus graph structure
+        graph = RingGraph(rank, size, args.devices, peers_per_itr=args.neighbors)
+    elif args.graph.lower() == 'torus':
+        graph = GridGraph(rank, size, args.devices, peers_per_itr=args.neighbors)
     elif args.graph.lower() == 'full':
-        graph = FullGraph(rank, size, args.devices, peers_per_itr=args.world_size-1) # torus graph structure  
-    elif args.graph.lower() == 'chain':   
+        graph = FullGraph(rank, size, args.devices, peers_per_itr=args.world_size - 1)
+    elif args.graph.lower() == 'chain':
         graph = ChainGraph(rank, size, args.devices, peers_per_itr=args.neighbors)
     else:
         raise NotImplementedError
-    
+
     mixing = UniformMixing(graph, device)
-    model = GossipDataParallel(model, 
-				device_ids=[rank%args.devices],
-				rank=rank,
-				world_size=size,
-				graph=graph, 
-				mixing=mixing,
-				comm_device=device, 
-                level = 32,
-                biased = False,
-                eta = args.gamma,
-                compress_ratio=0.0,
-                compress_fn = 'quantize', 
-                compress_op = 'top_k', 
-                momentum=args.momentum,
-                lr = args.lr) 
+    model = GossipDataParallel(
+        base_model,
+        device_ids=[gpu_id] if gpu_id is not None else [],
+        rank=rank,
+        world_size=size,
+        graph=graph,
+        mixing=mixing,
+        comm_device=device,
+        level=32,
+        biased=False,
+        eta=args.gamma,
+        compress_ratio=0.0,
+        compress_fn='quantize',
+        compress_op='top_k',
+        momentum=args.momentum,
+        lr=args.lr,
+    )
     model.to(device)
- 
-    train_loader, bsz_train = partition_trainDataset(args.dataset, args.data_dir, args.skew, args.seed, args.batch_size)
-    val_loader, bsz_val     = test_Dataset(args.dataset, args.data_dir)
-   
-    if args.optimizer.lower()=='cga':
-        receiver  = CGA_receiver(model, device, rank,  args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors)
-    elif args.optimizer.lower()=='compcga':
-        receiver = CompCGA_receiver(model, device, rank,  args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors)
-    elif args.optimizer.lower()=='ngc':
-        receiver  = NGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors, alpha = args.alpha)
-    elif args.optimizer.lower()=='compngc':
-        receiver = CompNGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors, alpha = args.alpha)
+
+    if args.optimizer.lower() == 'cga':
+        receiver = CGA_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors)
+    elif args.optimizer.lower() == 'compcga':
+        receiver = CompCGA_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors)
+    elif args.optimizer.lower() == 'ngc':
+        receiver = NGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors, alpha=args.alpha)
+    elif args.optimizer.lower() == 'compngc':
+        receiver = CompNGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors, alpha=args.alpha)
+    elif args.optimizer.lower() == 'topkngc':
+        receiver = Topk_NGC_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay, neighbors=args.neighbors, alpha=args.alpha)
+    elif args.optimizer.lower() == 'engc':
+        receiver = ENGC_receiver(
+            model,
+            device,
+            rank,
+            args.lr,
+            args.momentum,
+            args.qgm,
+            args.nesterov,
+            weight_decay=args.weight_decay,
+            neighbors=args.neighbors,
+            alpha=args.alpha,
+        )
+    elif args.optimizer.lower() == 'adaptive_ngc':
+        receiver = Adaptive_NGC_receiver(
+            model,
+            device,
+            rank,
+            args.lr,
+            args.momentum,
+            args.qgm,
+            args.nesterov,
+            weight_decay=args.weight_decay,
+            neighbors=args.neighbors,
+            alpha=args.alpha,
+        )
+    elif args.optimizer.lower() == 'murmura':
+        receiver = MURMURA_receiver(
+            model, device, rank,
+            args.lr, args.momentum, args.qgm, args.nesterov,
+            weight_decay=args.weight_decay,
+            neighbors=args.neighbors,
+            self_weight=args.murmura_self_weight,
+            trust_threshold=args.murmura_trust_threshold,
+            tightening_gamma=args.murmura_tightening_gamma,
+            tightening_kappa=args.murmura_tightening_kappa,
+            total_rounds=args.epochs,
+        )
     else:
         receiver = DSGD_receiver(model, device, rank, args.lr, args.momentum, args.qgm, args.nesterov, weight_decay=args.weight_decay)
-    
 
     optimizer = optim.SGD(model.parameters(), args.lr)
-    
-    criterion = nn.CrossEntropyLoss().to(device)
+
     if args.steplr:
-        lr_scheduler = optim.lr_scheduler.StepLR(optimizer, gamma = 0.981, step_size=1)
+        lr_scheduler = optim.lr_scheduler.StepLR(optimizer, gamma=0.981, step_size=1)
     else:
-        if args.dataset=='imagenet':
-            lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, gamma = 0.1, milestones=[int(args.epochs*0.33), int(args.epochs*0.67), int(args.epochs*0.89)])
+        if args.dataset == 'imagenet':
+            lr_scheduler = optim.lr_scheduler.MultiStepLR(
+                optimizer, gamma=0.1,
+                milestones=[int(args.epochs * 0.33), int(args.epochs * 0.67), int(args.epochs * 0.89)]
+            )
         else:
-            lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, gamma = 0.1, milestones=[int(args.epochs*0.5), int(args.epochs*0.75)])
-            
-    for epoch in range(0, args.epochs):  
+            lr_scheduler = optim.lr_scheduler.MultiStepLR(
+                optimizer, gamma=0.1,
+                milestones=[int(args.epochs * 0.5), int(args.epochs * 0.75)]
+            )
+
+    # Training loop
+    for epoch in range(0, args.epochs):
         print('current lr {:.5e}'.format(optimizer.param_groups[0]['lr']))
         model.block()
-        dt, prec1, loss = train(train_loader, model, criterion, optimizer, epoch, bsz_train, optimizer.param_groups[0]['lr'], device, receiver, sender)
+
+        dt, prec1, loss, m = train(
+            train_loader      = train_loader,
+            val_loader        = val_loader,
+            model             = model,
+            criterion         = criterion,
+            optimizer         = optimizer,
+            epoch             = epoch,
+            batch_size        = bsz_train,
+            lr                = optimizer.param_groups[0]['lr'],
+            device            = device,
+            receiver          = receiver,
+            sender            = sender,
+            gpu_index         = rank,
+            monitor_every     = max(10, args.print_freq),
+        )
         data_transferred += dt
-        if epoch>=0: lr_scheduler.step()
-        prec1, loss = validate(val_loader, model, criterion, bsz_val,device, epoch)
-        is_best = prec1 > best_prec1
+
+        train_acc_list.append(float(prec1))
+        train_loss_list.append(float(loss))
+
+        train_time_list.append(float(m["train_time_s"]))
+        cpu_pct_list.append(float(m["cpu_pct_avg"]))
+        gpu_pct_list.append(float(m["gpu_pct_avg"]))
+        comm_bytes_list.append(int(m["payload_bytes_from_calls"]))
+        comm_pkgs_list.append(
+            int(m["comm_calls_transfer_params"]) +
+            int(m["comm_calls_transfer_additional"])
+        )
+
+        engc_trust_list.append(m.get("engc_trust", {}))
+        engc_ws_history.append(m.get("engc_weight_stats", {}))
+
+        lr_scheduler.step()
+
+        prec1, loss = validate(val_loader, model, criterion, bsz_val, device, epoch)
+        is_best    = prec1 > best_prec1
         best_prec1 = max(prec1, best_prec1)
+
         save_checkpoint({
             'state_dict': model.state_dict(),
             'best_prec1': best_prec1,
         }, is_best, filename=os.path.join(args.save_dir, 'model_{}.th'.format(rank)))
-      
-    #############################
+
+        val_acc_list.append(float(prec1))
+        val_loss_list.append(float(loss))
+
+        if rank == 0:
+            t_loss = train_loss_list[-1]
+            v_loss = val_loss_list[-1]
+            t_acc  = train_acc_list[-1]
+            gap    = v_loss - t_loss
+            print(
+                f"[Loss][Epoch {epoch:>3}] "
+                f"Train={t_loss:.4f}  Val={v_loss:.4f}  "
+                f"Gap={gap:+.4f}  TrainAcc={t_acc:.2f}%  ValAcc={prec1:.2f}%"
+            )
+
     average_parameters(model)
     print('Final test accuracy')
-    prec1_final, _ = validate(val_loader, model, criterion, bsz_val,device, epoch)
-    print("Rank : ", rank, "Data transferred(in GB) during training: ", data_transferred/1.0e9, "\n")
-    #Store processed data
-    torch.save((prec1, prec1_final, (data_transferred+dt)/1.0e9), os.path.join(args.save_dir, "excel_data","rank_{}.sp".format(rank)))
+    prec1_final, _ = validate(val_loader, model, criterion, bsz_val, device, epoch)
 
-#def train(train_loader, model, criterion, optimizer, epoch, batch_size, writer, device):
-def train(train_loader, model, criterion, optimizer, epoch, batch_size, lr, device, receiver=None, sender=None):
-    """
-        Run one train epoch
-    """
+    # ENGC: weighting validation summary table (rank 0 only)
+    if args.optimizer.lower() == 'engc' and rank == 0 and engc_ws_history:
+        noise_ranks = {int(x) for x in args.noise_agents.split(',') if x.strip()} \
+                      if args.noise_agents else set()
+        # Use last min(10, epochs-1) epochs so validation reflects trained behavior
+        history_skip_first = engc_ws_history[1:] if len(engc_ws_history) > 1 else engc_ws_history
+        window = history_skip_first[-10:]
+        all_peer_ranks = sorted({r for ep in window for r in ep})
+
+        W = 90
+        print("\n" + "=" * W)
+        print(f"  ENGC WEIGHTING VALIDATION SUMMARY  [Rank {rank} — epochs 1-{len(engc_ws_history)-1}, last {len(window)} averaged]")
+        print("=" * W)
+        hdr = (f"  {'Peer':<14}  {'uncertainty_correct':>12}  {'uncertainty_wrong':>10}  "
+               f"{'delta uncertainty':>7}  {'weight_correct':>10}  {'weight_wrong':>9}  {'delta w':>7}  {'Pass?':>6}")
+        print(hdr)
+        print("  " + "-" * (W - 2))
+        all_pass = True
+        for r in all_peer_ranks:
+            tag = f"peer{r}{'[N]' if r in noise_ranks else '[c]'}"
+            vals = [ep[r] for ep in window if r in ep]
+            if not vals:
+                continue
+            unc_cor = sum(v['uncertainty_correct'] for v in vals) / len(vals)
+            unc_wr  = sum(v['uncertainty_wrong']  for v in vals) / len(vals)
+            w_cor   = sum(v['weight_corect']   for v in vals) / len(vals)
+            w_wr    = sum(v['weight_wrong']    for v in vals) / len(vals)
+            d_unc   = unc_wr - unc_cor
+            d_w     = w_wr   - w_cor
+            passed  = (d_unc > 0) and (d_w < 0)
+            all_pass = all_pass and passed
+            mark = "ok" if passed else "failed"
+            print(f"  {tag:<14}  {unc_cor:>12.3f}  {unc_wr:>10.3f}  "
+                  f"{d_unc:>+7.3f}  {w_cor:>10.3f}  {w_wr:>9.3f}  {d_w:>+7.3f}  {mark:>6}")
+        print("=" * W)
+        result_str = "VALIDATED" if all_pass else "NOT VALIDATED"
+        print(f"  Overall weighting mechanism: {result_str}")
+        print("=" * W + "\n")
+
+    total_comm_gb   = data_transferred / 1.0e9
+    total_time_s    = sum(train_time_list)
+    avg_cpu_pct     = sum(cpu_pct_list)  / max(len(cpu_pct_list),  1)
+    avg_gpu_pct     = sum(gpu_pct_list)  / max(len(gpu_pct_list),  1)
+    total_comm_pkgs = sum(comm_pkgs_list)
+    last_comm_mb    = comm_bytes_list[-1] / 1e6 if comm_bytes_list else 0.0
+    last_time_s     = train_time_list[-1]        if train_time_list else 0.0
+
+    # Print in rank order so output is readable with multiple processes
+    for r in range(dist.get_world_size()):
+        dist.barrier()
+        if dist.get_rank() == r:
+            W = 62
+            print("\n" + "=" * W)
+            print(f"  RANK {rank} — POST-TRAINING METRICS  "
+                  f"[{args.optimizer.upper()} | {args.graph} | skew={args.skew}]")
+            print("=" * W)
+            print(f"  {'Metric':<30} {'Last epoch':>12}  {'Total / Avg':>12}")
+            print("  " + "-" * (W - 2))
+            print(f"  {'Training time (s)':<30} {last_time_s:>12.2f}  {total_time_s:>11.1f}s")
+            print(f"  {'CPU usage (%)':<30} {cpu_pct_list[-1] if cpu_pct_list else 0:>12.1f}  {avg_cpu_pct:>11.1f}%")
+            print(f"  {'GPU usage (%)':<30} {gpu_pct_list[-1] if gpu_pct_list else 0:>12.1f}  {avg_gpu_pct:>11.1f}%")
+            print(f"  {'Comm payload (MB)':<30} {last_comm_mb:>12.2f}  {total_comm_gb*1e3:>10.2f}MB")
+            print(f"  {'Comm packages':<30} {comm_pkgs_list[-1] if comm_pkgs_list else 0:>12}  {total_comm_pkgs:>12}")
+            print(f"  {'Val accuracy (%)':<30} {'—':>12}  {prec1_final:>11.2f}%")
+            print("=" * W + "\n")
+
+    result = {
+        "acc_last_epoch":  float(prec1),
+        "acc_final":       float(prec1_final),
+        "payload_gb":      float(total_comm_gb),
+        "train_time_s":    float(total_time_s),
+        "cpu_pct_avg":     float(avg_cpu_pct),
+        "gpu_pct_avg":     float(avg_gpu_pct),
+        "comm_pkgs_total": int(total_comm_pkgs),
+        # per-epoch lists
+        "train_acc_list":   train_acc_list,
+        "train_loss_list":  train_loss_list,
+        "val_acc_list":     val_acc_list,
+        "val_loss_list":    val_loss_list,
+        "train_time_list":  train_time_list,
+        "cpu_pct_list":     cpu_pct_list,
+        "gpu_pct_list":     gpu_pct_list,
+        "comm_bytes_list":  comm_bytes_list,
+        "comm_pkgs_list":   comm_pkgs_list,
+    }
+    torch.save(result, os.path.join(args.save_dir, "excel_data", f"rank_{rank}.sp"))
+
+# # # Train function # # #
+def train(
+    train_loader,
+    val_loader,
+    model,
+    criterion,
+    optimizer,
+    epoch,
+    batch_size,
+    lr,
+    device,
+    receiver          = None,
+    sender            = None,
+    gpu_index         : int   = 0,
+    monitor_every     : int   = 50,
+):
+    global global_steps
+
     batch_time = AverageMeter()
-    data_time = AverageMeter()
-    losses = AverageMeter()
-    top1 = AverageMeter()
+    data_time  = AverageMeter()
+    losses     = AverageMeter()
+    top1       = AverageMeter()
     data_transferred = 0
 
-    # switch to train mode
+    all_outputs = []
+    all_targets = []
+
     model.train()
-    end = time.time()
-    step = len(train_loader)*batch_size*epoch
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+    t_epoch_start = time.perf_counter()
+
+    last_wall = time.perf_counter()
+    last_cpu  = time.process_time()
+    cpu_samples = []
+    gpu_samples = []
+
+    comm_calls_transfer_params      = 0
+    comm_calls_transfer_additional  = 0
+    payload_bytes_from_calls        = 0
+
+    _engc_trust = {}
+    _engc_ws = {}
+
+    end   = time.time()
+    step  = len(train_loader) * batch_size * epoch
+
+    val_iter = iter(val_loader)
+
     for i, (input, target) in enumerate(train_loader):
-        #print(dist.get_rank(), torch.unique(target))
         data_time.update(time.time() - end)
-        input_var, target_var = Variable(input).to(device), Variable(target).to(device)
-        # gossip the weights
-        _, amt_data_transfer, cross_weights = model.transfer_params(epoch=epoch+(1e-3*i), lr=lr)
-        data_transferred += amt_data_transfer
-        # do global update (gossip average step) in the pre forward hook, 
-        # then compute output in the forward pass
-        output = model(input_var)
-        loss = criterion(output, target_var)
-        # compute gradient 
-        loss.backward()
 
-        if 'cga' in args.optimizer.lower() or 'ngc' in args.optimizer.lower():
-            #send and recieve cross gradients
-            cross_grad, ref_buf                       = sender(cross_weights, input_var, target_var) 
-            cross_grad_copy                           = copy.deepcopy(cross_grad)
-            _, amt_data_transfer, recieved_cross_grad = model.transfer_additional(cross_grad)
-            receiver(recieved_cross_grad, cross_grad_copy, ref_buf)
-            data_transferred    +=amt_data_transfer
-            #project the gradients
+        input_var  = Variable(input).to(device)
+        target_var = Variable(target).to(device)
+
+        (val_input, val_target), val_iter = get_next_batch(val_iter, val_loader)
+        val_input_var  = Variable(val_input).to(device)
+        val_target_var = Variable(val_target).to(device)
+
+        _, amt_data_transfer, cross_weights = model.transfer_params(epoch=epoch + (1e-3 * i), lr=lr)
+        comm_calls_transfer_params += 1
+        payload_bytes_from_calls   += amt_data_transfer
+        data_transferred           += amt_data_transfer
+
+        if args.optimizer.lower() == 'engc':
+            # Cross-gradients
+            cross_grad, ref_buf = sender(cross_weights, input_var, target_var)
+
+            # Self-gradient
+            output = model(input_var)
+            loss = criterion(output, target_var)
+
+            all_outputs.append(output.detach().cpu())
+            all_targets.append(target.detach().cpu())
+            loss.backward()
+
+            # Broadcast cross-gradients
+            cross_grad_copy = copy.deepcopy(cross_grad)
+            _, amt_data_transfer, received_cross_grad = model.transfer_additional(cross_grad)
+            comm_calls_transfer_additional += 1
+            payload_bytes_from_calls += amt_data_transfer
+            data_transferred += amt_data_transfer
+
+            # Gradients aggregation
+            receiver(received_cross_grad, cross_grad_copy, ref_buf)
             receiver.project_gradients(lr)
-        elif args.optimizer.lower() == 'd-psgd':
-            receiver.update_gradients(lr)
 
-        # do local update
+            # Stats
+            for r, bp in sender.vac_by_pred.items():
+                d = _engc_ws.setdefault(r, {'uncertainty_correct_pred': [], 'uncertainty_wrong_pred': [], 'weight_correct_pred': [], 'weight_wrong_pred': []})
+                for key, field in [('uncertainty_correct_pred','uncertainty_correct'),('uncertainty_wrong_pred','uncertainty_wrong'),
+                                   ('weight_correct_pred','weight_correct'),('weight_wrong_pred','weight_wrong')]:
+                    v = bp.get(field, float('nan'))
+                    if not math.isnan(v):
+                        d[key].append(v)
+
+            # Diagnostics: entropy-based per-sample weighting
+            # uncertainty_on_wrong_pred > uncertainty_on_correct_pred => weight_on_wrong_pred < weight_on_correct_pred
+            if i % args.print_freq == 0:
+                noise_ranks = set(
+                    int(x) for x in args.noise_agents.split(',') if x.strip()
+                ) if args.noise_agents else set()
+                print(f"[ENGC-Diag][Rank {dist.get_rank()}]"
+                      f"[Ep {epoch}][{i}/{len(train_loader)}]")
+                for r in sorted(sender.vacuity_scores):
+                    tag     = f"peer{r}{'[N]' if r in noise_ranks else '[c]'}"
+                    stats   = sender.sample_weight_stats.get(r, {})
+                    by_pred = sender.vac_by_pred.get(r, {})
+                    print(
+                        f" {tag:<14}"
+                        f" mean_uncertainty={sender.vacuity_scores[r]:.3f}"
+                        f" uncertainty_std={stats.get('unc_std', float('nan')):.3f}"
+                        f" weight_std={stats.get('w_std', float('nan')):.3f}"
+                        f" frac_downweighted={stats.get('frac_low', float('nan')):.2f}"
+                    )
+                    print(
+                        f" {'':14}"
+                        f" uncertainty_on_correct={by_pred.get('uncertainty_correct', float('nan')):.3f}"
+                        f" uncertainty_on_wrong={by_pred.get('uncertainty_wrong', float('nan')):.3f}"
+                        f" weight_on_correct={by_pred.get('weight_correct', float('nan')):.3f}"
+                        f" weight_on_wrong={by_pred.get('weight_wrong', float('nan')):.3f}"
+                        f" frac_wrong_pred={by_pred.get('frac_wrong', float('nan')):.2f}"
+                    )
+
+            global_steps += 1
+
+        elif args.optimizer.lower() == 'murmura':
+            output = model(input_var)
+            loss   = criterion(output, target_var)
+
+            all_outputs.append(output.detach().cpu())
+            all_targets.append(target.detach().cpu())
+
+            loss.backward()
+
+            trust_scores = sender(cross_weights, input_var, target_var)
+            receiver.prepare(cross_weights, trust_scores,
+                             step=epoch + 1e-3 * i)
+            receiver.project_gradients(lr)
+
+            if i % args.print_freq == 0:
+                noise_ranks = set(
+                    int(x) for x in args.noise_agents.split(',') if x.strip()
+                ) if args.noise_agents else set()
+                parts = [f"tau={receiver.last_threshold:.3f}"]
+                for r in sorted(trust_scores):
+                    tag = '[N]' if r in noise_ranks else '[c]'
+                    parts.append(
+                        f"peer{r}{tag} "
+                        f"trust={trust_scores[r]:.3f} "
+                        f"vac={sender.last_vacuities.get(r, float('nan')):.3f} "
+                        f"acc={sender.last_accuracies.get(r, float('nan')):.3f}"
+                    )
+                print(
+                    f"[MURMURA-Diag][Rank {dist.get_rank()}]"
+                    f"[Ep {epoch}][{i}/{len(train_loader)}] "
+                    + " | ".join(parts)
+                )
+
+            global_steps += 1
+
+        else:
+            output = model(input_var)
+            loss   = criterion(output, target_var)
+
+            all_outputs.append(output.detach().cpu())
+            all_targets.append(target.detach().cpu())
+
+            loss.backward()
+
+            if 'cga' in args.optimizer.lower() or 'ngc' in args.optimizer.lower():
+                cross_grad, ref_buf = sender(cross_weights, input_var, target_var)
+                cross_grad_copy     = copy.deepcopy(cross_grad)
+                _, amt_data_transfer, received_cross_grad = model.transfer_additional(cross_grad)
+                comm_calls_transfer_additional += 1
+                payload_bytes_from_calls       += amt_data_transfer
+                data_transferred               += amt_data_transfer
+                receiver(received_cross_grad, cross_grad_copy, ref_buf)
+                receiver.project_gradients(lr)
+
+            elif args.optimizer.lower() == 'd-psgd':
+                receiver.update_gradients(lr)
+
         optimizer.step()
-        #zero out the gradients
-        optimizer.zero_grad() 
+        optimizer.zero_grad()
+
+        if args.optimizer.lower() == 'murmura': # model averaging happens after local gradient update
+            receiver.post_step_aggregate()
+
         output = output.float()
-        loss = loss.float()
-        # measure accuracy and record loss
+        loss   = loss.float()
+
         prec1 = accuracy(output.data, target_var)[0]
         losses.update(loss.item(), input.size(0))
         top1.update(prec1.item(), input.size(0))
-        # measure elapsed time
+
         batch_time.update(time.time() - end)
         end = time.time()
-        
+
+        if (i % monitor_every) == 0:
+            now_wall = time.perf_counter()
+            now_cpu  = time.process_time()
+            dt_wall  = max(now_wall - last_wall, 1e-9)
+            dt_cpu   = max(now_cpu - last_cpu, 0.0)
+            cpu_pct  = (dt_cpu / dt_wall) * 100.0
+            cpu_samples.append(cpu_pct)
+            last_wall, last_cpu = now_wall, now_cpu
+
+            gu = get_gpu_util_percent(gpu_index)
+            if gu is not None:
+                gpu_samples.append(gu)
+
         if i % args.print_freq == 0:
             print('Rank: {0}\t'
                   'Epoch: [{1}][{2}/{3}]\t'
                   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
                   'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
-                      dist.get_rank(), epoch, i, len(train_loader),  batch_time=batch_time,
-                      loss=losses, top1=top1))
-        step += batch_size 
-    return data_transferred, top1.avg, losses.avg
+                      dist.get_rank(), epoch, i, len(train_loader),
+                      batch_time=batch_time, loss=losses, top1=top1))
+        step += batch_size
 
+    all_outputs = torch.cat(all_outputs, dim=0)
+    all_targets = torch.cat(all_targets, dim=0)
 
+    prec, rec, f1 = precision_recall_f1(all_outputs, all_targets, num_classes=args.classes)
+
+    if dist.get_rank() == 0:
+        print(
+            f"[Train][Epoch {epoch}] "
+            f"Precision = {prec:.2f}  "
+            f"Recall = {rec:.2f}  "
+            f"F1 = {f1:.2f}"
+        )
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+    train_time_s = time.perf_counter() - t_epoch_start
+
+    cpu_avg = float(sum(cpu_samples) / max(len(cpu_samples), 1)) if cpu_samples else 0.0
+    gpu_avg = float(sum(gpu_samples) / max(len(gpu_samples), 1)) if gpu_samples else 0.0
+
+    def _emean(d):
+        return {r: float(sum(v) / len(v)) if v else float('nan') for r, v in d.items()}
+
+    metrics = {
+        "train_time_s":                   train_time_s,
+        "cpu_pct_avg":                    cpu_avg,
+        "gpu_pct_avg":                    gpu_avg,
+        "comm_calls_transfer_params":     comm_calls_transfer_params,
+        "comm_calls_transfer_additional": comm_calls_transfer_additional,
+        "payload_bytes_from_calls":       int(payload_bytes_from_calls),
+        "engc_trust": _emean(_engc_trust),
+        "engc_weight_stats": {
+            r: {k: float(sum(v) / len(v)) if v else float('nan')
+                for k, v in d.items()}
+            for r, d in _engc_ws.items()
+        },
+    }
+    return data_transferred, top1.avg, losses.avg, metrics
+
+# # # Validation function # # #
 def validate(val_loader, model, criterion, batch_size, device, epoch=0):
-#def validate(val_loader, model, criterion, batch_size, writer, device, epoch=0):
-    """
-    Run evaluation
-    """
     batch_time = AverageMeter()
-    losses = AverageMeter()
-    top1 = AverageMeter()
+    losses     = AverageMeter()
+    top1       = AverageMeter()
 
-    # switch to evaluate mode
     model.eval()
-    step = len(val_loader)*batch_size*epoch
-    end = time.time()
+
+    all_outputs = []
+    all_targets = []
+
+    step = len(val_loader) * batch_size * epoch
+    end  = time.time()
+
     with torch.no_grad():
         for i, (input, target) in enumerate(val_loader):
-            input_var, target_var = Variable(input).to(device), Variable(target).to(device)
-            # compute output and loss
-            output = model(input_var)
-            loss = criterion(output, target_var)
-            output = output.float()
-            loss = loss.float()
+            input_var  = Variable(input).to(device)
+            target_var = Variable(target).to(device)
 
-            # measure accuracy and record loss
+            output = model(input_var)
+            loss   = criterion(output, target_var)
+            output = output.float()
+            loss   = loss.float()
+
+            all_outputs.append(output.cpu())
+            all_targets.append(target.cpu())
+
             prec1 = accuracy(output.data, target_var)[0]
             losses.update(loss.item(), input.size(0))
             top1.update(prec1.item(), input.size(0))
 
-            # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
 
             if i % args.print_freq == 0:
                 print('Rank: {0}\t'
                       'Test: [{1}/{2}]\t'
-                      #'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                       'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
                       'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
-                          dist.get_rank(),i, len(val_loader), 
-                          #batch_time=batch_time, 
-                          loss=losses,
-                          top1=top1))
+                          dist.get_rank(), i, len(val_loader),
+                          loss=losses, top1=top1))
             step += batch_size
-    print('Rank:{0}, Prec@1 {top1.avg:.3f}'.format(dist.get_rank(),top1=top1))
+
+    print('Rank:{0}, Prec@1 {top1.avg:.3f}'.format(dist.get_rank(), top1=top1))
+
+    all_outputs = torch.cat(all_outputs, dim=0)
+    all_targets = torch.cat(all_targets, dim=0)
+
+    prec, rec, f1 = precision_recall_f1(all_outputs, all_targets, num_classes=args.classes)
+
+    ece = compute_ece(all_outputs, all_targets)
+
+    if dist.get_rank() == 0:
+        print(
+            f"[Val][Epoch {epoch}] "
+            f"Precision = {prec:.2f}  "
+            f"Recall = {rec:.2f}  "
+            f"F1 = {f1:.2f}  "
+            f"ECE = {ece:.4f}"
+        )
+
     return top1.avg, losses.avg
+
+# # # Helper functions # # #
+def compute_ece(logits: torch.Tensor, labels: torch.Tensor, n_bins: int = 15) -> float:
+    """ 
+    - Expected Calibration Error: measures gap between confidence and accuracy.
+    - Lower is better. Perfect calibration = 0.
+    """
+    probs = torch.softmax(logits, dim=1)
+    confidences, predictions = probs.max(dim=1)
+    correct = predictions.eq(labels).float()
+    ece = 0.0
+    bin_edges = torch.linspace(0.0, 1.0, n_bins + 1)
+    for i in range(n_bins):
+        lo, hi = bin_edges[i].item(), bin_edges[i + 1].item()
+        in_bin = (confidences > lo) & (confidences <= hi)
+        prop = in_bin.float().mean().item()
+        if prop > 0:
+            acc  = correct[in_bin].mean().item()
+            conf = confidences[in_bin].mean().item()
+            ece += prop * abs(conf - acc)
+    return ece
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val   = 0
+        self.avg   = 0
+        self.sum   = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val    = val
+        self.sum   += val * n
+        self.count += n
+        self.avg    = self.sum / self.count
+
+def get_gpu_util_percent(gpu_index: int):
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", f"--id={gpu_index}",
+             "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+            text=True
+        ).strip()
+        return float(out.splitlines()[0])
+    except Exception:
+        return None
 
 def average_parameters(model):
     size = float(dist.get_world_size())
@@ -322,36 +874,15 @@ def average_parameters(model):
         param.data /= size
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
-    """
-    Save the training model
-    """
     torch.save(state, filename)
-
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
 
 def accuracy(output, target, topk=(1,)):
     """Computes the precision@k for the specified values of k"""
-    maxk = max(topk)
+    maxk       = max(topk)
     batch_size = target.size(0)
 
     _, pred = output.topk(maxk, 1, True, True)
-    pred = pred.t()
+    pred    = pred.t()
     correct = pred.eq(target.view(1, -1).expand_as(pred))
 
     res = []
@@ -360,59 +891,232 @@ def accuracy(output, target, topk=(1,)):
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
 
-def flatten_tensors(tensors):
-    if len(tensors) == 1:
-        return tensors[0].view(-1).clone()
-    flat = torch.cat([t.contiguous().view(-1) for t in tensors], dim=0)
-    return flat
+def precision_recall_f1(output, target, num_classes):
+    pred           = output.argmax(dim=1)
+    precision_list = []
+    recall_list    = []
+    f1_list        = []
 
-def average_parameters(model):
-    size = float(dist.get_world_size())
-    for param in model.parameters():
-        dist.all_reduce(param.data, op=dist.ReduceOp.SUM)
-        param.data /= size
+    for c in range(num_classes):
+        tp = ((pred == c) & (target == c)).sum().item()
+        fp = ((pred == c) & (target != c)).sum().item()
+        fn = ((pred != c) & (target == c)).sum().item()
 
-def init_process(rank, size, fn, backend='nccl'):
-    """Initialize distributed enviornment"""
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1        = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+
+        precision_list.append(precision)
+        recall_list.append(recall)
+        f1_list.append(f1)
+
+    return (
+        sum(precision_list) / num_classes * 100,
+        sum(recall_list)    / num_classes * 100,
+        sum(f1_list)        / num_classes * 100,
+    )
+
+def init_process(rank, size, fn, backend=None):
+    num_gpus = torch.cuda.device_count()
+    if backend is None:
+        # nccl requires one dedicated GPU per rank; gloo works with shared GPUs or CPU
+        backend = 'nccl' if num_gpus >= size else 'gloo'
+    if num_gpus > 0:
+        torch.cuda.set_device(rank % num_gpus)
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = args.port
     dist.init_process_group(backend, rank=rank, world_size=size)
-    fn(rank,size)
+    dist.barrier()
+    try:
+        fn(rank, size)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
+def check_noniid(train_loader, rank, world_size):
+    local_counter = Counter()
+    for _, targets in train_loader:
+        local_counter.update(targets.tolist())
+    local_total        = sum(local_counter.values())
+    local_distribution = {int(label): count / local_total for label, count in local_counter.items()}
+
+    all_distributions = [None for _ in range(world_size)]
+    dist.all_gather_object(all_distributions, local_distribution)
+
+    print("= = = = = CHECK NON-IID DISTRIBUTION ACROSS AGENTS = = = = =")
+    if rank == 0:
+        for r, dist_r in enumerate(all_distributions):
+            print(f"Rank {r} label distribution: {dist_r}")
+        all_labels = sorted({label for d in all_distributions for label in d.keys()})
+        matrix = np.array([
+            [d.get(label, 0.0) for label in all_labels]
+            for d in all_distributions
+        ])
+        mean_distribution = matrix.mean(axis=0)
+        l1_distance       = np.abs(matrix - mean_distribution).sum(axis=1)
+        print("\nL1 distance:")
+        for r, value in enumerate(l1_distance):
+            print(f"Rank {r}: {value:.3f}")
+
+def get_next_batch(loader_iter, loader):
+    try:
+        batch = next(loader_iter)
+    except StopIteration:
+        loader_iter = iter(loader)
+        batch       = next(loader_iter)
+    return batch, loader_iter
+
+# # # Main # # #
 if __name__ == '__main__':
     size = args.world_size
-    
-    spawn(init_process, args=(size,run), nprocs=size, join=True)
-    #read stored data
+    spawn(init_process, args=(size, run), nprocs=size, join=True)
+
+    # Read stored data
     excel_data = {
-        'data': args.dataset,
-        "graph" : args.graph,
-        "nodes": size,
-        'arch': args.arch,
-        "norm" : args.normtype,
-        'depth':args.depth,
-        'optimizer' : args.optimizer,
+        'data':          args.dataset,
+        "graph":         args.graph,
+        "nodes":         size,
+        'arch':          args.arch,
+        "norm":          args.normtype,
+        'depth':         args.depth,
+        'optimizer':     args.optimizer,
         "learning rate": args.lr,
-        "momentum":args.momentum,
-        "qgm":args.qgm,
-        "nesterov":args.nesterov,
-        "weight_decay":args.weight_decay,
-        "skew" : args.skew,
-        "gamma" : args.gamma,
-        "alpha" : args.alpha,
-        "epochs": args.epochs,
-        "avg test acc":[0.0 for _ in range(size)],
-        "avg test acc final":[0.0 for _ in range(size)],
-        "data transferred": [0.0 for _ in range(size)],
-         "seed" :args.seed,
-         }
-         
+        "momentum":      args.momentum,
+        "qgm":           args.qgm,
+        "nesterov":      args.nesterov,
+        "weight_decay":  args.weight_decay,
+        "skew":          args.skew,
+        "gamma":         args.gamma,
+        "alpha":         args.alpha,
+        "epochs":        args.epochs,
+        "seed":          args.seed,
+        # scalar per-rank
+        "avg test acc":       [0.0 for _ in range(size)],
+        "avg test acc final": [0.0 for _ in range(size)],
+        "data transferred":   [0.0 for _ in range(size)],
+        "train_time_s":       [0.0 for _ in range(size)],
+        "cpu_pct_avg":        [0.0 for _ in range(size)],
+        "gpu_pct_avg":        [0.0 for _ in range(size)],
+        "comm_pkgs_total":    [0   for _ in range(size)],
+        # per-epoch lists per-rank
+        "train_acc_list":   [[] for _ in range(size)],
+        "train_loss_list":  [[] for _ in range(size)],
+        "val_acc_list":     [[] for _ in range(size)],
+        "val_loss_list":    [[] for _ in range(size)],
+        "train_time_list":  [[] for _ in range(size)],
+        "cpu_pct_list":     [[] for _ in range(size)],
+        "gpu_pct_list":     [[] for _ in range(size)],
+        "comm_bytes_list":  [[] for _ in range(size)],
+        "comm_pkgs_list":   [[] for _ in range(size)],
+    }
+
     for i in range(size):
-        acc, acc_final, d_tfr = torch.load(os.path.join( args.save_dir, "excel_data","rank_{}.sp".format(i) ))
-        excel_data["avg test acc"][i] = acc
-        excel_data["avg test acc final"][i] = acc_final
-        excel_data["data transferred"][i] = d_tfr
-        
-    torch.save(excel_data, os.path.join(args.save_dir, "excel_data","dict"))
-    #print(excel_data)
-    
+        r = torch.load(os.path.join(args.save_dir, "excel_data", f"rank_{i}.sp"))
+        excel_data["avg test acc"][i]       = r["acc_last_epoch"]
+        excel_data["avg test acc final"][i] = r["acc_final"]
+        excel_data["data transferred"][i]   = r["payload_gb"]
+        excel_data["train_time_s"][i]       = r["train_time_s"]
+        excel_data["cpu_pct_avg"][i]        = r["cpu_pct_avg"]
+        excel_data["gpu_pct_avg"][i]        = r["gpu_pct_avg"]
+        excel_data["comm_pkgs_total"][i]    = r["comm_pkgs_total"]
+        excel_data["train_acc_list"][i]     = r.get("train_acc_list",  [])
+        excel_data["train_loss_list"][i]    = r.get("train_loss_list", [])
+        excel_data["val_acc_list"][i]       = r.get("val_acc_list",    [])
+        excel_data["val_loss_list"][i]      = r.get("val_loss_list",   [])
+        excel_data["train_time_list"][i]    = r.get("train_time_list", [])
+        excel_data["cpu_pct_list"][i]       = r.get("cpu_pct_list",    [])
+        excel_data["gpu_pct_list"][i]       = r.get("gpu_pct_list",    [])
+        excel_data["comm_bytes_list"][i]    = r.get("comm_bytes_list", [])
+        excel_data["comm_pkgs_list"][i]     = r.get("comm_pkgs_list",  [])
+
+    torch.save(excel_data, os.path.join(args.save_dir, "excel_data", "dict"))
+
+    def _build_matrix(lists):
+        """Stack per-rank lists into a (n_ranks x n_epochs) numpy matrix."""
+        max_len = max((len(l) for l in lists if l), default=0)
+        if max_len == 0:
+            return None, max_len
+        mat = np.full((len(lists), max_len), np.nan, dtype=float)
+        for i, l in enumerate(lists):
+            mat[i, :len(l)] = np.array(l, dtype=float)
+        return mat, max_len
+
+    def plot_epoch_metric(lists, out_dir, filename, ylabel, title=None):
+        mat, max_len = _build_matrix(lists)
+        if mat is None:
+            return
+        mean   = np.nanmean(mat, axis=0)
+        epochs = np.arange(1, max_len + 1)
+        plt.figure()
+        for i in range(mat.shape[0]):
+            plt.plot(epochs, mat[i], alpha=0.25)
+        plt.plot(epochs, mean, linewidth=2.5, label="mean")
+        if title:
+            plt.title(title)
+        plt.xlabel("Epoch")
+        plt.ylabel(ylabel)
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, filename), dpi=200)
+        plt.close()
+
+    # Accuracy plots
+    plot_epoch_metric(excel_data["train_acc_list"], args.save_dir,
+                      "train_accuracy_vs_epoch.png", "Train accuracy (%)")
+    plot_epoch_metric(excel_data["val_acc_list"],   args.save_dir,
+                      "val_accuracy_vs_epoch.png",   "Val accuracy (%)")
+
+    # Resource / communication plots
+    plot_epoch_metric(excel_data["train_time_list"], args.save_dir,
+                      "train_time_vs_epoch.png", "Training time (s/epoch)",
+                      title="Training time per epoch")
+    plot_epoch_metric(excel_data["cpu_pct_list"], args.save_dir,
+                      "cpu_usage_vs_epoch.png", "CPU usage (%)",
+                      title="CPU usage per epoch")
+    plot_epoch_metric(excel_data["gpu_pct_list"], args.save_dir,
+                      "gpu_usage_vs_epoch.png", "GPU usage (%)",
+                      title="GPU usage per epoch")
+    plot_epoch_metric(
+        [[b / 1e6 for b in row] for row in excel_data["comm_bytes_list"]],
+        args.save_dir, "comm_cost_vs_epoch.png", "Communication cost (MB/epoch)",
+        title="Communication cost per epoch",
+    )
+    plot_epoch_metric(excel_data["comm_pkgs_list"], args.save_dir,
+                      "comm_packages_vs_epoch.png", "# comm packages/epoch",
+                      title="Communication packages per epoch")
+
+    # Print cross-rank summary table
+    print("\n" + "=" * 72)
+    print(f"  FINAL SUMMARY  [{args.optimizer.upper()} | {args.graph} | "
+          f"{size} nodes | skew={args.skew}]")
+    print("=" * 72)
+    print(f"  {'Rank':<6} {'ValAcc%':>8} {'FinalAcc%':>10} "
+          f"{'Time(s)':>9} {'CPU%':>7} {'GPU%':>7} "
+          f"{'CommGB':>8} {'Pkgs':>7}")
+    print("  " + "-" * 68)
+    for i in range(size):
+        print(f"  {i:<6} "
+              f"{excel_data['avg test acc'][i]:>8.2f} "
+              f"{excel_data['avg test acc final'][i]:>10.2f} "
+              f"{excel_data['train_time_s'][i]:>9.1f} "
+              f"{excel_data['cpu_pct_avg'][i]:>7.1f} "
+              f"{excel_data['gpu_pct_avg'][i]:>7.1f} "
+              f"{excel_data['data transferred'][i]:>8.4f} "
+              f"{excel_data['comm_pkgs_total'][i]:>7}")
+    print("=" * 72 + "\n")
+
+    # Loss curve (rank 0 only)
+    r0_train = excel_data["train_loss_list"][0]
+    r0_val   = excel_data["val_loss_list"][0]
+    if r0_train and r0_val:
+        print("=" * 72)
+        print(f"  LOSS CURVE  [Rank 0 — {args.optimizer.upper()}]")
+        print("=" * 72)
+        print(f"  {'Epoch':>6}  {'TrainLoss':>10}  {'ValLoss':>10}  {'Gap(V-T)':>10}  {'Overfit?':>9}")
+        print("  " + "-" * 60)
+        for ep, (tl, vl) in enumerate(zip(r0_train, r0_val)):
+            gap      = vl - tl
+            overfit  = "YES" if gap > 0.1 else ""
+            print(f"  {ep:>6}  {tl:>10.4f}  {vl:>10.4f}  {gap:>+10.4f}  {overfit:>9}")
+        print("=" * 72 + "\n")
