@@ -10,8 +10,6 @@ import argparse
 import os
 import shutil
 import time
-import math
-from tkinter import E
 import numpy as np
 import statistics
 import copy
