@@ -572,7 +572,18 @@ class DataPartitioner(object):
         
         assert len(labels) == len(data), f"labels({len(labels)}) != len(data)({len(data)})"
         # -------- end labels --------
-        
+
+        # Dirichlet partition for inherently imbalanced datasets.
+        # Consecutive label-sorted split breaks down when one class dominates
+        # (e.g. HAM10000: 67% class 5 → multiple agents get identical data).
+        # Dirichlet sampling gives each agent a distinct class mixture.
+        if dataset_name in ('ham10000', 'fedisic2019') and skew > 0:
+            # alpha: small → strong non-IID, large → near-IID
+            # skew=1 → alpha=0.5 (standard FL setting); skew→0 → large alpha
+            alpha = (1.0 - skew) * 50 + 0.5
+            self._dirichlet_partition(labels, len(sizes), alpha, seed)
+            return
+
         rng = random.Random()
         rng.seed(seed)
         indices_rand = np.arange(len(labels)).tolist()
@@ -615,6 +626,40 @@ class DataPartitioner(object):
                 sort_indices = mixed[part_len:]
                 indices_rand = [x for x in indices_rand if x not in assigned]
 
+
+    def _dirichlet_partition(self, labels, num_agents, alpha, seed):
+        """
+        Dirichlet-based non-IID partition for imbalanced datasets.
+
+        For each class c, sample a Dirichlet(alpha) vector of length num_agents
+        to decide what fraction of class-c samples goes to each agent.
+        Small alpha → each agent gets mostly one or two classes (strong non-IID).
+        Large alpha → each agent gets a near-uniform class mix (near-IID).
+        """
+        rng = np.random.RandomState(seed)
+        label_arr = np.array(labels, dtype=np.int64)
+        num_classes = int(label_arr.max()) + 1
+
+        class_indices = [np.where(label_arr == c)[0].copy() for c in range(num_classes)]
+        partitions = [[] for _ in range(num_agents)]
+
+        for idxs in class_indices:
+            if len(idxs) == 0:
+                continue
+            rng.shuffle(idxs)
+            proportions = rng.dirichlet(np.ones(num_agents) * alpha)
+            boundaries = (np.cumsum(proportions) * len(idxs)).astype(int)
+            boundaries = np.clip(boundaries, 0, len(idxs))
+            prev = 0
+            for i, end in enumerate(boundaries[:-1]):
+                partitions[i].extend(idxs[prev:end].tolist())
+                prev = end
+            partitions[-1].extend(idxs[prev:].tolist())
+
+        for part in partitions:
+            arr = np.array(part, dtype=np.int64)
+            rng.shuffle(arr)
+            self.partitions.append(arr.tolist())
 
     def use(self, partition):
         return Partition(self.data, self.partitions[partition])
