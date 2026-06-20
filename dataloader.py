@@ -656,6 +656,13 @@ class DataPartitioner(object):
                 prev = end
             partitions[-1].extend(idxs[prev:].tolist())
 
+        # Guarantee no agent gets an empty partition: steal one sample from
+        # the largest partition for each empty one.
+        for i, part in enumerate(partitions):
+            if len(part) == 0:
+                largest = max(range(num_agents), key=lambda j: len(partitions[j]))
+                partitions[i].append(partitions[largest].pop())
+
         for part in partitions:
             arr = np.array(part, dtype=np.int64)
             rng.shuffle(arr)
