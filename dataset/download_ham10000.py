@@ -1,6 +1,6 @@
 """
 URL: https://isic-archive.s3.amazonaws.com/images/<ISIC_ID>.jpg
-Commands: python3.12 dataset/download_ham10000.py --out ../../data/ham10000
+Commands: python3.12 dataset/download_ham10000.py --out ../data/ham10000
 """
 
 from __future__ import annotations

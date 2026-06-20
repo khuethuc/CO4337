@@ -1,19 +1,5 @@
 """
 MURMURA — Evidential Trust-Aware Model Aggregation
-Reference: Rangwala et al., 2025 (https://arxiv.org/abs/2512.19131)
-
-Key differences from NGC/ENGC:
-  - Aggregates MODEL WEIGHTS directly, not gradients
-  - Trust score = f(EDL vacuity, local accuracy) of each neighbor's model
-  - Tightening threshold τ(t) starts lenient and tightens over training
-  - Does NOT require a second communication round (no cross-gradient transfer)
-    → lower communication cost than NGC/ENGC
-
-Per-step flow:
-  1. [Shared] Round 1: exchange model params via transfer_params()
-  2. Evaluate each neighbor model on local batch → trust score
-  3. Local loss.backward() + optimizer.step()
-  4. post_step_aggregate(): trust-weighted blend of accepted neighbor models
 """
 
 import copy
@@ -21,7 +7,21 @@ import math
 import torch
 import torch.nn.functional as F
 
-from .engc import compute_edl_vacuity   # reuse EDL vacuity
+def _edl_params(logits: torch.Tensor):
+    evidence = F.softplus(logits)   # [B, K]
+    alpha    = evidence + 1.0       # [B, K]
+    S        = alpha.sum(dim=1)     # [B]
+    return evidence, alpha, S
+
+def compute_edl_vacuity(logits: torch.Tensor) -> torch.Tensor:
+    """
+    EDL vacuity = K / S [0, 1]
+    0: confident
+    1: uncertain
+    """
+    K = logits.size(1)
+    _, _, S = _edl_params(logits)
+    return (K / S).clamp(0.0, 1.0) 
 
 
 # ---------------------------------------------------------------------------
