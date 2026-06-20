@@ -10,7 +10,7 @@ OUT_DIR_CLEAN="${SAVE_BASE_CLEAN}/${BASE_NAME}"
 mkdir -p "${OUT_DIR_CLEAN}/excel_data"
 
 echo "========== [NGC] Clean setting =========="
-python trainer.py \
+python3.12 trainer.py \
   --data-dir ../data/ham10000 --dataset ham10000 --classes 7 \
   --lr 0.01 --batch-size 160 \
   --world_size 5 --skew 1 \

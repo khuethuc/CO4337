@@ -21,7 +21,21 @@ import math
 import torch
 import torch.nn.functional as F
 
-from .engc import compute_edl_vacuity   # reuse EDL vacuity
+def _edl_params(logits: torch.Tensor):
+    evidence = F.softplus(logits)              # [B, K]
+    alpha    = evidence + 1.0                  # [B, K]
+    S        = alpha.sum(dim=1)                # [B]
+    return evidence, alpha, S
+
+def compute_edl_vacuity(logits: torch.Tensor) -> torch.Tensor:
+    """
+    EDL vacuity = K / S  ∈ (0, 1].
+    0 - confident
+    1 - uncertain (uniform Dirichlet)
+    """
+    K = logits.size(1)
+    _, _, S = _edl_params(logits)
+    return (K / S).clamp(0.0, 1.0) 
 
 
 # ---------------------------------------------------------------------------
