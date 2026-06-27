@@ -48,7 +48,7 @@ run_exp() {
     printf '  Time     : %s\n' "$(date)"
     printf '======================================================================\n\n'
 
-    python trainer.py "${COMMON[@]}" "${DATASET[@]}" "$@" \
+    python3.12 trainer.py "${COMMON[@]}" "${DATASET[@]}" "$@" \
         --arch "$arch" \
         --world_size "$nodes" \
         --seed "$seed" \
