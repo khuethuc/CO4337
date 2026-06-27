@@ -6,7 +6,7 @@ Graph Manager Class
     communication topologies, and cycling through peers.
 """
 
-from math import log as mlog
+from math import log as mlog, sqrt
 import torch
 import torch.distributed as dist
 
@@ -162,13 +162,21 @@ class RingGraph(GraphManager):
 class GridGraph(GraphManager):
 
     def _make_graph(self):
+        # col_stride for the 2D torus column connections.
+        # Hardcoding 5 causes self-loops (world_size=5) and duplicate
+        # neighbors (world_size=10) that break dist.new_group.
+        # round(sqrt(N)) gives 4 distinct neighbors for all our sizes:
+        #   5 nodes  → stride 2  (each node sees ±1 and ±2)
+        #   10 nodes → stride 3  (each node sees ±1 and ±3)
+        #   20 nodes → stride 4  (each node sees ±1 and ±4)
+        col_stride = max(2, round(sqrt(self.world_size)))
         for rank in range(self.world_size):
             a = self._rotate_forward(rank, 1)
             b = self._rotate_backward(rank, 1)
-            c = self._rotate_forward(rank, 5)
-            d = self._rotate_backward(rank, 5)
-     
-            self._add_peers(rank, [a,b,c,d])
+            c = self._rotate_forward(rank, col_stride)
+            d = self._rotate_backward(rank, col_stride)
+
+            self._add_peers(rank, [a, b, c, d])
 
     def is_regular_graph(self): return True
 
