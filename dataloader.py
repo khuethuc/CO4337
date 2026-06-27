@@ -13,27 +13,14 @@ from sklearn.model_selection import train_test_split
 import torchvision.transforms.functional as TF
 import math
 
-
-# ---------------------------------------------------------------------------
-# Fed-ISIC2019 (flwrlabs/fed-isic2019) — 8 skin-lesion classes
-# Saved to disk by dataset/download_fedisic2019.py
-# ---------------------------------------------------------------------------
+# # # Fed-ISIC2019 # # # 
 _FEDISIC2019_CLASSES = ["MEL", "NV", "BCC", "AK", "BKL", "DF", "VASC", "SCC"]
 _FEDISIC2019_NUM_CLASSES = len(_FEDISIC2019_CLASSES)  # 8
 
-# ISIC 2019 channel statistics (computed on training set at native resolution)
 _FEDISIC2019_MEAN = [0.6681, 0.5301, 0.5247]
 _FEDISIC2019_STD  = [0.1337, 0.1480, 0.1595]
 
-
 class FedISIC2019Dataset(torch.utils.data.Dataset):
-    """
-    Loads Fed-ISIC2019 from images saved by download_fedisic2019.py.
-
-    Exposes .y and .indices so DataPartitioner can extract per-sample labels
-    without iterating the whole dataset (same contract as HAM10000ImageDataset).
-    """
-
     def __init__(self, images_dir: str, meta_path: str, transform=None):
         self.images_dir = images_dir
         self.transform  = transform
@@ -43,7 +30,6 @@ class FedISIC2019Dataset(torch.utils.data.Dataset):
         labels  = df["label"].to_numpy(dtype=np.int64)
         centers = df["center_id"].tolist() if "center_id" in df.columns else [-1] * len(ids)
 
-        # Keep only images that actually exist on disk
         keep = [i for i, id_ in enumerate(ids)
                 if os.path.exists(os.path.join(images_dir, f"{id_}.jpg"))]
         if len(keep) < len(ids):
@@ -72,36 +58,19 @@ def _load_fedisic2019_images(data_dir: str, train: bool, transform) -> FedISIC20
     if not os.path.isdir(images_dir):
         raise FileNotFoundError(
             f"images/ not found in {data_dir}\n"
-            "Run: python dataset/download_fedisic2019.py --out-dir <data_dir>"
+            "Please download dataset Fed-ISIC-2019"
         )
     meta_fname = "metadata_train.csv" if train else "metadata_test.csv"
     meta_path  = os.path.join(data_dir, meta_fname)
     if not os.path.exists(meta_path):
         raise FileNotFoundError(
             f"Metadata not found: {meta_path}\n"
-            "Run: python dataset/download_fedisic2019.py --out-dir <data_dir>"
+            "Please download dataset Fed-ISIC-2019"
         )
     return FedISIC2019Dataset(images_dir, meta_path, transform=transform)
 
 
 def _fedisic2019_center_split(dataset: FedISIC2019Dataset, rank: int, world_size: int, seed: int) -> list:
-    """
-    Partition Fed-ISIC-2019 by pre-assigned center_id.
-
-    Scaling rule (num_centers = 6 for fed-isic2019):
-      - world_size <= num_centers : agent `rank` → center `rank % num_centers`
-      - world_size >  num_centers : centers are reused round-robin; each center's
-        data is further split evenly among the agents assigned to it.
-
-    Assignment: agent rank → center index  (rank % num_centers)
-                           → sub-partition (rank // num_centers)
-
-    Example with 10 agents, 6 centers:
-      rank 0,6 → center 0 (split into 2)   rank 4 → center 4 (not split)
-      rank 1,7 → center 1 (split into 2)   rank 5 → center 5 (not split)
-      rank 2,8 → center 2 (split into 2)
-      rank 3,9 → center 3 (split into 2)
-    """
     unique_centers = sorted(set(dataset.centers))
     num_centers    = len(unique_centers)
     center_idx     = rank % num_centers
@@ -110,7 +79,6 @@ def _fedisic2019_center_split(dataset: FedISIC2019Dataset, rank: int, world_size
 
     center_flat = [i for i, c in enumerate(dataset.centers) if c == my_center]
 
-    # Number of agents sharing this center
     agents_this_center = math.ceil((world_size - center_idx) / num_centers)
 
     rng = np.random.RandomState(seed + center_idx)
@@ -124,11 +92,8 @@ def _fedisic2019_center_split(dataset: FedISIC2019Dataset, rank: int, world_size
     return my_indices
 
 
-# ---------------------------------------------------------------------------
-# HAM10000 label map
-# ---------------------------------------------------------------------------
+# # # HAM10000 # # #
 _HAM10000_DX_TO_LABEL = {
-    # canonical HAM10000 short codes
     "akiec": 0,
     "bcc": 1,
     "bkl": 2,
@@ -137,7 +102,6 @@ _HAM10000_DX_TO_LABEL = {
     "nv": 5,
     "vasc": 6,
 
-    # common long-form aliases (ISIC-style)
     "actinic keratosis": 0,
     "bowen": 0,
     "bowen's disease": 0,
@@ -183,12 +147,10 @@ def _extract_ids_labels(df: pd.DataFrame):
         raise ValueError(f"Cannot find id column in metadata. Columns: {list(df.columns)}")
     ids_all = df[id_col].astype(str).str.strip().tolist()
 
-    # if numeric label exists, use it
     if "label" in df.columns:
         y_all = df["label"].to_numpy(dtype=np.int64)
         return ids_all, y_all
 
-    # choose the "most specific" diagnosis column available: 3 -> 2 -> 1
     diag_cols = [c for c in ["diagnosis_3", "diagnosis_2", "diagnosis_1", "dx", "diagnosis", "diagnosis_name"] if c in df.columns]
     if not diag_cols:
         raise ValueError(
@@ -196,11 +158,9 @@ def _extract_ids_labels(df: pd.DataFrame):
             f"Columns: {list(df.columns)}"
         )
 
-    # helper to normalize text
     def norm(x: str) -> str:
         return str(x).strip().lower()
 
-    # values that are too coarse (can't map to 7 classes)
     coarse = {"benign", "malignant", "unknown", "nan", "none", ""}
 
     keep_ids = []
@@ -209,7 +169,6 @@ def _extract_ids_labels(df: pd.DataFrame):
     for i in range(len(df)):
         isic_id = ids_all[i]
 
-        # pick first non-coarse diagnosis among diag_cols (prefer diagnosis_3 then 2 then 1)
         chosen = ""
         for c in diag_cols:
             v = norm(df.iloc[i][c])
@@ -218,10 +177,8 @@ def _extract_ids_labels(df: pd.DataFrame):
                 break
 
         if not chosen:
-            # skip if we only have benign/malignant/unknown
             continue
 
-        # direct match or substring match
         if chosen in _HAM10000_DX_TO_LABEL:
             lab = _HAM10000_DX_TO_LABEL[chosen]
             keep_ids.append(isic_id)
@@ -235,7 +192,6 @@ def _extract_ids_labels(df: pd.DataFrame):
                 break
 
         if matched is None:
-            # skip unknown diagnosis values instead of crashing
             continue
 
         keep_ids.append(isic_id)
@@ -296,46 +252,22 @@ def _load_ham10000_images(data_dir: str, seed: int, train: bool, transform):
     indices = train_idx if train else val_idx
     return HAM10000ImageDataset(images_dir, keep_ids, y2, indices=indices, transform=transform)
 
-# ------------------------------------------------------------------
-# 1. CorruptionTransform — áp dụng per-node, simulate image quality
-# ------------------------------------------------------------------
 class CorruptionTransform:
-    """
-    Simulate ảnh chất lượng kém: Gaussian noise + Gaussian blur.
-    
-    Args:
-        noise_std  : độ lệch chuẩn Gaussian noise trên [0,1] pixel space
-                     0.0 = không noise, 0.1 = nhẹ, 0.3 = nặng
-        blur_radius: bán kính blur kernel (0 = không blur, 3 = nặng)
-    """
     def __init__(self, noise_std: float = 0.0, blur_radius: int = 0):
         self.noise_std   = noise_std
         self.blur_radius = blur_radius
 
     def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
-        # tensor shape: (C, H, W), đã được normalize trước đó
+        # tensor shape: (C, H, W)
         if self.noise_std > 0.0:
             noise = torch.randn_like(tensor) * self.noise_std
             tensor = tensor + noise
         if self.blur_radius > 0:
-            # kernel_size phải là số lẻ
             k = self.blur_radius * 2 + 1
             tensor = TF.gaussian_blur(tensor, kernel_size=k, sigma=self.blur_radius)
         return tensor
 
-
-# ------------------------------------------------------------------
-# 2. QualityPartition — wrapper thay thế Partition
-#    Thêm: image corruption + data scarcity
-# ------------------------------------------------------------------
 class QualityPartition(object):
-    """
-    Thay thế Partition, thêm:
-      - corruption_transform : CorruptionTransform hoặc None
-      - retain_ratio         : float [0,1], tỉ lệ data giữ lại (scarcity)
-      - label_noise_rate     : float [0,1], tỉ lệ label bị flip
-      - num_classes          : cần cho label noise
-    """
     def __init__(self, data, index,
                  corruption_transform=None,
                  retain_ratio: float = 1.0,
@@ -350,16 +282,13 @@ class QualityPartition(object):
 
         rng = np.random.RandomState(seed + rank + 42)
 
-        # --- scarcity: subsample index ---
         index = list(index)
         if retain_ratio < 1.0:
             keep_n = max(1, int(len(index) * retain_ratio))
             index  = rng.choice(index, size=keep_n, replace=False).tolist()
         self.index = index
 
-        # --- label noise: flip labels in-place ---
         if label_noise_rate > 0.0:
-            # Resolve the label array regardless of dataset type
             if hasattr(self.data, 'y'):
                 y_arr = self.data.y
             elif hasattr(self.data, 'targets'):
@@ -368,14 +297,15 @@ class QualityPartition(object):
                 raise AttributeError("Dataset has neither .y nor .targets")
 
             if noise_type == 'dirichlet':
-                # ----------------------------------------------------------
-                # Dirichlet label noise
-                # Mỗi true class i có transition row T[i]:
-                #   T[i, i]   = 1 - noise_rate          (giữ nguyên)
-                #   T[i, j≠i] = noise_rate · w_j         (flip theo Dirichlet)
-                #   w ~ Dirichlet(alpha · 1_{K-1})
-                # alpha nhỏ → gần pair-flip; alpha lớn → gần USN
-                # ----------------------------------------------------------
+                """
+                Dirichlet label noise
+                Each true class i has transition row T[i]:
+                    T[i, i]   = 1 - noise_rate  # keep original label
+                    T[i, j != i] = noise_rate x w_j # flip to class j with Dirichlet weight
+                    w ~ Dirichlet(alpha x 1_{K-1})
+                small alpha -> close to pair-flip
+                large alpha -> close to USN
+                """
                 T = _build_dirichlet_transition(num_classes, label_noise_rate,
                                                 noise_alpha, rng)
                 if rank == 0:
@@ -407,10 +337,7 @@ class QualityPartition(object):
                       f"expected ~{label_noise_rate*100:.0f}%)")
 
             else:
-                # ----------------------------------------------------------
-                # Uniform Symmetric Noise (USN) — hành vi gốc
-                # Chọn cố định n_noisy mẫu, flip sang class ngẫu nhiên ≠ orig
-                # ----------------------------------------------------------
+                # Uniform Symmetric Noise (USN)
                 n_noisy   = int(label_noise_rate * len(self.index))
                 noisy_pos = rng.choice(len(self.index), size=n_noisy, replace=False)
                 for pos in noisy_pos:
@@ -430,36 +357,18 @@ class QualityPartition(object):
 
     def __getitem__(self, i):
         data_idx = self.index[i]
-        img, target = self.data[data_idx]          # tensor sau base transform
+        img, target = self.data[data_idx]
         if self.corruption is not None:
             img = self.corruption(img)
         return img, target
 
 
-# ------------------------------------------------------------------
-# 3. Dirichlet noise transition matrix
-# ------------------------------------------------------------------
 def _build_dirichlet_transition(
     num_classes: int,
     noise_rate: float,
     alpha: float,
     rng: np.random.RandomState,
 ) -> np.ndarray:
-    """
-    Xây dựng noise transition matrix T ∈ [0,1]^{K×K} theo phân phối Dirichlet.
-
-    Với mỗi true class i:
-        off-diagonal weights  w ~ Dirichlet(alpha · 1_{K-1})
-        T[i, j≠i] = noise_rate · w_j    (xác suất flip sang class j)
-        T[i, i]   = 1 - noise_rate       (xác suất giữ nguyên)
-
-    Tham số alpha điều chỉnh "độ tập trung" của noise:
-        alpha → 0   : gần pair-flip — gần như tất cả noise đổ vào một class
-        alpha = 1.0 : uniform trên off-diagonal simplex
-        alpha → ∞   : tiệm cận Uniform Symmetric Noise (USN)
-
-    Returns: T shape (K, K), mỗi hàng là một phân phối xác suất.
-    """
     T = np.zeros((num_classes, num_classes), dtype=np.float64)
     for c in range(num_classes):
         alpha_vec        = np.ones(num_classes - 1) * alpha
@@ -473,10 +382,6 @@ def _build_dirichlet_transition(
                 j += 1
     return T
 
-
-# ------------------------------------------------------------------
-# 4. Helper: build quality profile cho từng rank
-# ------------------------------------------------------------------
 def make_quality_profiles(
     world_size: int,
     mode: str = "uniform",
@@ -484,23 +389,10 @@ def make_quality_profiles(
     noise_type: str = "uniform",
     noise_alpha: float = 0.1,
 ) -> list[dict]:
-    """
-    Trả về list[dict] dài world_size, mỗi dict chứa:
-      {noise_std, blur_radius, retain_ratio, label_noise_rate,
-       noise_type, noise_alpha}
 
-    mode:
-      "uniform"    - tất cả node có quality tốt (baseline, không corrupt)
-      "tiered"     - chia 3 tier: good / medium / poor
-      "random"     - sample ngẫu nhiên theo uniform distribution
-
-    noise_type: "uniform" | "dirichlet"
-    noise_alpha: tham số concentration của Dirichlet (chỉ dùng khi noise_type="dirichlet")
-    """
     rng = np.random.RandomState(seed)
 
     def _prof(**kw):
-        """Thêm noise_type / noise_alpha vào mọi profile."""
         return dict(**kw, noise_type=noise_type, noise_alpha=noise_alpha)
 
     if mode == "uniform":
@@ -509,13 +401,13 @@ def make_quality_profiles(
 
     if mode == "tiered":
         profiles = []
-        tier_size = world_size // 3
+        tier_size = world_size // 5
         for i in range(world_size):
-            if i < tier_size:                      # Good
+            if i < tier_size: # good nodes
                 p = _prof(noise_std=0.0,  blur_radius=0, retain_ratio=1.0, label_noise_rate=0.0)
-            elif i < 2 * tier_size:                # Medium
+            elif i < 2 * tier_size: # medium nodes
                 p = _prof(noise_std=0.08, blur_radius=1, retain_ratio=1.0, label_noise_rate=0.05)
-            else:                                  # Poor
+            else: # poor nodes
                 p = _prof(noise_std=0.20, blur_radius=2, retain_ratio=1.0, label_noise_rate=0.15)
             profiles.append(p)
         return profiles
@@ -548,17 +440,14 @@ class Partition(object):
         return self.data[data_idx]
                 
 class DataPartitioner(object):
-    """ Partitions a dataset into different chunks"""
     def __init__(self, data, sizes, skew, seed, dataset_name):
         
         self.data = data
         self.partitions = []
         data_len = len(data)
-        # -------- labels: take directly from dataset --------
         if hasattr(data, "targets"):
             labels = [int(x) for x in data.targets]
         elif hasattr(data, "y") and hasattr(data, "indices"):
-            # IMPORTANT: data.y is global labels, but len(data) is subset length
             labels = [int(data.y[int(idx)]) for idx in data.indices]
         elif hasattr(data, "y"):
             labels = [int(x) for x in data.y]
@@ -571,7 +460,6 @@ class DataPartitioner(object):
                 labels.extend([int(t) for t in targets])
         
         assert len(labels) == len(data), f"labels({len(labels)}) != len(data)({len(data)})"
-        # -------- end labels --------
         
         rng = random.Random()
         rng.seed(seed)
@@ -585,7 +473,6 @@ class DataPartitioner(object):
                 part_len = int(frac*data_len)
                 self.partitions.append(sort_indices[0:part_len])
                 if len(sizes)>10 and i<10:
-                    #print('here', i, len(sizes), len(indices))
                     sort_indices = sort_indices[2*part_len:]+sort_indices[part_len:2*part_len]
                 else:
                     sort_indices = sort_indices[part_len:]
@@ -623,7 +510,6 @@ def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size,
                         num_classes, noise_rate=0.0, noise_agents=None,
                         quality_mode: str = "uniform", quality_profiles: list = None,
                         noise_type: str = "uniform", noise_alpha: float = 0.1):
-    """Partitioning dataset""" 
     if dataset_name== 'cifar10':
         normalize   = transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
                                      std=[0.2023, 0.1994, 0.2010])
@@ -695,10 +581,6 @@ def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size,
         dataset = _load_ham10000_images(data_dir=data_dir, seed=seed, train=True, transform=train_tf)
 
     elif dataset_name == "fedisic2019":
-        # Fed-ISIC2019: 8 classes, images pre-downloaded by download_fedisic2019.py
-        # skew=1 → label-sorted non-IID partition (each agent holds mostly 1-2 classes)
-        # skew=0 → IID random partition
-        # 0<skew<1 → mixed
         normalize = transforms.Normalize(
             mean=_FEDISIC2019_MEAN, std=_FEDISIC2019_STD
         )
@@ -721,7 +603,6 @@ def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size,
                          seed=seed, dataset_name=dataset_name)
     raw_partition = dp.use(rank)
 
-    # --- Build quality profile ---
     if quality_profiles is None:
         quality_profiles = make_quality_profiles(
             size, mode=quality_mode, seed=seed,
@@ -729,7 +610,6 @@ def partition_trainDataset(dataset_name, data_dir, skew, seed, batch_size,
         )
     prof = quality_profiles[rank]
 
-    # Override label_noise_rate from CLI --noise-rate, only for designated agents
     if noise_rate > 0.0 and (not noise_agents or rank in noise_agents):
         prof = dict(prof, label_noise_rate=noise_rate)
 
@@ -802,7 +682,6 @@ def test_Dataset(dataset_name, data_dir, seed=321):
         dataset = datasets.ImageFolder(os.path.join(data_dir, 'val'),  data_transforms)
 
     elif dataset_name== 'imagenet':
-        #/local/a/imagenet/imagenet2012/
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                  std=[0.229, 0.224, 0.225])
 
